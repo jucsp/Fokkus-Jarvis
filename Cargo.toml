@@ -5,6 +5,7 @@ members = [
     "crates/jarvis-render",
     "crates/jarvis-shell",
     "crates/jarvis-app",
+    "crates/jarvis-audio",
 ]
 
 [workspace.package]
