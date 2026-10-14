@@ -7,15 +7,15 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
-## 🚀 Épica 1: Núcleo Nativo y Ventana Transparente Multiplataforma (Rust + Tauri)
-- [ ] [#1](https://github.com/jucsp/Fokkus-Jarvis/issues/1) **feat(core): setup inicial de Fokkus Jarvis en Rust/Tauri con ventana flotante frameless y transparente**
-  - _Alcance:_ Configuración de proyecto en Rust + Tauri. Ventana frameless nativa sin decoraciones del SO, fondo 100% transparente en Wayland (KDE / Caelestia), X11, Windows 10/11 y macOS. Always-On-Top y persistente en todos los escritorios virtuales (`visible_on_all_workspaces: true`). Canvas 2D con esfera líquida orgánica reactiva. Consumo en reposo $\le 40$ MB RAM.
+## 🚀 Épica 1: Núcleo Nativo y Ventana Transparente Multiplataforma (Rust Nativo)
+- [ ] [#1](https://github.com/jucsp/Fokkus-Jarvis/issues/1) **feat(core): setup inicial de Fokkus Jarvis en Rust nativo (layer-shell Wayland / winit / tiny-skia)**
+  - _Alcance:_ Configuración de workspace en Rust nativo. Ventana frameless nativa sin decoraciones del SO, capa overlay real en Wayland (`zwlr_layer_shell_v1`) en KWin/Caelestia para soporte Always-On-Top y visible en todos los escritorios. Fallback winit para X11/Windows. Renderizado CPU ultraligero con `tiny-skia` para la esfera líquida (sin drivers GPU pesados). Consumo en reposo $\le 25-40$ MB RAM. Estructura multi-crate y Makefile.
 
 ---
 
 ## 🎙️ Épica 2: Motores de Audio de Alta Fidelidad y Voz Natural
-- [ ] [#2](https://github.com/jucsp/Fokkus-Jarvis/issues/2) **feat(audio): pipeline de audio full-duplex con Faster-Whisper base (STT) y Edge-TTS neuronal**
-  - _Alcance:_ Integración de `faster-whisper` (base, int8 en CPU, beam_size=5, Silero VAD activo) con buffer WebM continuo (sin latencia de hardware). Síntesis neuronal de alta fidelidad con `edge-tts` (15 voces neuronales, `es-CL-LorenzoNeural` por defecto) y fallback offline instantáneo a `espeak-ng`. Selector interactivo de voces con preescucha en vivo (▶️ / ⏹️).
+- [ ] [#2](https://github.com/jucsp/Fokkus-Jarvis/issues/2) **feat(audio): pipeline de audio full-duplex con Whisper (STT) y Edge-TTS neuronal con caché de fillers**
+  - _Alcance:_ Captura de audio continuo con `cpal` (16 kHz mono) y buffer deslizante de 300 ms de audio previo. Transcripción local rápida con Whisper y VAD Silero. Síntesis neuronal de alta fidelidad con `edge-tts` (15 voces neuronales, `es-CL-LorenzoNeural` por defecto) y fallback offline instantáneo a `espeak-ng`. Pre-síntesis y almacenamiento en caché de frases de relleno conversacional (*fillers*) para latencia de inicio $< 300$ ms. Reproducción con detención inmediata (*fade-out* 15 ms).
 
 ---
 

@@ -29,6 +29,7 @@
 ## 📚 Documentación
 
 * 📋 [Contrato y Especificación Técnica SDD](docs/specs/sdd-fokkus-jarvis.md)
+* ✅ [Dictamen PM/QA — Fase 1](docs/specs/dictamen-qa-fase1.md)
 * 🗺️ [Product Backlog y Seguimiento de Tareas](backlog.md)
 
 ---

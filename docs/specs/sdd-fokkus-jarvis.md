@@ -214,3 +214,14 @@ Para mantener a Fokkus IDE limpio y profesional:
 | **Fase 2** | **Audio Full-Duplex & Fillers** | Integración nativa de `faster-whisper` (base) y `edge-tts` (15 voces). Implementación de frases de relleno conversacional (< 300 ms) durante el estado `thinking`. | Issue #2 & #3 |
 | **Fase 3** | **Barge-In & Servidor IPC** | Implementación de interrupción acústica en tiempo real (< 50 ms) y servidor de socket local `~/.fokkus/jarvis.sock` (JSON-RPC 2.0). | Issue #4 & #5 |
 | **Fase 4** | **Herramientas de SO & Desacoplamiento IDE** | Orquestador de sistema (archivos, terminal, MCPs) y actualización en Fokkus IDE para conectarse al nuevo daemon independiente. | Issue #6 & Fokkus IDE v1.9.0 |
+
+---
+
+## 8. Enmiendas QA pendientes de aprobación (2026-10-14)
+
+El dictamen PM/QA [`dictamen-qa-fase1.md`](dictamen-qa-fase1.md) propone enmiendas que **afectan a las secciones 1.2, 2, 3, 4 y 7** de este documento. Hasta que el usuario/PO las apruebe, prevalece lo que dice el dictamen en estos puntos:
+1. **Stack de UI:** Rust nativo (layer-shell en Wayland + winit en X11/Windows/macOS, render con tiny-skia) en lugar de Tauri.
+2. **STT:** whisper.cpp (`whisper-rs` + `whisper-cpp-devel` del sistema) en lugar de `faster-whisper` (no está en los repos del sistema). Captura en PCM, sin WebM.
+3. **IPC:** framing NDJSON, `notify*` como notifications, handshake `jarvis.hello`, socket 0600 + `SO_PEERCRED`, catálogo único de métodos.
+4. **Latencias:** fillers pre-sintetizados en caché; barge-in con corte dentro del callback de audio + AEC + VAD.
+5. **RAM ≤ 40 MB** medida con el modelo STT descargado.
