@@ -1,15 +1,18 @@
 //! Núcleo de Fokkus-Jarvis.
 //!
 //! Este crate agrupa la máquina de estados del asistente, la configuración de
-//! usuario y el bus de eventos (nivel de audio y transiciones de estado).
-//! No realiza I/O de UI ni de audio: es puramente testeable.
+//! usuario (persistida en TOML), el bus de eventos (nivel de audio y
+//! transiciones de estado) y el lock de instancia única. No realiza I/O de UI
+//! ni de audio: es puramente testeable.
 
 mod bus;
 mod config;
+mod paths;
+pub mod single_instance;
 mod state;
 
-pub use bus::{AudioLevel, EventBus};
-pub use config::JarvisConfig;
+pub use bus::{AudioLevel, AudioLevelStore, EventBus};
+pub use config::{ConfigError, JarvisConfig};
 pub use state::{JarvisState, StateMachine, StateTransition, TransitionError};
 
 /// Orquestador mínimo del núcleo: estado + configuración + bus de eventos.
@@ -80,6 +83,11 @@ impl JarvisCore {
     pub fn set_audio_level(&self, level: AudioLevel) {
         self.bus.publish_audio_level(level);
     }
+
+    /// Último nivel de audio publicado.
+    pub fn audio_level(&self) -> AudioLevel {
+        self.bus.audio_level()
+    }
 }
 
 #[cfg(test)]
@@ -138,15 +146,15 @@ mod tests {
     }
 
     #[test]
-    fn audio_level_is_clamped() {
+    fn audio_level_is_clamped_and_last_value_wins() {
         let core = JarvisCore::new(JarvisConfig::default());
-        let rx = core.bus().audio_level_receiver();
         core.set_audio_level(1.7);
+        assert_eq!(core.audio_level(), 1.0);
         core.set_audio_level(-0.4);
+        assert_eq!(core.audio_level(), 0.0);
         core.set_audio_level(0.42);
-        assert_eq!(rx.recv().unwrap(), 1.0);
-        assert_eq!(rx.recv().unwrap(), 0.0);
-        assert_eq!(rx.recv().unwrap(), 0.42);
+        core.set_audio_level(0.77);
+        assert_eq!(core.audio_level(), 0.77);
     }
 
     #[test]

@@ -7,3 +7,5 @@ description = "Núcleo de Fokkus-Jarvis: máquina de estados, configuración y b
 
 [dependencies]
 crossbeam-channel.workspace = true
+serde.workspace = true
+toml.workspace = true

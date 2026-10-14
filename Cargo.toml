@@ -17,3 +17,6 @@ crossbeam-channel = "0.5"
 # Renderizado CPU sin GPU. Se desactivan los features por defecto para no
 # arrastrar la dependencia opcional `png` (y sus dependencias transitivas).
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+# Persistencia de configuración (aprobado por el PO el 2026-10-14).
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
