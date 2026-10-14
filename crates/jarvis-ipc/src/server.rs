@@ -17,14 +17,22 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+
+#[cfg(unix)]
+use std::fs;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+#[cfg(unix)]
 use std::thread::{self, JoinHandle};
+#[cfg(unix)]
 use std::time::Duration;
 
 use jarvis_core::{JarvisConfig, JarvisCore, JarvisState};
@@ -33,12 +41,14 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::paths;
+#[cfg(unix)]
+use crate::protocol::MAX_MESSAGE_BYTES;
 use crate::protocol::{
     error_codes, methods, task_status, Ack, DispatchSwarmParams, HelloParams, HelloResult,
     HelloSession, Incoming, JsonRpcError, NotifySwarmCompletedParams, NotifySwarmProgressParams,
     NotifyTriageAlertParams, PingResult, Response, SetMutedParams, SetMutedResult, SpeakParams,
     SpeakResult, StateResult, SwarmStatusResult, SwarmTask, TriageAlert, Utterance,
-    MAX_MESSAGE_BYTES, PROTOCOL_VERSION, SERVER_VERSION,
+    PROTOCOL_VERSION, SERVER_VERSION,
 };
 
 /// Número máximo de conexiones concurrentes antes de responder `-32003`.
@@ -445,6 +455,9 @@ pub enum IpcError {
     InvalidPath(PathBuf),
     /// La ruta excede el límite de `sun_path`.
     SocketPathTooLong { path: PathBuf, len: usize },
+    /// El transporte IPC (Unix Domain Socket) no está soportado en esta
+    /// plataforma (p. ej. Windows hasta que llegue el Named Pipe del SDD §3).
+    Unsupported,
     /// Se pidió [`PeerPolicy::PeerCredentials`], no disponible en `std` estable.
     PeerCredentialsUnavailable,
 }
@@ -464,6 +477,10 @@ impl fmt::Display for IpcError {
                 "ruta de socket de {len} bytes (máximo {MAX_SOCKET_PATH_BYTES}): {}",
                 path.display()
             ),
+            IpcError::Unsupported => write!(
+                f,
+                "transporte IPC (Unix Domain Socket) no soportado en esta plataforma"
+            ),
             IpcError::PeerCredentialsUnavailable => write!(
                 f,
                 "SO_PEERCRED requiere la dependencia `libc`: UCred/peer_cred son inestables en std"
@@ -480,7 +497,8 @@ impl From<std::io::Error> for IpcError {
     }
 }
 
-/// Servidor IPC con hilo aceptador propio.
+/// Servidor IPC con hilo aceptador propio (Unix Domain Sockets).
+#[cfg(unix)]
 pub struct IpcServer {
     socket_path: PathBuf,
     state: Arc<ServerState>,
@@ -492,6 +510,7 @@ pub struct IpcServer {
     bound: bool,
 }
 
+#[cfg(unix)]
 impl IpcServer {
     /// Crea el servidor en la ruta por defecto ([`paths::default_socket_path`]).
     pub fn new(state: Arc<ServerState>) -> Self {
@@ -582,14 +601,15 @@ impl IpcServer {
 
     /// Añade el socket con [`IpcServer::bind`] y lanza el hilo aceptador.
     ///
-    /// Es idempotente: si ya está sirviendo, no hace nada.
-    pub fn start(&mut self) -> Result<(), IpcError> {
+    /// Es idempotente: si ya está sirviendo, no hace nada. Devuelve la ruta del
+    /// socket activo (`Some`) o `None` si la plataforma no soporta socket Unix.
+    pub fn start(&mut self) -> Result<Option<PathBuf>, IpcError> {
         if self.accept_handle.is_some() {
-            return Ok(());
+            return Ok(Some(self.socket_path.clone()));
         }
         self.bind()?;
         let Some(listener) = self.listener.take() else {
-            return Ok(());
+            return Ok(Some(self.socket_path.clone()));
         };
 
         self.shutdown_flag.store(false, Ordering::SeqCst);
@@ -602,7 +622,7 @@ impl IpcServer {
                 accept_loop(listener, state, shutdown_flag, connections, MAX_CONNECTIONS);
             })?;
         self.accept_handle = Some(handle);
-        Ok(())
+        Ok(Some(self.socket_path.clone()))
     }
 
     /// Detiene el hilo aceptador y espera a que termine.
@@ -614,6 +634,7 @@ impl IpcServer {
     }
 }
 
+#[cfg(unix)]
 impl Drop for IpcServer {
     fn drop(&mut self) {
         self.shutdown();
@@ -625,6 +646,7 @@ impl Drop for IpcServer {
     }
 }
 
+#[cfg(unix)]
 impl fmt::Debug for IpcServer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IpcServer")
@@ -634,6 +656,80 @@ impl fmt::Debug for IpcServer {
             .field("peer_policy", &self.peer_policy)
             .finish()
     }
+}
+
+/// Servidor IPC (stub para plataformas sin `UnixListener`, p. ej. Windows).
+///
+/// La implementación real usa Unix Domain Sockets; el Named Pipe de Windows
+/// llegará en una fase posterior (SDD §3). Este stub mantiene la misma
+/// superficie pública para que el workspace compile en cualquier plataforma:
+/// no enlaza ningún socket, no lanza hilos y [`IpcServer::start`] devuelve
+/// `Ok(None)`.
+#[cfg(not(unix))]
+pub struct IpcServer {
+    socket_path: PathBuf,
+    state: Arc<ServerState>,
+    peer_policy: PeerPolicy,
+}
+
+#[cfg(not(unix))]
+impl IpcServer {
+    /// Crea el servidor en la ruta por defecto ([`paths::default_socket_path`]).
+    pub fn new(state: Arc<ServerState>) -> Self {
+        Self::with_path(paths::default_socket_path(), state)
+    }
+
+    /// Crea el servidor en una ruta explícita (tests, perfiles múltiples).
+    pub fn with_path(path: impl Into<PathBuf>, state: Arc<ServerState>) -> Self {
+        Self {
+            socket_path: path.into(),
+            state,
+            peer_policy: PeerPolicy::default(),
+        }
+    }
+
+    /// Ruta configurada del socket (nunca enlazada en esta plataforma).
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Estado compartido del servidor.
+    pub fn state(&self) -> &Arc<ServerState> {
+        &self.state
+    }
+
+    /// Política de verificación del cliente.
+    pub fn peer_policy(&self) -> PeerPolicy {
+        self.peer_policy
+    }
+
+    /// Cambia la política de verificación del cliente.
+    pub fn set_peer_policy(&mut self, policy: PeerPolicy) {
+        self.peer_policy = policy;
+    }
+
+    /// Conexiones activas: siempre 0 (sin socket real en esta plataforma).
+    pub fn connection_count(&self) -> usize {
+        0
+    }
+
+    /// `true` si el socket está enlazado: nunca en esta plataforma.
+    pub fn is_running(&self) -> bool {
+        false
+    }
+
+    /// No-op: no hay Unix Domain Sockets que enlazar en esta plataforma.
+    pub fn bind(&mut self) -> Result<(), IpcError> {
+        Ok(())
+    }
+
+    /// No-op: no arranca ningún hilo aceptador y devuelve `Ok(None)`.
+    pub fn start(&mut self) -> Result<Option<PathBuf>, IpcError> {
+        Ok(None)
+    }
+
+    /// No-op: no hay hilo aceptador que detener.
+    pub fn shutdown(&mut self) {}
 }
 
 /// Recupera un lock ignorando el envenenamiento (nunca hace *panic*).
@@ -679,6 +775,7 @@ fn state_name(state: JarvisState) -> &'static str {
 }
 
 /// Borra un socket *stale*; si hay un servidor vivo responde `AlreadyRunning`.
+#[cfg(unix)]
 fn cleanup_stale(path: &Path) -> Result<(), IpcError> {
     match UnixStream::connect(path) {
         Ok(_) => Err(IpcError::AlreadyRunning(path.to_path_buf())),
@@ -687,6 +784,7 @@ fn cleanup_stale(path: &Path) -> Result<(), IpcError> {
 }
 
 /// Resultado de leer una unidad NDJSON del stream.
+#[cfg(unix)]
 enum ReadStatus {
     /// El peer cerró la conexión.
     Eof,
@@ -700,6 +798,7 @@ enum ReadStatus {
 ///
 /// Acumula desde el `BufReader` sin superar `MAX_MESSAGE_BYTES + 1` y deja la
 /// línea cruda (incluido el `\n`) en `buffer`.
+#[cfg(unix)]
 fn read_message(
     reader: &mut BufReader<UnixStream>,
     buffer: &mut Vec<u8>,
@@ -736,6 +835,7 @@ fn read_message(
 }
 
 /// Atiende una conexión hasta EOF o error.
+#[cfg(unix)]
 fn handle_connection(stream: UnixStream, state: Arc<ServerState>) {
     let mut writer = match stream.try_clone() {
         Ok(writer) => writer,
@@ -776,12 +876,14 @@ fn handle_connection(stream: UnixStream, state: Arc<ServerState>) {
 }
 
 /// Escribe una línea NDJSON y la vacía al socket.
+#[cfg(unix)]
 fn write_line(writer: &mut UnixStream, line: &str) -> std::io::Result<()> {
     writer.write_all(line.as_bytes())?;
     writer.flush()
 }
 
 /// Hilo aceptador: un hilo por conexión, con tope `limit`.
+#[cfg(unix)]
 fn accept_loop(
     listener: UnixListener,
     state: Arc<ServerState>,
@@ -826,7 +928,7 @@ fn accept_loop(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;

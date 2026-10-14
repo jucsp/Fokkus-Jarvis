@@ -4,21 +4,30 @@
 //! con un `id` propio y espera la respuesta con el mismo `id`.
 
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::paths;
 use crate::protocol::{
-    methods, DispatchSwarmParams, HelloParams, HelloResult, Id, JsonRpcError, Notification,
-    NotifySwarmCompletedParams, NotifySwarmProgressParams, NotifyTriageAlertParams, PingResult,
-    Request, Response, SetMutedParams, SetMutedResult, SpeakParams, SpeakResult, StateResult,
-    SwarmStatusResult, SwarmTask, PROTOCOL_VERSION,
+    HelloResult, Id, JsonRpcError, PingResult, SetMutedResult, SpeakResult, StateResult,
+    SwarmStatusResult, SwarmTask,
 };
 use crate::server::IpcError;
+
+#[cfg(unix)]
+use crate::paths;
+#[cfg(unix)]
+use crate::protocol::{
+    methods, DispatchSwarmParams, HelloParams, Notification, NotifySwarmCompletedParams,
+    NotifySwarmProgressParams, NotifyTriageAlertParams, Request, Response, SetMutedParams,
+    SpeakParams, PROTOCOL_VERSION,
+};
+#[cfg(unix)]
+use serde::de::DeserializeOwned;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 
 /// Error de una llamada al servidor.
 #[derive(Debug)]
@@ -63,12 +72,14 @@ impl fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 /// Cliente JSON-RPC sobre un Unix Domain Socket.
+#[cfg(unix)]
 pub struct IpcClient {
     writer: UnixStream,
     reader: BufReader<UnixStream>,
     next_id: i64,
 }
 
+#[cfg(unix)]
 impl IpcClient {
     /// Conecta al socket indicado.
     pub fn connect(path: &Path) -> Result<Self, IpcError> {
@@ -261,12 +272,14 @@ impl IpcClient {
 }
 
 /// Serializa parámetros a `Value`.
+#[cfg(unix)]
 fn to_params<T: serde::Serialize>(params: &T) -> Result<Value, ClientError> {
     serde_json::to_value(params)
         .map_err(|e| ClientError::Transport(format!("parámetros no serializables: {e}")))
 }
 
 /// Deserializa un resultado al tipo esperado.
+#[cfg(unix)]
 fn decode<T: DeserializeOwned>(method: &str, value: Value) -> Result<T, ClientError> {
     serde_json::from_value(value).map_err(|e| ClientError::Decode {
         method: method.to_string(),
@@ -274,6 +287,7 @@ fn decode<T: DeserializeOwned>(method: &str, value: Value) -> Result<T, ClientEr
     })
 }
 
+#[cfg(unix)]
 impl fmt::Debug for IpcClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IpcClient")
@@ -282,7 +296,123 @@ impl fmt::Debug for IpcClient {
     }
 }
 
-#[cfg(test)]
+/// Cliente IPC (stub para plataformas sin `UnixStream`, p. ej. Windows).
+///
+/// Mantiene la misma superficie pública que la implementación Unix para que el
+/// workspace compile en cualquier plataforma: [`IpcClient::connect`] devuelve
+/// [`IpcError::Unsupported`] y, por tanto, nunca existe una instancia real.
+#[cfg(not(unix))]
+#[derive(Debug)]
+pub struct IpcClient {
+    _private: (),
+}
+
+#[cfg(not(unix))]
+impl IpcClient {
+    /// Siempre falla: no hay Unix Domain Sockets en esta plataforma.
+    pub fn connect(_path: &Path) -> Result<Self, IpcError> {
+        Err(IpcError::Unsupported)
+    }
+
+    /// Siempre falla: no hay Unix Domain Sockets en esta plataforma.
+    pub fn connect_default() -> Result<Self, IpcError> {
+        Err(IpcError::Unsupported)
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn request(&mut self, _method: &str, _params: Option<Value>) -> Result<Value, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn notify(&mut self, _method: &str, _params: Option<Value>) -> Result<(), ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn hello(&mut self, _client: &str) -> Result<HelloResult, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn ping(&mut self) -> Result<PingResult, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn get_state(&mut self) -> Result<StateResult, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn set_muted(&mut self, _muted: bool) -> Result<SetMutedResult, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn speak(
+        &mut self,
+        _text: &str,
+        _category: Option<&str>,
+    ) -> Result<SpeakResult, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn dispatch_swarm(
+        &mut self,
+        _task_id: &str,
+        _agent: &str,
+        _goal: &str,
+    ) -> Result<SwarmTask, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn get_swarm_status(&mut self) -> Result<SwarmStatusResult, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn notify_swarm_progress(
+        &mut self,
+        _task_id: &str,
+        _role: &str,
+        _percent: u8,
+        _message: &str,
+    ) -> Result<(), ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn notify_swarm_completed(
+        &mut self,
+        _task_id: &str,
+        _summary: &str,
+        _tests_passed: u32,
+        _tests_failed: u32,
+    ) -> Result<(), ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn notify_triage_alert(
+        &mut self,
+        _item_id: &str,
+        _title: &str,
+        _source: &str,
+    ) -> Result<(), ClientError> {
+        Err(unsupported())
+    }
+}
+
+/// Error común del stub sin transporte.
+#[cfg(not(unix))]
+fn unsupported() -> ClientError {
+    ClientError::Transport("IPC no soportado en esta plataforma".into())
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::protocol::error_codes;

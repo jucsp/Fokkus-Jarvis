@@ -30,12 +30,6 @@
 //! * **I7** ruta en `$XDG_RUNTIME_DIR` calculada pero no activada por defecto
 //!   (decisión del PO).
 
-#[cfg(not(unix))]
-compile_error!(
-    "jarvis-ipc requiere Unix Domain Sockets (Linux/macOS); \
-     el Named Pipe de Windows llegará en una fase posterior (SDD §3)."
-);
-
 pub mod client;
 pub mod paths;
 pub mod protocol;
@@ -58,7 +52,7 @@ pub use server::{IpcError, IpcServer, PeerPolicy, ServerState, SpeechSink, MAX_C
 
 pub use jarvis_core::{JarvisConfig, JarvisCore, JarvisState};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::path::PathBuf;
