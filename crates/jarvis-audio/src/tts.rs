@@ -192,6 +192,20 @@ impl EdgeTtsEngine {
             .find(|path| path.is_file())
     }
 
+    /// Devuelve el primer filler cacheado de una categoría concreta (sin red).
+    ///
+    /// Es la consulta usada por el `ConversationCoordinator` para disparar la
+    /// frase de relleno contextual en < 300 ms: solo comprueba el sistema de
+    /// archivos local, nunca invoca al backend TTS.
+    pub fn get_cached_filler_for(&self, category: FillerCategory) -> Option<PathBuf> {
+        category
+            .phrases()
+            .iter()
+            .copied()
+            .map(|text| self.filler_cache_path(text))
+            .find(|path| path.is_file())
+    }
+
     /// Sintetiza (si faltan) todos los fillers en el directorio de caché.
     pub fn pre_synthesize_fillers(&self) -> Result<usize, TtsError> {
         if self.backend() == TtsBackend::Unavailable {

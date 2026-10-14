@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 description = "Motor de audio full-duplex de Fokkus-Jarvis: voces, TTS con caché de fillers, playback con barge-in y STT Whisper."
+
+[dependencies]
+jarvis-core = { path = "../jarvis-core" }

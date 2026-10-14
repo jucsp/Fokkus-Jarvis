@@ -5,12 +5,18 @@
 //! - [`tts`]: síntesis Edge-TTS con fallback a espeak-ng y caché de fillers.
 //! - [`playback`]: control de reproducción con parada instantánea (barge-in).
 //! - [`stt`]: transcripción local con Whisper (binario del sistema).
+//! - [`conversation`]: gestor de diálogo con fillers contextuales e interrupción
+//!   humana (Issues #3 y #4).
 
+pub mod conversation;
 pub mod playback;
 pub mod stt;
 pub mod tts;
 pub mod voices;
 
+pub use conversation::{
+    classify_intent, BackgroundTasks, ConversationCoordinator, ConversationError,
+};
 pub use playback::AudioPlayback;
 pub use stt::{SttError, WhisperEngine};
 pub use tts::{EdgeTtsEngine, FillerCategory, TtsBackend, TtsError};
