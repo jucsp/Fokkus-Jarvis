@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/jarvis-core",
+    "crates/jarvis-render",
+    "crates/jarvis-shell",
+    "crates/jarvis-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.99"
+
+[workspace.dependencies]
+crossbeam-channel = "0.5"
+# Renderizado CPU sin GPU. Se desactivan los features por defecto para no
+# arrastrar la dependencia opcional `png` (y sus dependencias transitivas).
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }

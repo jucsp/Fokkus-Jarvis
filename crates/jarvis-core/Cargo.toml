@@ -1,0 +1,9 @@
+[package]
+name = "jarvis-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Núcleo de Fokkus-Jarvis: máquina de estados, configuración y bus de eventos."
+
+[dependencies]
+crossbeam-channel.workspace = true

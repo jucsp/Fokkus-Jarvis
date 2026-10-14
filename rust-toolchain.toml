@@ -1,0 +1,7 @@
+# Toolchain objetivo del proyecto (Fase 1 exige Rust 1.99).
+#
+# El toolchain `stable` instalado en esta máquina ya es 1.99.0, por lo que se
+# fija `stable` para no forzar la descarga de un toolchain versionado nuevo.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

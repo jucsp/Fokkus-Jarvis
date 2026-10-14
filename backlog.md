@@ -10,6 +10,15 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 ## 🚀 Épica 1: Núcleo Nativo y Ventana Transparente Multiplataforma (Rust Nativo)
 - [ ] [#1](https://github.com/jucsp/Fokkus-Jarvis/issues/1) **feat(core): setup inicial de Fokkus Jarvis en Rust nativo (layer-shell Wayland / winit / tiny-skia)**
   - _Alcance:_ Configuración de workspace en Rust nativo. Ventana frameless nativa sin decoraciones del SO, capa overlay real en Wayland (`zwlr_layer_shell_v1`) en KWin/Caelestia para soporte Always-On-Top y visible en todos los escritorios. Fallback winit para X11/Windows. Renderizado CPU ultraligero con `tiny-skia` para la esfera líquida (sin drivers GPU pesados). Consumo en reposo $\le 25-40$ MB RAM. Estructura multi-crate y Makefile.
+  - _Estado QA (2026-10-14):_ ⚠️ entrega parcial, issue abierto — ver [reporte QA](docs/specs/qa-issue1-fase1.md).
+    - [x] 1.1 Workspace Cargo, toolchain y Makefile
+    - [x] 1.2 Máquina de estados y bus de eventos (tabla 100 % cubierta)
+    - [ ] 1.3 Esfera líquida — falta animación temporal (render 1.66 ms/frame ✅)
+    - [ ] 1.0 / 1.4 Ventana overlay `zwlr_layer_shell_v1` en KWin
+    - [ ] 1.5 Fallback winit + detección real de layer-shell
+    - [ ] 1.6 Instancia única y config TOML persistente
+    - [ ] 1.7 `cargo-deny` y snapshot de pixmap (fmt + clippy ✅)
+    - [ ] 1.8 Medición RSS ≤ 40 MB y CPU en reposo
 
 ---
 

@@ -1,0 +1,11 @@
+[package]
+name = "jarvis-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Binario de Fokkus-Jarvis que une núcleo, render y shell."
+
+[dependencies]
+jarvis-core = { path = "../jarvis-core" }
+jarvis-render = { path = "../jarvis-render" }
+jarvis-shell = { path = "../jarvis-shell" }
