@@ -6,6 +6,7 @@ members = [
     "crates/jarvis-shell",
     "crates/jarvis-app",
     "crates/jarvis-audio",
+    "crates/jarvis-ipc",
 ]
 
 [workspace.package]
@@ -21,3 +22,5 @@ tiny-skia = { version = "0.11", default-features = false, features = ["std", "si
 # Persistencia de configuración (aprobado por el PO el 2026-10-14).
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Serialización del protocolo JSON-RPC 2.0 sobre el socket local (Issue #5).
+serde_json = "1"

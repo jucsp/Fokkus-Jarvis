@@ -1,0 +1,11 @@
+[package]
+name = "jarvis-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Servidor y cliente IPC local (Unix Domain Socket, JSON-RPC 2.0) que expone Fokkus-Jarvis a Fokkus IDE."
+
+[dependencies]
+jarvis-core = { path = "../jarvis-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
