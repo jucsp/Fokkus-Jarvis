@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 description = "Binario de Fokkus-Jarvis: orquesta núcleo, render, shell, audio e IPC."
 
+[[bin]]
+name = "fokkus-jarvis"
+path = "src/main.rs"
+
 [dependencies]
 jarvis-audio = { path = "../jarvis-audio" }
 jarvis-core = { path = "../jarvis-core" }
