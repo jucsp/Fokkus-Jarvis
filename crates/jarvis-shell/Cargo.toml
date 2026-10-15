@@ -6,3 +6,6 @@ rust-version.workspace = true
 description = "Abstracción de la superficie overlay (ventana flotante transparente)."
 
 [dependencies]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay-client-toolkit.workspace = true

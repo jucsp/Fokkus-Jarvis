@@ -11,9 +11,12 @@ use std::fmt;
 
 use jarvis_core::JarvisState;
 use tiny_skia::{
-    Color, FillRule, GradientStop, Paint, PathBuilder, Pixmap, Point, RadialGradient, Shader,
-    SpreadMode, Stroke, Transform,
+    Color, FillRule, GradientStop, Paint, PathBuilder, Point, RadialGradient, Shader, SpreadMode,
+    Stroke, Transform,
 };
+
+/// Buffer RGBA premultiplicado reutilizable con [`SphereRenderer::render_into`].
+pub use tiny_skia::Pixmap;
 
 /// Tamaño por defecto de la esfera, en píxeles.
 pub const DEFAULT_SPHERE_SIZE: u32 = 220;

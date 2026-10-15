@@ -48,9 +48,18 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
-## 📊 Métricas Globales (2026-10-14)
+## 🧾 Deuda técnica
 
-- ✅ **149 pruebas unitarias pasando al 100%** en todo el workspace (**0 fallos**).
+- [ ] **Unificar `JarvisCore`** (hallazgo QA, HU-4 de `docs/specs/brief-hu-overlay-event-loop.md`): `ConversationCoordinator` y `ServerState` mantienen núcleos independientes. La esfera ya lee el estado de `ServerState::state()` (fuente de verdad del IPC) y el nivel de audio del coordinador, pero un `start_listening()` del coordinador no se refleja en el color de la esfera. Requiere compartir un único núcleo (`Arc<Mutex<JarvisCore>>` o eventos) cambiando APIs de `jarvis-ipc`/`jarvis-audio`.
+- [ ] **CPU en reposo de la esfera** (~6 % de un núcleo en release a 30 FPS): `SphereRenderer::render_into` cuesta ~1,6 ms por frame a 220×220. Objetivo M5 < 5 %: cachear el halo estático o bajar a 20 FPS en `Idle`.
+- [ ] **Clippy en Windows** (`--target x86_64-pc-windows-gnu`): `result_large_err` en `jarvis-core/src/config.rs` (`ConfigError::Parse`). `cargo check` compila; solo falla el lint.
+
+---
+
+## 📊 Métricas Globales (2026-10-15)
+
+- ✅ **163 pruebas unitarias pasando al 100%** en todo el workspace (**0 fallos**).
+- ✅ Bucle principal con apagado limpio (SIGINT/SIGTERM < 50 ms) y overlay `zwlr_layer_shell_v1` en KWin Wayland, con fallback headless.
 - ✅ `make check` / `make lint` / `make fmt-check` limpios (sin warnings).
 - ✅ Binario `jarvis-app` con CLI operativo: `--version` (`-v`), `--check` (`-c`), `--help` (`-h`).
 - ✅ Socket IPC activo y listo para conexiones de Fokkus IDE.

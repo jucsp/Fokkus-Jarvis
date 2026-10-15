@@ -1,10 +1,23 @@
 //! Abstracción de la superficie overlay (ventana flotante transparente).
 //!
-//! En Fase 1 solo se definen el trait y los tipos; los backends reales
-//! (`wayland_layer` con `zwlr_layer_shell_v1` y `winit_window`) llegan en las
-//! tareas 1.4 y 1.5.
+//! Define el contrato [`OverlaySurface`] y sus backends:
+//!
+//! - [`WaylandLayerSurface`] (solo Linux): capa overlay real vía
+//!   `zwlr_layer_shell_v1` (KWin, Hyprland, Sway…).
+//! - [`HeadlessSurface`]: sin ventana; valida frames y regula el ritmo del bucle.
+//!
+//! El backend `winit` (X11, Windows, macOS, GNOME) llega en otra tarea.
 
 use std::fmt;
+use std::time::Duration;
+
+mod headless;
+#[cfg(target_os = "linux")]
+mod wayland_layer;
+
+pub use headless::HeadlessSurface;
+#[cfg(target_os = "linux")]
+pub use wayland_layer::{anchor_to_layer, WaylandLayerSurface};
 
 /// Tamaño de una superficie en píxeles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +92,8 @@ pub enum SurfaceBackend {
     WaylandLayer,
     /// Ventana `winit` frameless/transparente (X11, Windows, macOS, GNOME).
     Winit,
+    /// Sin ventana: solo IPC (fallback cuando no hay overlay disponible).
+    Headless,
 }
 
 impl SurfaceBackend {
@@ -125,9 +140,17 @@ impl Default for OverlayOptions {
 /// Error de superficie.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceError {
-    InvalidSize { width: u32, height: u32 },
-    InvalidFrame { expected: usize, actual: usize },
+    InvalidSize {
+        width: u32,
+        height: u32,
+    },
+    InvalidFrame {
+        expected: usize,
+        actual: usize,
+    },
     BackendUnavailable(&'static str),
+    /// Fallo de comunicación con el compositor (conexión, buffer compartido…).
+    Backend(String),
 }
 
 impl fmt::Display for SurfaceError {
@@ -145,14 +168,38 @@ impl fmt::Display for SurfaceError {
             SurfaceError::BackendUnavailable(backend) => {
                 write!(f, "backend de superficie no disponible: {backend}")
             }
+            SurfaceError::Backend(detail) => write!(f, "error del backend de superficie: {detail}"),
         }
     }
 }
 
 impl std::error::Error for SurfaceError {}
 
+/// Estado de la superficie tras despachar sus eventos.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceStatus {
+    /// La superficie sigue activa.
+    Running,
+    /// El compositor cerró la superficie o se perdió la conexión.
+    Closed,
+}
+
 /// Contrato que debe cumplir cualquier backend de ventana flotante.
 pub trait OverlaySurface {
+    /// Backend efectivo de la superficie (para el log y `--check`).
+    fn backend(&self) -> SurfaceBackend;
+
+    /// Despacha los eventos pendientes esperando como máximo `timeout`.
+    ///
+    /// Es el único punto de espera del bucle principal.
+    fn pump_events(&mut self, timeout: Duration) -> Result<SurfaceStatus, SurfaceError>;
+
+    /// `true` si conviene dibujar un frame nuevo (frame callback del compositor
+    /// o primer frame pendiente).
+    fn wants_frame(&self) -> bool {
+        true
+    }
+
     /// Tamaño actual de la superficie.
     fn size(&self) -> SurfaceSize;
 
@@ -164,6 +211,69 @@ pub trait OverlaySurface {
 
     /// Re-ancla la superficie (drag de la esfera, tarea 1.4).
     fn set_anchor(&mut self, anchor: Anchor);
+}
+
+/// Convierte píxeles RGBA premultiplicados (tiny-skia) a `Argb8888` de
+/// `wl_shm`, que en little-endian se guarda en memoria como BGRA.
+///
+/// Solo intercambia R↔B y conserva el alfa: ambos formatos son
+/// premultiplicados, así que no se despremultiplica.
+pub fn rgba_premul_to_argb8888(src: &[u8], dst: &mut [u8]) -> Result<(), SurfaceError> {
+    if src.len() != dst.len() || !src.len().is_multiple_of(4) {
+        return Err(SurfaceError::InvalidFrame {
+            expected: src.len(),
+            actual: dst.len(),
+        });
+    }
+    for (&[r, g, b, a], d) in src
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<4>().0)
+    {
+        *d = [b, g, r, a];
+    }
+    Ok(())
+}
+
+/// Abre la superficie overlay del sistema.
+///
+/// En Linux con `WAYLAND_DISPLAY` intenta una capa `zwlr_layer_shell_v1`. Si no
+/// es posible devuelve [`SurfaceError::BackendUnavailable`] para que la app
+/// decida el fallback (normalmente [`HeadlessSurface`]).
+pub fn open_overlay(opts: OverlayOptions) -> Result<Box<dyn OverlaySurface>, SurfaceError> {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return Err(SurfaceError::BackendUnavailable("WAYLAND_DISPLAY"));
+        }
+        let surface = WaylandLayerSurface::open(opts)?;
+        Ok(Box::new(surface))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = opts;
+        Err(SurfaceError::BackendUnavailable("winit"))
+    }
+}
+
+/// Sonda de disponibilidad del overlay sin mapear ninguna capa.
+///
+/// Abre la conexión con el compositor, comprueba los globals necesarios y la
+/// cierra. Pensada para `--check`.
+pub fn probe_overlay() -> Result<SurfaceBackend, SurfaceError> {
+    #[cfg(target_os = "linux")]
+    {
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() {
+            return Err(SurfaceError::BackendUnavailable("WAYLAND_DISPLAY"));
+        }
+        wayland_layer::probe()?;
+        Ok(SurfaceBackend::WaylandLayer)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(SurfaceError::BackendUnavailable("winit"))
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +307,37 @@ mod tests {
         assert_eq!(opts.size.width, 220);
         assert_eq!(opts.size.height, 220);
         assert_eq!(opts.keyboard_interactivity, KeyboardInteractivity::OnDemand);
+    }
+
+    #[test]
+    fn rgba_to_argb8888_swaps_red_and_blue() {
+        let src = [10, 20, 30, 40, 255, 0, 128, 255];
+        let mut dst = [0u8; 8];
+        rgba_premul_to_argb8888(&src, &mut dst).unwrap();
+        // BGRA en memoria: R↔B intercambiados, G y A intactos.
+        assert_eq!(dst, [30, 20, 10, 40, 128, 0, 255, 255]);
+    }
+
+    #[test]
+    fn rgba_to_argb8888_keeps_transparent_pixels() {
+        let src = [0u8; 4];
+        let mut dst = [7u8; 4];
+        rgba_premul_to_argb8888(&src, &mut dst).unwrap();
+        assert_eq!(dst, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rgba_to_argb8888_rejects_mismatched_lengths() {
+        let src = [0u8; 8];
+        let mut dst = [0u8; 4];
+        assert_eq!(
+            rgba_premul_to_argb8888(&src, &mut dst),
+            Err(SurfaceError::InvalidFrame {
+                expected: 8,
+                actual: 4,
+            })
+        );
+        let mut odd = [0u8; 6];
+        assert!(rgba_premul_to_argb8888(&[0u8; 6], &mut odd).is_err());
     }
 }

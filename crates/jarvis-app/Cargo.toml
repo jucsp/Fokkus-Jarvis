@@ -15,3 +15,6 @@ jarvis-core = { path = "../jarvis-core" }
 jarvis-ipc = { path = "../jarvis-ipc" }
 jarvis-render = { path = "../jarvis-render" }
 jarvis-shell = { path = "../jarvis-shell" }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true

@@ -6,13 +6,16 @@
 //! 1. Analiza los argumentos de línea de comandos (`--version`, `--check`).
 //! 2. Adquiere el lock de instancia única.
 //! 3. Carga la configuración persistente (`~/.config/fokkus-jarvis/config.toml`).
-//! 4. Instancia el núcleo ([`JarvisCore`]), el motor TTS ([`EdgeTtsEngine`]), la
-//!    señal de reproducción ([`AudioPlayback`]) y el gestor conversacional
-//!    ([`ConversationCoordinator`]) de los Issues #3 y #4.
+//! 4. Instancia el motor TTS ([`EdgeTtsEngine`]), la señal de reproducción
+//!    ([`AudioPlayback`]) y el gestor conversacional ([`ConversationCoordinator`])
+//!    de los Issues #3 y #4.
 //! 5. Arranca el servidor IPC en `~/.fokkus/jarvis.sock` en un hilo de fondo
 //!    no bloqueante, listo para Fokkus IDE (Issue #5).
 //! 6. Pre-sintetiza los fillers de caché en segundo plano si hay backend TTS.
-//! 7. Renderiza la esfera líquida en la superficie overlay.
+//! 7. Abre la capa overlay (o el modo headless) y entra en el bucle principal
+//!    ([`runtime::run_loop`]) hasta SIGINT/SIGTERM o el cierre de la capa.
+
+mod runtime;
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -23,10 +26,9 @@ use jarvis_audio::{
 use jarvis_core::single_instance::{self, InstanceError};
 use jarvis_core::{JarvisConfig, JarvisCore};
 use jarvis_ipc::{IpcError, IpcServer, ServerState, SpeechSink, Utterance};
-use jarvis_render::SphereRenderer;
-use jarvis_shell::{
-    Anchor, FrameBuffer, OverlaySurface, SurfaceBackend, SurfaceError, SurfaceSize,
-};
+use jarvis_render::{Pixmap, SphereRenderer};
+use jarvis_shell::{HeadlessSurface, OverlayOptions, OverlaySurface, SurfaceError, SurfaceSize};
+use runtime::{LoopExit, SttAvailability};
 
 /// Acción solicitada en la línea de comandos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,32 +77,6 @@ impl SpeechSink for PlaybackSpeechSink {
     }
 }
 
-/// Superficie de prueba que valida los frames sin abrir una ventana real.
-struct HeadlessSurface {
-    size: SurfaceSize,
-}
-
-impl OverlaySurface for HeadlessSurface {
-    fn size(&self) -> SurfaceSize {
-        self.size
-    }
-
-    fn present(&mut self, frame: &FrameBuffer<'_>) -> Result<(), SurfaceError> {
-        let expected = self.size.width as usize * self.size.height as usize * 4;
-        if frame.data.len() != expected {
-            return Err(SurfaceError::InvalidFrame {
-                expected,
-                actual: frame.data.len(),
-            });
-        }
-        Ok(())
-    }
-
-    fn set_visible(&mut self, _visible: bool) {}
-
-    fn set_anchor(&mut self, _anchor: Anchor) {}
-}
-
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
@@ -146,10 +122,10 @@ fn print_usage() {
     println!("el socket listo para conexiones de Fokkus IDE.");
 }
 
-/// Arranca el asistente completo.
+/// Arranca el asistente completo y lo mantiene vivo como daemon.
 fn run() -> ExitCode {
     // Instancia única: impide que corran dos procesos concurrentes.
-    let _lock = match single_instance::acquire() {
+    let lock = match single_instance::acquire() {
         Ok(lock) => lock,
         Err(InstanceError::AlreadyRunning) => {
             eprintln!("Fokkus-Jarvis ya está en ejecución.");
@@ -160,6 +136,9 @@ fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    // Señales antes de levantar nada: un Ctrl+C temprano también apaga en orden.
+    let shutdown = runtime::install_shutdown_flag();
 
     // Configuración persistente. Si el archivo está corrupto, se degrada a los
     // valores por defecto para no bloquear el arranque.
@@ -172,16 +151,17 @@ fn run() -> ExitCode {
     };
 
     // Subsistemas del diálogo (Issues #3 y #4).
-    let core = JarvisCore::new(config.clone());
     let tts = EdgeTtsEngine::with_voice(config.voice_id.clone());
     let tts_backend = tts.backend();
     let playback = AudioPlayback::new();
     let mut coordinator = ConversationCoordinator::with_config(tts, config.clone());
 
     // Servidor IPC para Fokkus IDE (Issue #5): hilo de fondo no bloqueante.
+    // `ServerState` es la fuente de verdad del estado que dibuja la esfera.
     let sink = Arc::new(PlaybackSpeechSink { playback });
-    let state = Arc::new(ServerState::new(JarvisCore::new(config.clone())).with_speech_sink(sink));
-    let mut server = IpcServer::new(state);
+    let server_state =
+        Arc::new(ServerState::new(JarvisCore::new(config.clone())).with_speech_sink(sink));
+    let mut server = IpcServer::new(Arc::clone(&server_state));
     if let Err(e) = server.start() {
         eprintln!("No se pudo arrancar el servidor IPC: {e}");
         return ExitCode::FAILURE;
@@ -191,7 +171,7 @@ fn run() -> ExitCode {
     // Pre-síntesis de fillers en segundo plano: nunca bloquea el arranque.
     spawn_filler_pre_synthesis(config.voice_id.clone());
 
-    // Superficie overlay con la esfera líquida.
+    // Superficie overlay con la esfera líquida (o headless si no hay overlay).
     let renderer = SphereRenderer::new();
     let mut surface = match prepare_surface(&renderer) {
         Ok(surface) => surface,
@@ -200,37 +180,62 @@ fn run() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    let Some(mut pixmap) = Pixmap::new(renderer.size(), renderer.size()) else {
+        eprintln!("No se pudo reservar el buffer de la esfera.");
+        return ExitCode::FAILURE;
+    };
     surface.set_visible(true);
-    if let Err(e) = present_frame(&renderer, &mut surface, &core, 0.0) {
-        eprintln!("No se pudo presentar el primer frame: {e}");
-        return ExitCode::FAILURE;
+
+    // STT: sonda única; sin whisper el asistente queda en modo degradado.
+    let stt = SttAvailability::probe(&WhisperEngine::new());
+    runtime::start_listening_if_ready(&mut coordinator, &stt);
+
+    let backend = surface.backend();
+    let mut on_first_frame = || {
+        println!(
+            "Fokkus-Jarvis {} — voz={} ({}) · TTS={:?} · STT={} · estado={:?}",
+            env!("CARGO_PKG_VERSION"),
+            config.voice_id,
+            config.voice_lang,
+            tts_backend,
+            stt.label(),
+            server_state.state(),
+        );
+        println!(
+            "Esfera renderizada: {}x{} px (backend: {:?})",
+            renderer.size(),
+            renderer.size(),
+            backend,
+        );
+        println!(
+            "Fokkus-Jarvis iniciado correctamente. Socket IPC activo en {} — listo para conexiones de Fokkus IDE.",
+            socket_path.display(),
+        );
+    };
+    let mut source = || (server_state.state(), coordinator.core().audio_level());
+    let exit = runtime::run_loop(
+        surface.as_mut(),
+        &renderer,
+        &mut pixmap,
+        &mut source,
+        &shutdown,
+        None,
+        &mut on_first_frame,
+    );
+
+    // Apagado ordenado: superficie → coordinador → IPC (borra el socket) → lock.
+    surface.set_visible(false);
+    drop(surface);
+    drop(coordinator);
+    server.shutdown();
+    drop(server);
+    drop(lock);
+
+    match exit {
+        LoopExit::Signal => println!("Fokkus-Jarvis detenido por señal."),
+        LoopExit::SurfaceClosed => println!("Fokkus-Jarvis detenido: el compositor cerró la capa."),
+        LoopExit::MaxFrames => {}
     }
-
-    // El asistente queda a la escucha del usuario.
-    if let Err(e) = coordinator.start_listening() {
-        eprintln!("No se pudo entrar en escucha: {e}");
-        return ExitCode::FAILURE;
-    }
-
-    println!(
-        "Fokkus-Jarvis {} — voz={} ({}) · TTS={:?} · estado={:?}",
-        env!("CARGO_PKG_VERSION"),
-        config.voice_id,
-        config.voice_lang,
-        tts_backend,
-        coordinator.state(),
-    );
-    println!(
-        "Esfera renderizada: {}x{} px (backend detectado: {:?})",
-        renderer.size(),
-        renderer.size(),
-        SurfaceBackend::detect(),
-    );
-    println!(
-        "Fokkus-Jarvis iniciado correctamente. Socket IPC activo en {} — listo para conexiones de Fokkus IDE.",
-        socket_path.display(),
-    );
-
     ExitCode::SUCCESS
 }
 
@@ -344,6 +349,20 @@ fn run_health_check() -> ExitCode {
     }
     drop(server);
 
+    // 6. Superficie overlay.
+    match jarvis_shell::probe_overlay() {
+        Ok(backend) => checks.push((
+            "superficie",
+            Health::Ok,
+            format!("{backend:?} (zwlr_layer_shell_v1 disponible)"),
+        )),
+        Err(e) => checks.push((
+            "superficie",
+            Health::Warn,
+            format!("overlay no disponible ({e}); modo headless, solo IPC"),
+        )),
+    }
+
     // Informe.
     for (name, health, detail) in &checks {
         let status = health.label();
@@ -382,21 +401,29 @@ fn spawn_filler_pre_synthesis(voice_id: String) {
     }
 }
 
-/// Prepara la superficie overlay a partir del tamaño del renderizador.
-fn prepare_surface(renderer: &SphereRenderer) -> Result<HeadlessSurface, SurfaceError> {
+/// Abre la superficie overlay a partir del tamaño del renderizador.
+///
+/// Si no hay overlay disponible (sin `WAYLAND_DISPLAY`, sin layer-shell…)
+/// avisa y degrada a [`HeadlessSurface`]: el proceso sigue vivo como daemon IPC.
+fn prepare_surface(renderer: &SphereRenderer) -> Result<Box<dyn OverlaySurface>, SurfaceError> {
     let size = SurfaceSize::new(renderer.size(), renderer.size())?;
-    Ok(HeadlessSurface { size })
-}
-
-/// Renderiza y presenta un frame de la esfera.
-fn present_frame(
-    renderer: &SphereRenderer,
-    surface: &mut HeadlessSurface,
-    core: &JarvisCore,
-    t: f32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let frame = renderer.render(core.audio_level(), core.state(), t)?;
-    let frame_buffer = FrameBuffer::new(frame.data(), frame.width(), frame.height())?;
-    surface.present(&frame_buffer)?;
-    Ok(())
+    let options = OverlayOptions {
+        size,
+        ..OverlayOptions::default()
+    };
+    let surface = match jarvis_shell::open_overlay(options) {
+        Ok(surface) => surface,
+        Err(e) => {
+            eprintln!("[shell] overlay no disponible ({e}); modo headless, solo IPC");
+            Box::new(HeadlessSurface::new(size))
+        }
+    };
+    // La esfera tiene tamaño fijo: superficie y renderer deben coincidir.
+    if surface.size() != size {
+        return Err(SurfaceError::InvalidSize {
+            width: surface.size().width,
+            height: surface.size().height,
+        });
+    }
+    Ok(surface)
 }
