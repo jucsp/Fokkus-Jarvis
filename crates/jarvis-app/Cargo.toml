@@ -3,6 +3,7 @@ name = "jarvis-app"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 description = "Binario de Fokkus-Jarvis: orquesta núcleo, render, shell, audio e IPC."
 
 [[bin]]
@@ -10,6 +11,7 @@ name = "fokkus-jarvis"
 path = "src/main.rs"
 
 [dependencies]
+cpal.workspace = true
 jarvis-audio = { path = "../jarvis-audio" }
 jarvis-core = { path = "../jarvis-core" }
 jarvis-ipc = { path = "../jarvis-ipc" }

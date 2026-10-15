@@ -7,19 +7,53 @@
 //! - [`stt`]: transcripción local con Whisper (binario del sistema).
 //! - [`conversation`]: gestor de diálogo con fillers contextuales e interrupción
 //!   humana (Issues #3 y #4).
+//! - [`io`]: captura y reproducción con `cpal` (callbacks sin locks ni
+//!   asignaciones, métricas atómicas).
+//! - [`dsp`]: remuestreo a 16 kHz, AEC3 + NS + AGC2 y re-encuadre (hilo
+//!   `jarvis-audio-dsp`).
+//! - [`vad`]: detección de voz con `earshot` y *endpointing* de turno.
+//! - [`events`]: eventos de voz hacia el coordinador.
+//! - [`activation`]: palabra de activación "Jarvis", ventana de seguimiento y
+//!   modo silencio (HU-4).
+//! - [`models`]: descarga y verificación segura de modelos whisper (HU-7).
+//! - [`brain`]: cliente de la API de Mensajes de Anthropic con streaming SSE y
+//!   memoria de turnos (HU-6).
 
+pub mod activation;
+pub mod brain;
 pub mod conversation;
+pub mod dsp;
+pub mod events;
+pub mod io;
+pub mod models;
 pub mod playback;
 pub mod stt;
 pub mod tts;
+pub mod vad;
 pub mod voices;
 
+pub use activation::{Activation, ActivationDetector};
+pub use brain::{
+    resolve_api_key, BrainError, CancellationToken, ClaudeClient, Completion, Message, SseEvent,
+    SseParser,
+};
 pub use conversation::{
     classify_intent, BackgroundTasks, ConversationCoordinator, ConversationError,
 };
+pub use dsp::{
+    spawn_dsp_thread, DspError, DspHandle, DspMetrics, DspMetricsSnapshot, DspThreadConfig,
+    LatencyProbe, ProcessorConfig,
+};
+pub use events::{Segment, VoiceEvent};
+pub use io::{AudioError, AudioMetrics, AudioMetricsSnapshot};
+pub use models::{
+    default_models_dir, validate_header, HttpSource, ModelError, ModelHeader, ModelManager,
+    ModelSource, ModelSpec, ModelStatus, VerifiedModel, MODELS, WHISPER_BASE_Q5_1, WHISPER_TINY,
+};
 pub use playback::AudioPlayback;
-pub use stt::{SttError, WhisperEngine};
-pub use tts::{EdgeTtsEngine, FillerCategory, TtsBackend, TtsError};
+pub use stt::{SttError, Transcriber, WhisperEngine};
+pub use tts::{EdgeTtsEngine, FillerCategory, PcmAudio, PhraseSplitter, TtsBackend, TtsError};
+pub use vad::{EndpointConfig, Endpointer, VadDetector};
 pub use voices::{resolve_voice, Gender, VoiceInfo, DEFAULT_VOICE_ID, DEFAULT_VOICE_LANG, VOICES};
 
 #[cfg(test)]

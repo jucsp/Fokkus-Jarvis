@@ -20,8 +20,11 @@ mod runtime;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use cpal::traits::DeviceTrait;
+
 use jarvis_audio::{
-    AudioPlayback, ConversationCoordinator, EdgeTtsEngine, TtsBackend, WhisperEngine,
+    AudioPlayback, ConversationCoordinator, EdgeTtsEngine, ModelManager, ModelStatus, TtsBackend,
+    WHISPER_BASE_Q5_1,
 };
 use jarvis_core::single_instance::{self, InstanceError};
 use jarvis_core::{JarvisConfig, JarvisCore};
@@ -187,7 +190,11 @@ fn run() -> ExitCode {
     surface.set_visible(true);
 
     // STT: sonda única; sin whisper el asistente queda en modo degradado.
-    let stt = SttAvailability::probe(&WhisperEngine::new());
+    let model_manager = ModelManager::new().ok();
+    let stt = match &model_manager {
+        Some(mgr) => SttAvailability::probe(mgr),
+        None => SttAvailability::NoDataDir,
+    };
     runtime::start_listening_if_ready(&mut coordinator, &stt);
 
     let backend = surface.backend();
@@ -306,33 +313,84 @@ fn run_health_check() -> ExitCode {
         )),
     }
 
-    // 4. Backend STT (Whisper).
-    let stt = WhisperEngine::new();
-    match stt.binary() {
-        Some(binary) => {
-            let model_ready = stt.model().is_some_and(|path| path.is_file());
-            if model_ready {
-                checks.push((
-                    "STT",
-                    Health::Ok,
-                    format!("whisper ({}) con modelo local", binary.display()),
-                ));
-            } else {
-                checks.push((
-                    "STT",
-                    Health::Warn,
-                    format!("whisper ({}) sin modelo local", binary.display()),
-                ));
+    // 4. Backend STT y modelos Whisper.
+    match ModelManager::new() {
+        Ok(manager) => match manager.status(&WHISPER_BASE_Q5_1) {
+            ModelStatus::Verified { sha256 } => checks.push((
+                "STT",
+                Health::Ok,
+                format!(
+                    "{} verificado en {} (sha256 {})",
+                    WHISPER_BASE_Q5_1.id,
+                    manager.path_of(&WHISPER_BASE_Q5_1).display(),
+                    sha256
+                ),
+            )),
+            ModelStatus::Missing => checks.push((
+                "STT",
+                Health::Warn,
+                format!(
+                    "modelo no descargado aún en {}",
+                    manager.path_of(&WHISPER_BASE_Q5_1).display()
+                ),
+            )),
+            ModelStatus::Invalid { reason } => {
+                checks.push(("STT", Health::Fail, format!("modelo corrupto: {reason}")))
             }
-        }
-        None => checks.push((
+        },
+        Err(_) => checks.push((
             "STT",
             Health::Warn,
-            "sin whisper-cli/whisper-cpp en PATH".to_string(),
+            "no se pudo resolver ~/.local/share".to_string(),
         )),
     }
 
-    // 5. Socket IPC.
+    // 5. Dispositivos de audio.
+    let host = cpal::default_host();
+    let input = jarvis_audio::io::select_input_device(&host, None);
+    let output = jarvis_audio::io::select_output_device(&host, None);
+    match (input, output) {
+        (Ok(input), Ok(output)) => {
+            let input_name = device_name(&input);
+            let output_name = device_name(&output);
+            checks.push((
+                "audio",
+                Health::Ok,
+                format!("entrada: {input_name} · salida: {output_name}"),
+            ));
+        }
+        (Err(_), Ok(_)) => checks.push((
+            "audio",
+            Health::Warn,
+            "no se detectó micrófono (altavoces disponibles)".to_string(),
+        )),
+        (Ok(_), Err(_)) => checks.push((
+            "audio",
+            Health::Warn,
+            "no se detectó altavoz (micrófono disponible)".to_string(),
+        )),
+        (Err(_), Err(_)) => checks.push((
+            "audio",
+            Health::Warn,
+            "no se detectaron micrófono ni altavoces".to_string(),
+        )),
+    }
+
+    // 6. API key de Claude / Anthropic.
+    match jarvis_audio::brain::resolve_api_key(None) {
+        Ok(_) => checks.push((
+            "API Anthropic",
+            Health::Ok,
+            "clave de API Anthropic configurada (keyring/entorno)".to_string(),
+        )),
+        Err(_) => checks.push((
+            "API Anthropic",
+            Health::Warn,
+            "falta ANTHROPIC_API_KEY en entorno o keyring".to_string(),
+        )),
+    }
+
+    // 7. Socket IPC.
     let mut server = IpcServer::new(Arc::new(ServerState::with_default_config()));
     match server.bind() {
         Ok(()) => checks.push((
@@ -349,7 +407,7 @@ fn run_health_check() -> ExitCode {
     }
     drop(server);
 
-    // 6. Superficie overlay.
+    // 8. Superficie overlay.
     match jarvis_shell::probe_overlay() {
         Ok(backend) => checks.push((
             "superficie",
@@ -376,6 +434,14 @@ fn run_health_check() -> ExitCode {
         println!("Diagnóstico: todos los subsistemas operativos.");
         ExitCode::SUCCESS
     }
+}
+
+/// Nombre legible de un dispositivo `cpal` (o `desconocido` si no se puede leer).
+fn device_name(device: &cpal::Device) -> String {
+    device
+        .description()
+        .map(|d| d.name().to_string())
+        .unwrap_or_else(|_| "desconocido".to_string())
 }
 
 /// Lanza la pre-síntesis de fillers en un hilo de fondo.

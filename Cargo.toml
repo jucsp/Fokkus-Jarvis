@@ -10,9 +10,12 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.99"
+# Los crates del workspace no se publican en crates.io (cargo-deny los trata
+# como privados mientras se resuelve la licencia del producto, decisión D-1).
+publish = false
 
 [workspace.dependencies]
 crossbeam-channel = "0.5"
@@ -29,3 +32,44 @@ serde_json = "1"
 smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
 # Apagado limpio con SIGINT/SIGTERM en el bucle principal.
 signal-hook = "0.4"
+
+# ─── Conversación nativa v0.2.0 ──────────────────────────────────────────────
+# Stack aprobado en docs/specs/sdd-conversacion-nativa-v0.2.0.md §4, con el
+# análisis de seguridad de la §3. Nada de tokio, reqwest, openssl, native-tls
+# ni aws-lc en el árbol: lo verifica `cargo deny check` (deny.toml).
+# Audio E/S nativo (backend ALSA, vía pipewire-alsa). Requiere alsa-lib-devel.
+cpal = "0.18.2"
+# Buffers lock-free entre los callbacks de audio y los hilos de DSP.
+ringbuf = "0.5.3"
+# Remuestreo 48 kHz ↔ 16 kHz y a la tasa del dispositivo de salida.
+rubato = "5.0.1"
+# VAD neuronal en Rust puro, sin dependencias.
+earshot = "1.2.2"
+# AEC3 + NS + AGC2 (port Rust puro de WebRTC APM).
+sonora = "0.2.0"
+# STT enlazado. SEC-01: whisper.cpp vendorizado debe ser >= 1.9.5 (ver
+# [patch.crates-io] y el gate de CI). Requiere cmake, clang y un compilador C++.
+whisper-rs = "0.16.0"
+# TTS en línea (Edge). La feature `blocking` usa ureq + tungstenite con rustls;
+# SEC-03 exige que el proveedor criptográfico sea ring y no aws-lc-rs.
+msedge-tts = { version = "0.4.1", default-features = false, features = ["blocking"] }
+# Decodificación MP3 de la salida de Edge (solo el códec necesario).
+symphonia = { version = "0.6.1", default-features = false, features = ["mp3"] }
+# Inferencia de Piper (TTS offline). SEC-07: sin `download-binaries`; carga
+# dinámica del onnxruntime 1.22 de Fedora (`api-22` = API mínima de ORT 1.22).
+ort = { version = "=2.0.0-rc.14", default-features = false, features = ["std", "load-dynamic", "api-22"] }
+# HTTP síncrono (Claude Messages API y descarga de modelos): rustls + ring.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls", "json"] }
+# API key en Secret Service/KWallet, nunca en texto plano.
+keyring = "4.2.0"
+# Verificación SHA-256 de los modelos descargados.
+sha2 = "0.11.1"
+
+[patch.crates-io]
+# SEC-03: msedge-tts 0.4.1 fija aws-lc-rs en código y en las features de
+# rustls. Copia local con el cambio mínimo a ring (ver vendor/msedge-tts/FOKKUS-PATCH.md).
+msedge-tts = { path = "vendor/msedge-tts" }
+# SEC-01: whisper-rs-sys 0.15.0 vendoriza whisper.cpp 1.8.3 (CVE-2026-110810 y
+# otros). Copia local con whisper.cpp v1.9.5 (commit d1be6fde) y bindings
+# regenerados (ver vendor/whisper-rs-sys/FOKKUS-PATCH.md).
+whisper-rs-sys = { path = "vendor/whisper-rs-sys" }

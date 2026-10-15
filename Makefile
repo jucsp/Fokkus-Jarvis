@@ -2,7 +2,7 @@
 # Cargo y rustc están instalados en ~/.cargo/bin.
 CARGO := $(HOME)/.cargo/bin/cargo
 
-.PHONY: build test check fmt fmt-check lint run audit clean
+.PHONY: build test check fmt fmt-check lint deny whisper-version run audit clean
 
 build:
 	$(CARGO) build --workspace
@@ -19,18 +19,23 @@ fmt:
 fmt-check:
 	$(CARGO) fmt --all -- --check
 
-lint:
+lint: deny
 	$(CARGO) clippy --workspace --all-targets -- -D warnings
+
+# Gate de cadena de suministro (deny.toml, HU-0). Requiere cargo-deny.
+deny:
+	$(CARGO) deny check
+
+# SEC-01: whisper.cpp vendorizado >= 1.9.5.
+whisper-version:
+	scripts/check-whisper-version.sh --self-test
+	scripts/check-whisper-version.sh
 
 run:
 	$(CARGO) run -p jarvis-app
 
-audit:
-	@if command -v cargo-audit >/dev/null 2>&1; then \
-		cargo-audit audit; \
-	else \
-		echo "SKIP: cargo-audit no está instalado (opcional)"; \
-	fi
+audit: deny whisper-version
+	$(CARGO) audit
 
 clean:
 	$(CARGO) clean

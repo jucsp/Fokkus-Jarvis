@@ -1,25 +1,31 @@
-//! Gestor conversacional de Fokkus-Jarvis (Issues #3 y #4).
+//! Gestor conversacional de Fokkus-Jarvis (Issues #3, #4 y HU-9).
 //!
 //! `ConversationCoordinator` integra la máquina de estados ([`JarvisCore`]), la
-//! señal de reproducción ([`AudioPlayback`]) y el motor de síntesis
-//! ([`EdgeTtsEngine`]) para dar forma al diálogo:
+//! señal de reproducción ([`AudioPlayback`]), el motor de síntesis
+//! ([`EdgeTtsEngine`]) y el cliente LLM ([`ClaudeClient`]) para dar forma al
+//! diálogo de punta a punta:
 //!
 //! * **Fillers (< 300 ms):** al terminar el turno del usuario se entra en
 //!   `Thinking` y se dispara de inmediato una frase de relleno contextual
 //!   pre-sintetizada en caché, eliminando el silencio incómodo.
 //! * **Barge-in (< 50 ms):** si el usuario habla mientras Jarvis está `Speaking`,
-//!   se corta la reproducción al instante y se vuelve a `Listening`.
+//!   se corta la reproducción al instante, se cancela la inferencia activa y se
+//!   vuelve a `Listening`.
+//! * **Streaming de respuesta:** los *tokens* del LLM se segmentan en frases con
+//!   [`PhraseSplitter`] y cada frase se sintetiza y entrega en cuanto está
+//!   completa, de modo que la voz arranca antes de que termine la generación.
 //! * **Preservación del Swarm:** la interrupción de voz NUNCA cancela las tareas
 //!   técnicas en segundo plano; solo el usuario puede hacerlo de forma explícita
-//!   (dictamen §4.2).
+//!   (dictamen §4.2, CA-9.4).
 
 use std::fmt;
 use std::path::PathBuf;
 
 use jarvis_core::{JarvisConfig, JarvisCore, JarvisState, TransitionError};
 
+use crate::brain::{BrainError, ClaudeClient, Completion};
 use crate::playback::AudioPlayback;
-use crate::tts::{EdgeTtsEngine, FillerCategory, TtsError};
+use crate::tts::{EdgeTtsEngine, FillerCategory, PcmAudio, PhraseSplitter, TtsError};
 
 /// Palabras clave que identifican órdenes de desarrollo (dictamen §4.1).
 pub const DEV_KEYWORDS: &[&str] = &[
@@ -76,6 +82,8 @@ pub enum ConversationError {
     Transition(TransitionError),
     /// El motor TTS falló.
     Tts(TtsError),
+    /// El cliente LLM falló (red, API, cancelación inesperada…).
+    Brain(BrainError),
 }
 
 impl fmt::Display for ConversationError {
@@ -83,6 +91,7 @@ impl fmt::Display for ConversationError {
         match self {
             ConversationError::Transition(e) => write!(f, "error de transición: {e}"),
             ConversationError::Tts(e) => write!(f, "error de TTS: {e}"),
+            ConversationError::Brain(e) => write!(f, "error del cerebro: {e}"),
         }
     }
 }
@@ -98,6 +107,12 @@ impl From<TransitionError> for ConversationError {
 impl From<TtsError> for ConversationError {
     fn from(value: TtsError) -> Self {
         ConversationError::Tts(value)
+    }
+}
+
+impl From<BrainError> for ConversationError {
+    fn from(value: BrainError) -> Self {
+        ConversationError::Brain(value)
     }
 }
 
@@ -154,7 +169,33 @@ impl BackgroundTasks {
     }
 }
 
-/// Coordinador del flujo conversacional (fillers + barge-in).
+/// Fuente de tokens de streaming. Permite probar el coordinador sin red
+/// inyectando un cliente falso.
+trait TokenStream {
+    fn stream_tokens(
+        &self,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError>;
+
+    fn cancel(&self);
+}
+
+impl TokenStream for ClaudeClient {
+    fn stream_tokens(
+        &self,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError> {
+        self.stream(user_text, on_token)
+    }
+
+    fn cancel(&self) {
+        ClaudeClient::cancel(self);
+    }
+}
+
+/// Coordinador del flujo conversacional (fillers + barge-in + streaming HU-9).
 pub struct ConversationCoordinator {
     core: JarvisCore,
     playback: AudioPlayback,
@@ -165,6 +206,10 @@ pub struct ConversationCoordinator {
     utterance_generation: u64,
     /// `true` si el turno en curso fue interrumpido por barge-in.
     interrupted: bool,
+    /// Motor de síntesis inyectable, solo en tests.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    synth_override: Option<Box<dyn Fn(&str) -> Result<PcmAudio, TtsError>>>,
 }
 
 impl ConversationCoordinator {
@@ -184,6 +229,8 @@ impl ConversationCoordinator {
             last_filler: None,
             utterance_generation: 0,
             interrupted: false,
+            #[cfg(test)]
+            synth_override: None,
         }
     }
 
@@ -300,13 +347,15 @@ impl ConversationCoordinator {
     /// Interrupción humana en tiempo real (*barge-in*).
     ///
     /// Si el estado actual es `Speaking`, corta la reproducción de inmediato
-    /// (marca de parada + nuevo `generation`) y vuelve a `Listening` en el mismo
-    /// hilo lógico, en microsegundos (< 50 ms).
+    /// (marca de parada + nuevo `generation`), cancela la inferencia activa del
+    /// cliente y vuelve a `Listening` en el mismo hilo lógico, en microsegundos
+    /// (< 50 ms).
     ///
-    /// Las tareas del Swarm en segundo plano NO se tocan ni se cancelan.
+    /// Las tareas del Swarm en segundo plano NO se tocan ni se cancelan
+    /// (CA-9.4).
     ///
     /// Devuelve `true` solo si hubo una interrupción efectiva.
-    pub fn handle_barge_in(&mut self) -> bool {
+    pub fn handle_barge_in(&mut self, client: &ClaudeClient) -> bool {
         if self.core.state() != JarvisState::Speaking {
             // No hay locución que interrumpir: operación nula.
             return false;
@@ -315,6 +364,8 @@ impl ConversationCoordinator {
         // Corte acústico instantáneo: señal de parada + invalidación de generación.
         self.playback.stop();
         self.interrupted = true;
+        // Cancela la inferencia en curso (idempotente si ya terminó).
+        client.cancel();
 
         // Speaking -> Listening de forma inmediata.
         // La transición es válida por tabla, pero ante cualquier fallo no debe
@@ -347,11 +398,129 @@ impl ConversationCoordinator {
     pub fn is_stale(&self, generation: u64) -> bool {
         self.playback.is_stale(generation)
     }
+
+    /// Consume el turno completo del LLM y emite el audio de cada frase.
+    ///
+    /// Conecta el *streaming* de tokens de `client` con un [`PhraseSplitter`]:
+    /// cada frase completa se sintetiza con
+    /// [`EdgeTtsEngine::synthesize_phrase_native`] y se entrega a
+    /// `on_phrase_audio`. Si el usuario interrumpe, se detiene el stream y se
+    /// descarta el audio restante.
+    pub fn run_turn_streaming<F>(
+        &mut self,
+        user_text: &str,
+        client: &ClaudeClient,
+        mut on_phrase_audio: F,
+    ) -> Result<Completion, ConversationError>
+    where
+        F: FnMut(&str, &PcmAudio),
+    {
+        self.run_turn_streaming_with(client, user_text, &mut on_phrase_audio)
+    }
+
+    fn run_turn_streaming_with<C, F>(
+        &mut self,
+        client: &C,
+        user_text: &str,
+        on_phrase_audio: &mut F,
+    ) -> Result<Completion, ConversationError>
+    where
+        C: TokenStream,
+        F: FnMut(&str, &PcmAudio),
+    {
+        let generation = self.utterance_generation;
+        let mut splitter = PhraseSplitter::new();
+        let mut saw_phrase = false;
+        let mut aborted = false;
+
+        let stream_result = client.stream_tokens(user_text, &mut |token: &str| {
+            // Barge-in en curso: detiene el stream y no sintetiza más.
+            if self.interrupted || self.playback.is_stop_requested() {
+                client.cancel();
+                aborted = true;
+                if self.core.state() == JarvisState::Speaking {
+                    let _ = self.core.transition(JarvisState::Listening);
+                }
+                return;
+            }
+
+            splitter.push(token);
+            for phrase in splitter.drain_available() {
+                if self.interrupted || self.playback.is_stop_requested() {
+                    client.cancel();
+                    aborted = true;
+                    if self.core.state() == JarvisState::Speaking {
+                        let _ = self.core.transition(JarvisState::Listening);
+                    }
+                    return;
+                }
+
+                // Primera frase de respuesta real: `Thinking → Speaking`.
+                if !saw_phrase && self.core.state() == JarvisState::Thinking {
+                    if self.core.transition(JarvisState::Speaking).is_err() {
+                        client.cancel();
+                        aborted = true;
+                        return;
+                    }
+                    saw_phrase = true;
+                }
+
+                if let Ok(pcm) = self.synthesize_phrase(&phrase) {
+                    // Locución obsoleta por barge-in: descarta y aborta.
+                    if self.is_stale(generation) {
+                        client.cancel();
+                        aborted = true;
+                        if self.core.state() == JarvisState::Speaking {
+                            let _ = self.core.transition(JarvisState::Listening);
+                        }
+                        return;
+                    }
+                    on_phrase_audio(&phrase, &pcm);
+                }
+            }
+        });
+
+        // Remanente pendiente del segmentador al terminar el stream.
+        if !aborted {
+            if let Some(remaining) = splitter.finish() {
+                if !self.interrupted && !self.playback.is_stop_requested() {
+                    if !saw_phrase && self.core.state() == JarvisState::Thinking {
+                        self.core.transition(JarvisState::Speaking)?;
+                    }
+                    if let Ok(pcm) = self.synthesize_phrase(&remaining) {
+                        if !self.is_stale(generation) {
+                            on_phrase_audio(&remaining, &pcm);
+                        }
+                    }
+                }
+            }
+        }
+
+        match stream_result {
+            Ok(completion) => {
+                if !aborted && !self.interrupted && !self.playback.is_stop_requested() {
+                    self.finish_speech(true)?;
+                }
+                Ok(completion)
+            }
+            Err(BrainError::Cancelled) if aborted => Ok(Completion::default()),
+            Err(e) => Err(ConversationError::Brain(e)),
+        }
+    }
+
+    fn synthesize_phrase(&self, text: &str) -> Result<PcmAudio, TtsError> {
+        #[cfg(test)]
+        if let Some(synth) = &self.synth_override {
+            return synth(text);
+        }
+        self.tts.synthesize_phrase_native(text)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::path::Path;
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -375,8 +544,57 @@ mod tests {
             .with_edge_tts_binary(Some(PathBuf::from("/bin/edge-tts")))
     }
 
+    fn fake_client() -> ClaudeClient {
+        ClaudeClient::with_api_key("test-key")
+    }
+
     fn cleanup(dir: &Path) {
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Cliente LLM falso que emite tokens en memoria, sin red.
+    struct FakeClient {
+        tokens: Vec<String>,
+        cancelled: Cell<bool>,
+        /// Si es `Some(n)`, detiene el `playback` justo antes del token `n`.
+        interrupt_after: Option<usize>,
+        playback: Option<AudioPlayback>,
+    }
+
+    impl TokenStream for FakeClient {
+        fn stream_tokens(
+            &self,
+            _user_text: &str,
+            on_token: &mut dyn FnMut(&str),
+        ) -> Result<Completion, BrainError> {
+            let mut count = 0usize;
+            for token in &self.tokens {
+                if self.cancelled.get() {
+                    return Err(BrainError::Cancelled);
+                }
+                count += 1;
+                if self.interrupt_after == Some(count) {
+                    if let Some(playback) = &self.playback {
+                        playback.stop();
+                    }
+                }
+                on_token(token);
+            }
+            if self.cancelled.get() {
+                return Err(BrainError::Cancelled);
+            }
+            Ok(Completion {
+                text: self.tokens.concat(),
+                stop_reason: Some("end_turn".to_string()),
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_input_tokens: 0,
+            })
+        }
+
+        fn cancel(&self) {
+            self.cancelled.set(true);
+        }
     }
 
     #[test]
@@ -517,6 +735,7 @@ mod tests {
         let dir = temp_dir("bargein-speaking");
         cleanup(&dir);
         let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        let client = fake_client();
 
         coord.start_listening().unwrap();
         coord.handle_user_utterance("hola").unwrap();
@@ -526,7 +745,7 @@ mod tests {
         let generation_before = coord.playback().generation();
         assert!(!coord.playback().is_stop_requested());
 
-        assert!(coord.handle_barge_in(), "debe interrumpir");
+        assert!(coord.handle_barge_in(&client), "debe interrumpir");
 
         assert_eq!(coord.state(), JarvisState::Listening);
         assert!(coord.playback().is_stop_requested(), "playback detenido");
@@ -535,6 +754,7 @@ mod tests {
             generation_before + 1,
             "la generación de parada se incrementa"
         );
+        assert!(client.is_cancelled(), "la inferencia se cancela");
         // La generación de la locución interrumpida queda obsoleta.
         let interrupted_gen = coord.utterance_generation();
         assert!(coord.is_stale(interrupted_gen));
@@ -547,18 +767,21 @@ mod tests {
         let dir = temp_dir("bargein-noop");
         cleanup(&dir);
         let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        let client = fake_client();
 
         // En Idle.
         assert_eq!(coord.state(), JarvisState::Idle);
-        assert!(!coord.handle_barge_in());
+        assert!(!coord.handle_barge_in(&client));
         assert_eq!(coord.state(), JarvisState::Idle);
+        assert!(!client.is_cancelled());
 
         // En Thinking (filler en curso, respuesta aún no locutada).
         coord.start_listening().unwrap();
         coord.handle_user_utterance("hola").unwrap();
         assert_eq!(coord.state(), JarvisState::Thinking);
-        assert!(!coord.handle_barge_in());
+        assert!(!coord.handle_barge_in(&client));
         assert_eq!(coord.state(), JarvisState::Thinking);
+        assert!(!client.is_cancelled());
 
         cleanup(&dir);
     }
@@ -585,11 +808,12 @@ mod tests {
         let dir = temp_dir("finish-listening");
         cleanup(&dir);
         let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        let client = fake_client();
 
         coord.start_listening().unwrap();
         coord.handle_user_utterance("hola").unwrap();
         coord.begin_speaking().unwrap();
-        assert!(coord.handle_barge_in());
+        assert!(coord.handle_barge_in(&client));
         assert_eq!(coord.state(), JarvisState::Listening);
 
         // Interrumpido: aunque se informe "natural", permanece en Listening.
@@ -604,6 +828,7 @@ mod tests {
         let dir = temp_dir("background");
         cleanup(&dir);
         let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        let client = fake_client();
 
         coord.register_background_task("task-102");
         coord.register_background_task("task-103");
@@ -613,7 +838,7 @@ mod tests {
         coord.handle_user_utterance("desarrollo algo").unwrap();
         coord.begin_speaking().unwrap();
 
-        assert!(coord.handle_barge_in());
+        assert!(coord.handle_barge_in(&client));
 
         // La interrupción de voz NO toca las tareas de segundo plano.
         assert!(coord.background_tasks().is_active("task-102"));
@@ -661,6 +886,154 @@ mod tests {
             Err(ConversationError::Transition(_))
         ));
         assert_eq!(coord.state(), JarvisState::Speaking);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn barge_in_cancels_client_and_stops_playback_instantly() {
+        let dir = temp_dir("bargein-cancel");
+        cleanup(&dir);
+        let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        let client = fake_client();
+
+        coord.start_listening().unwrap();
+        coord.handle_user_utterance("hola").unwrap();
+        coord.begin_speaking().unwrap();
+
+        let generation_before = coord.playback().generation();
+
+        assert!(coord.handle_barge_in(&client));
+
+        assert!(coord.playback().is_stop_requested());
+        assert_eq!(coord.playback().generation(), generation_before + 1);
+        assert!(client.is_cancelled());
+        assert_eq!(coord.state(), JarvisState::Listening);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn turn_streaming_transitions_thinking_to_speaking_and_emits_phrases() {
+        let dir = temp_dir("streaming-emits");
+        cleanup(&dir);
+        let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        coord.start_listening().unwrap();
+        coord.handle_user_utterance("hola").unwrap();
+        assert_eq!(coord.state(), JarvisState::Thinking);
+
+        coord.synth_override = Some(Box::new(|_text| {
+            Ok(PcmAudio::new(vec![0.0, 0.5], 24_000, 1))
+        }));
+
+        let client = FakeClient {
+            tokens: vec!["Hola".to_string(), " mundo".to_string(), ".".to_string()],
+            cancelled: Cell::new(false),
+            interrupt_after: None,
+            playback: None,
+        };
+
+        let mut emitted = Vec::new();
+        let completion = coord
+            .run_turn_streaming_with(&client, "hola", &mut |phrase, pcm| {
+                emitted.push((phrase.to_string(), pcm.clone()));
+            })
+            .expect("turno de streaming");
+
+        assert_eq!(coord.state(), JarvisState::Idle);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].0, "Hola mundo.");
+        assert_eq!(emitted[0].1.sample_rate, 24_000);
+        assert_eq!(completion.text, "Hola mundo.");
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn barge_in_during_streaming_stops_phrases_and_preserves_background_tasks() {
+        let dir = temp_dir("bargein-streaming");
+        cleanup(&dir);
+        let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        coord.register_background_task("task-201");
+        coord.register_background_task("task-202");
+
+        coord.start_listening().unwrap();
+        coord.handle_user_utterance("desarrollo algo").unwrap();
+        assert_eq!(coord.state(), JarvisState::Thinking);
+
+        coord.synth_override = Some(Box::new(|_text| {
+            Ok(PcmAudio::new(vec![0.0, 0.5, -0.5], 16_000, 1))
+        }));
+
+        let playback = coord.playback().clone();
+        let client = FakeClient {
+            tokens: vec![
+                "Hola".to_string(),
+                " mundo".to_string(),
+                ".".to_string(),
+                " ¿Sigues".to_string(),
+                "?".to_string(),
+            ],
+            cancelled: Cell::new(false),
+            // Barge-in justo antes del cuarto token: la primera frase ya se
+            // emitió, la segunda debe descartarse.
+            interrupt_after: Some(4),
+            playback: Some(playback),
+        };
+
+        let mut emitted = Vec::new();
+        let completion = coord
+            .run_turn_streaming_with(&client, "desarrollo algo", &mut |phrase, pcm| {
+                emitted.push((phrase.to_string(), pcm.clone()));
+            })
+            .expect("turno interrumpido por barge-in no es error");
+
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].0, "Hola mundo.");
+        // El barge-in vuelve a Listening.
+        assert_eq!(coord.state(), JarvisState::Listening);
+        // Las tareas de fondo siguen intactas.
+        assert!(coord.background_tasks().is_active("task-201"));
+        assert!(coord.background_tasks().is_active("task-202"));
+        assert_eq!(coord.background_tasks().len(), 2);
+        assert_eq!(completion.text, String::new());
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn multi_turn_stress_test_20_turns_without_inconsistent_state() {
+        let dir = temp_dir("stress-20");
+        cleanup(&dir);
+        let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        coord.synth_override = Some(Box::new(|text| {
+            Ok(PcmAudio::new(vec![0.0; text.len()], 24_000, 1))
+        }));
+
+        for i in 0..20 {
+            coord.start_listening().unwrap();
+            coord
+                .handle_user_utterance(&format!("turno {i}"))
+                .expect("turno de usuario");
+            assert_eq!(coord.state(), JarvisState::Thinking, "turno {i}");
+
+            let client = FakeClient {
+                tokens: vec![format!("Respuesta {i}.")],
+                cancelled: Cell::new(false),
+                interrupt_after: None,
+                playback: None,
+            };
+
+            let mut emitted = 0usize;
+            coord
+                .run_turn_streaming_with(&client, &format!("turno {i}"), &mut |_phrase, _pcm| {
+                    emitted += 1;
+                })
+                .expect("turno completo");
+            assert_eq!(emitted, 1, "turno {i}");
+            assert_eq!(coord.state(), JarvisState::Idle, "turno {i}");
+            assert!(!coord.playback().is_stop_requested(), "turno {i}");
+        }
 
         cleanup(&dir);
     }

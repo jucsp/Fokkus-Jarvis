@@ -4,12 +4,13 @@
 //! puro y se prueba sin compositor ni whisper.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use jarvis_audio::{ConversationCoordinator, WhisperEngine};
+use jarvis_audio::models::{ModelManager, ModelStatus, WHISPER_BASE_Q5_1};
+use jarvis_audio::ConversationCoordinator;
 use jarvis_core::{AudioLevel, JarvisState};
 use jarvis_render::{Pixmap, SphereRenderer};
 use jarvis_shell::{FrameBuffer, OverlaySurface, SurfaceStatus};
@@ -200,32 +201,30 @@ pub fn install_shutdown_flag() -> Arc<AtomicBool> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SttAvailability {
     Ready,
-    MissingBinary,
-    /// Hay binario pero no modelo; guarda la ruta esperada si se conoce.
-    MissingModel(Option<std::path::PathBuf>),
+    MissingModel(Option<PathBuf>),
+    InvalidModel(String),
+    NoDataDir,
 }
 
 impl SttAvailability {
-    /// Clasificación pura a partir del binario y el modelo resueltos.
-    pub fn from_parts(binary: Option<&Path>, model: Option<&Path>) -> Self {
-        match (binary, model) {
-            (None, _) => SttAvailability::MissingBinary,
-            (Some(_), Some(model)) if model.is_file() => SttAvailability::Ready,
-            (Some(_), model) => SttAvailability::MissingModel(model.map(Path::to_path_buf)),
+    /// Sonda única sobre el gestor de modelos.
+    pub fn probe(manager: &ModelManager) -> Self {
+        match manager.status(&WHISPER_BASE_Q5_1) {
+            ModelStatus::Verified { .. } => SttAvailability::Ready,
+            ModelStatus::Missing => {
+                SttAvailability::MissingModel(Some(manager.path_of(&WHISPER_BASE_Q5_1)))
+            }
+            ModelStatus::Invalid { reason } => SttAvailability::InvalidModel(reason),
         }
-    }
-
-    /// Sonda única sobre el motor whisper.
-    pub fn probe(engine: &WhisperEngine) -> Self {
-        Self::from_parts(engine.binary(), engine.model())
     }
 
     /// Etiqueta corta para la línea de arranque (`STT=<estado>`).
     pub fn label(&self) -> &'static str {
         match self {
             SttAvailability::Ready => "listo",
-            SttAvailability::MissingBinary => "sin-binario",
             SttAvailability::MissingModel(_) => "sin-modelo",
+            SttAvailability::InvalidModel(_) => "modelo-invalido",
+            SttAvailability::NoDataDir => "sin-datadir",
         }
     }
 
@@ -233,16 +232,17 @@ impl SttAvailability {
     pub fn warning(&self) -> Option<String> {
         match self {
             SttAvailability::Ready => None,
-            SttAvailability::MissingBinary => {
-                Some("[stt] deshabilitado: falta whisper-cli/whisper-cpp en PATH".to_string())
-            }
             SttAvailability::MissingModel(path) => Some(format!(
-                "[stt] deshabilitado: sin modelo local en {}",
-                path.as_deref().map_or_else(
-                    || "(ruta desconocida)".to_string(),
-                    |p| p.display().to_string()
-                )
+                "[stt] deshabilitado: modelo no encontrado en {}",
+                path.as_deref()
+                    .map_or_else(|| "(desconocido)".to_string(), |p| p.display().to_string())
             )),
+            SttAvailability::InvalidModel(reason) => Some(format!(
+                "[stt] deshabilitado: modelo corrupto o inválido ({reason})"
+            )),
+            SttAvailability::NoDataDir => {
+                Some("[stt] deshabilitado: sin directorio de datos (~/.local/share)".to_string())
+            }
         }
     }
 }
@@ -369,32 +369,35 @@ mod tests {
 
     #[test]
     fn stt_availability_classifies_parts() {
+        // Un directorio sin modelo se clasifica como modelo faltante.
+        let dir = std::env::temp_dir().join(format!("jarvis-stt-probe-{}", std::process::id()));
+        let manager = ModelManager::with_dir(&dir);
+        match SttAvailability::probe(&manager) {
+            SttAvailability::MissingModel(Some(path)) => {
+                assert_eq!(path, manager.path_of(&WHISPER_BASE_Q5_1));
+            }
+            other => panic!("se esperaba MissingModel(Some), se obtuvo {other:?}"),
+        }
+
+        // Etiquetas y avisos del resto de variantes.
+        assert_eq!(SttAvailability::Ready.label(), "listo");
         assert_eq!(
-            SttAvailability::from_parts(None, None),
-            SttAvailability::MissingBinary
+            SttAvailability::InvalidModel("roto".to_string()).label(),
+            "modelo-invalido"
         );
-        let bin = Path::new("/usr/bin/whisper-cli");
-        let missing = Path::new("/nonexistent/fokkus/ggml-base.bin");
-        assert_eq!(
-            SttAvailability::from_parts(Some(bin), Some(missing)),
-            SttAvailability::MissingModel(Some(missing.to_path_buf()))
-        );
-        assert_eq!(
-            SttAvailability::from_parts(Some(bin), None),
-            SttAvailability::MissingModel(None)
-        );
-        // Cualquier archivo existente vale como modelo para la clasificación.
-        let model = Path::new(env!("CARGO_MANIFEST_PATH"));
-        assert_eq!(
-            SttAvailability::from_parts(Some(bin), Some(model)),
-            SttAvailability::Ready
-        );
+        assert_eq!(SttAvailability::NoDataDir.label(), "sin-datadir");
+        assert!(SttAvailability::Ready.warning().is_none());
+        assert!(SttAvailability::InvalidModel("roto".to_string())
+            .warning()
+            .is_some());
+        assert!(SttAvailability::NoDataDir.warning().is_some());
     }
 
     #[test]
     fn missing_stt_keeps_assistant_idle() {
         let mut coordinator = ConversationCoordinator::new(EdgeTtsEngine::new());
-        let entered = start_listening_if_ready(&mut coordinator, &SttAvailability::MissingBinary);
+        let entered =
+            start_listening_if_ready(&mut coordinator, &SttAvailability::MissingModel(None));
         assert!(!entered);
         assert_eq!(coordinator.state(), JarvisState::Idle);
 

@@ -22,6 +22,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # cpal (ALSA) y whisper-rs-sys (cmake + bindgen/libclang) compilan código nativo.
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev cmake clang libclang-dev pkg-config
+
       - name: Cache cargo registry and build
         uses: actions/cache@v4
         with:
@@ -46,3 +52,38 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+  supply-chain:
+    name: supply chain gates (HU-0)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: whisper.cpp vendorizado >= 1.9.5 (SEC-01, CA-0.3)
+        run: |
+          scripts/check-whisper-version.sh --self-test
+          scripts/check-whisper-version.sh
+
+      - name: cargo deny check (SEC-05, CA-0.1)
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
+
+      - name: Árbol sin aws-lc, openssl, tokio ni reqwest (CA-0.2)
+        run: |
+          for c in aws-lc-sys aws-lc-rs openssl-sys native-tls tokio reqwest; do
+            if cargo tree --workspace -i "$c" >/dev/null 2>&1; then
+              echo "FALLA: $c está en el árbol de dependencias"; exit 1
+            fi
+          done
+          echo "OK: ningún crate prohibido en el árbol"
