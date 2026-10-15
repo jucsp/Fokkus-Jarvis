@@ -14,9 +14,15 @@
 //! 6. Pre-sintetiza los fillers de caché en segundo plano si hay backend TTS.
 //! 7. Abre la capa overlay (o el modo headless) y entra en el bucle principal
 //!    ([`runtime::run_loop`]) hasta SIGINT/SIGTERM o el cierre de la capa.
+//!
+//! Sin terminal (lanzado desde el `.desktop`) toda la salida va al log
+//! persistente ([`logging`]); si falta el modelo whisper se descarga en
+//! segundo plano y la escucha arranca al quedar verificado.
 
+mod logging;
 mod runtime;
 
+use std::io::BufRead;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -42,6 +48,8 @@ enum CliAction {
     Check,
     /// Muestra la ayuda y sale.
     Help,
+    /// Lee la API key de Anthropic por stdin y la guarda en el llavero.
+    SetApiKey,
     /// Arranca el asistente (comportamiento por defecto).
     Run,
 }
@@ -92,6 +100,7 @@ fn main() -> ExitCode {
             print_usage();
             ExitCode::SUCCESS
         }
+        Ok(CliAction::SetApiKey) => run_set_api_key(),
         Ok(CliAction::Run) => run(),
         Err(message) => {
             eprintln!("{message}");
@@ -108,6 +117,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         Some("-v" | "--version") => Ok(CliAction::Version),
         Some("-c" | "--check") => Ok(CliAction::Check),
         Some("-h" | "--help") => Ok(CliAction::Help),
+        Some("--set-api-key") => Ok(CliAction::SetApiKey),
         Some(other) => Err(format!("argumento desconocido: {other}")),
     }
 }
@@ -120,13 +130,44 @@ fn print_usage() {
     println!("  -v, --version   Muestra la versión y sale.");
     println!("  -c, --check     Diagnostica los subsistemas y sale.");
     println!("  -h, --help      Muestra esta ayuda y sale.");
+    println!("  --set-api-key   Lee la API key de Anthropic por stdin y la guarda");
+    println!("                  en el llavero del sistema.");
     println!();
     println!("Sin opciones, arranca Fokkus-Jarvis, levanta el servidor IPC y deja");
     println!("el socket listo para conexiones de Fokkus IDE.");
+    if let Some(path) = logging::log_path() {
+        println!("Sin terminal, la salida se escribe en {}.", path.display());
+    }
+}
+
+/// Guarda en el llavero la API key leída por stdin (nunca por argv, para que
+/// no quede en el historial de la shell ni en `ps`).
+fn run_set_api_key() -> ExitCode {
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("Pega la API key de Anthropic y pulsa Enter:");
+    }
+    let mut key = String::new();
+    if let Err(e) = std::io::stdin().lock().read_line(&mut key) {
+        eprintln!("No se pudo leer la API key: {e}");
+        return ExitCode::FAILURE;
+    }
+    match jarvis_audio::store_api_key(&key) {
+        Ok(()) => {
+            println!("API key guardada en el llavero del sistema.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("No se pudo guardar la API key: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Arranca el asistente completo y lo mantiene vivo como daemon.
 fn run() -> ExitCode {
+    // Antes que nada: sin terminal, la salida va al log persistente.
+    let log_file = logging::redirect_if_detached();
+
     // Instancia única: impide que corran dos procesos concurrentes.
     let lock = match single_instance::acquire() {
         Ok(lock) => lock,
@@ -189,13 +230,25 @@ fn run() -> ExitCode {
     };
     surface.set_visible(true);
 
-    // STT: sonda única; sin whisper el asistente queda en modo degradado.
+    // STT: sonda única. Si el modelo falta o está dañado se descarga en
+    // segundo plano y la escucha arranca cuando quede verificado.
     let model_manager = ModelManager::new().ok();
     let stt = match &model_manager {
         Some(mgr) => SttAvailability::probe(mgr),
         None => SttAvailability::NoDataDir,
     };
     runtime::start_listening_if_ready(&mut coordinator, &stt);
+    let mut model_pending = match model_manager {
+        Some(manager) if stt.needs_download() => runtime::spawn_model_download(manager),
+        _ => None,
+    };
+
+    // Cerebro: sin API key el diálogo con Claude no puede responder.
+    if let Err(e) = jarvis_audio::resolve_api_key(None) {
+        eprintln!(
+            "[cerebro] sin API key de Anthropic ({e}). Guárdala con: fokkus-jarvis --set-api-key"
+        );
+    }
 
     let backend = surface.backend();
     let mut on_first_frame = || {
@@ -218,8 +271,14 @@ fn run() -> ExitCode {
             "Fokkus-Jarvis iniciado correctamente. Socket IPC activo en {} — listo para conexiones de Fokkus IDE.",
             socket_path.display(),
         );
+        if let Some(path) = &log_file {
+            println!("Log persistente: {}", path.display());
+        }
     };
-    let mut source = || (server_state.state(), coordinator.core().audio_level());
+    let mut source = || {
+        runtime::poll_model_ready(&mut model_pending, &mut coordinator);
+        (server_state.state(), coordinator.core().audio_level())
+    };
     let exit = runtime::run_loop(
         surface.as_mut(),
         &renderer,
@@ -240,7 +299,9 @@ fn run() -> ExitCode {
 
     match exit {
         LoopExit::Signal => println!("Fokkus-Jarvis detenido por señal."),
-        LoopExit::SurfaceClosed => println!("Fokkus-Jarvis detenido: el compositor cerró la capa."),
+        LoopExit::SurfaceClosed => {
+            println!("Fokkus-Jarvis detenido: se cerró la capa (clic derecho o compositor).")
+        }
         LoopExit::MaxFrames => {}
     }
     ExitCode::SUCCESS
@@ -492,4 +553,26 @@ fn prepare_surface(renderer: &SphereRenderer) -> Result<Box<dyn OverlaySurface>,
         });
     }
     Ok(surface)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_args_recognizes_every_action() {
+        assert_eq!(parse_args(&args(&[])), Ok(CliAction::Run));
+        assert_eq!(parse_args(&args(&["--version"])), Ok(CliAction::Version));
+        assert_eq!(parse_args(&args(&["-c"])), Ok(CliAction::Check));
+        assert_eq!(parse_args(&args(&["--help"])), Ok(CliAction::Help));
+        assert_eq!(
+            parse_args(&args(&["--set-api-key"])),
+            Ok(CliAction::SetApiKey)
+        );
+        assert!(parse_args(&args(&["--desconocida"])).is_err());
+    }
 }

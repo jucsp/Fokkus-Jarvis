@@ -34,8 +34,8 @@ pub mod voices;
 
 pub use activation::{Activation, ActivationDetector};
 pub use brain::{
-    resolve_api_key, BrainError, CancellationToken, ClaudeClient, Completion, Message, SseEvent,
-    SseParser,
+    resolve_api_key, store_api_key, BrainError, CancellationToken, ClaudeClient, Completion,
+    Message, SseEvent, SseParser,
 };
 pub use conversation::{
     classify_intent, BackgroundTasks, ConversationCoordinator, ConversationError,

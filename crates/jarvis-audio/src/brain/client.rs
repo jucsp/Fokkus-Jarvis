@@ -477,6 +477,22 @@ pub fn resolve_api_key(provided: Option<String>) -> Result<String, BrainError> {
     }
 }
 
+/// Guarda la API key en el llavero del sistema (Secret Service/KWallet).
+///
+/// Es la vía para el binario lanzado desde el `.desktop`, que no hereda las
+/// variables de entorno de la shell del usuario.
+pub fn store_api_key(key: &str) -> Result<(), BrainError> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(BrainError::NoApiKey);
+    }
+    let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+        .map_err(|e| BrainError::Keyring(e.to_string()))?;
+    entry
+        .set_password(key)
+        .map_err(|e| BrainError::Keyring(e.to_string()))
+}
+
 fn backoff(attempt: u32) -> Duration {
     // 250 ms, 500 ms, 1 s… con tope para los reintentos posteriores.
     Duration::from_millis(250u64.saturating_mul(1u64 << attempt.saturating_sub(1).min(4)))

@@ -8,8 +8,8 @@ pub mod client;
 pub mod sse;
 
 pub use client::{
-    resolve_api_key, BrainError, CancellationToken, ClaudeClient, Completion, Message,
-    ANTHROPIC_BETA, ANTHROPIC_ENDPOINT, ANTHROPIC_VERSION, API_KEY_ENV, DEFAULT_EFFORT,
+    resolve_api_key, store_api_key, BrainError, CancellationToken, ClaudeClient, Completion,
+    Message, ANTHROPIC_BETA, ANTHROPIC_ENDPOINT, ANTHROPIC_VERSION, API_KEY_ENV, DEFAULT_EFFORT,
     DEFAULT_HISTORY_TURNS, DEFAULT_MAX_RETRIES, DEFAULT_MAX_TOKENS, DEFAULT_MODEL, KEYRING_SERVICE,
     KEYRING_USER, SYSTEM_PROMPT,
 };

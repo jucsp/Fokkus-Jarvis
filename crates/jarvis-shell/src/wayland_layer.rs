@@ -3,6 +3,10 @@
 //! La superficie se presenta con buffers `wl_shm` en formato `Argb8888` (doble
 //! buffer reutilizado) y el ritmo lo marca el compositor con frame callbacks:
 //! si la capa no es visible, no se dibuja.
+//!
+//! Puntero: la región de entrada es el círculo de la esfera (las esquinas
+//! transparentes dejan pasar los clics). Arrastrar con el botón izquierdo
+//! reposiciona la capa ajustando sus márgenes; el clic derecho la cierra.
 
 use std::time::Duration;
 
@@ -13,9 +17,13 @@ use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 use smithay_client_toolkit::reexports::client::globals::registry_queue_init;
-use smithay_client_toolkit::reexports::client::protocol::{wl_output, wl_shm, wl_surface};
+use smithay_client_toolkit::reexports::client::protocol::{
+    wl_output, wl_pointer, wl_seat, wl_shm, wl_surface,
+};
 use smithay_client_toolkit::reexports::client::{Connection, QueueHandle};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
+use smithay_client_toolkit::seat::pointer::{PointerEvent, PointerEventKind, PointerHandler};
+use smithay_client_toolkit::seat::{Capability, SeatHandler, SeatState};
 use smithay_client_toolkit::shell::wlr_layer::{
     self, Layer, LayerShell, LayerShellHandler, LayerSurface, LayerSurfaceConfigure,
 };
@@ -34,6 +42,19 @@ const LAYER_NAMESPACE: &str = "fokkus-jarvis";
 
 /// Número de buffers `wl_shm` reutilizados (doble buffer).
 const BUFFER_COUNT: usize = 2;
+
+/// Botones del puntero (códigos evdev de `linux/input-event-codes.h`).
+const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
+
+/// Desplazamiento mínimo (px) para que una pulsación se considere arrastre.
+const DRAG_THRESHOLD: f64 = 4.0;
+
+/// Alto (px) de cada franja con la que se aproxima el círculo de entrada.
+const INPUT_STRIP_HEIGHT: u32 = 4;
+
+/// Márgenes `(top, right, bottom, left)` de la capa.
+type Margins = (i32, i32, i32, i32);
 
 /// Traduce el anclaje lógico a los bordes de layer-shell.
 ///
@@ -58,7 +79,7 @@ fn keyboard_to_layer(_value: KeyboardInteractivity) -> wlr_layer::KeyboardIntera
 }
 
 /// Márgenes `(top, right, bottom, left)` aplicados solo a los bordes anclados.
-fn margins_for(anchor: Anchor, margin: u32) -> (i32, i32, i32, i32) {
+fn margins_for(anchor: Anchor, margin: u32) -> Margins {
     let m = i32::try_from(margin).unwrap_or(i32::MAX);
     let edges = anchor_to_layer(anchor);
     let pick = |edge: wlr_layer::Anchor| if edges.contains(edge) { m } else { 0 };
@@ -70,6 +91,101 @@ fn margins_for(anchor: Anchor, margin: u32) -> (i32, i32, i32, i32) {
     )
 }
 
+/// Aplica un arrastre `(dx, dy)` a los márgenes de los bordes anclados.
+///
+/// Mover hacia la derecha/abajo reduce el margen derecho/inferior y aumenta el
+/// izquierdo/superior. Cada margen se acota a `[0, max]`, donde `max` es el
+/// hueco libre de la salida en ese eje (si se conoce). Sin bordes anclados
+/// (`Center`) la capa no se mueve.
+fn drag_margins(
+    anchor: Anchor,
+    current: Margins,
+    (dx, dy): (i32, i32),
+    max: Option<(i32, i32)>,
+) -> Margins {
+    let edges = anchor_to_layer(anchor);
+    let (max_x, max_y) = max.unwrap_or((i32::MAX, i32::MAX));
+    let clamp = |v: i32, hi: i32| v.clamp(0, hi.max(0));
+    let (mut top, mut right, mut bottom, mut left) = current;
+    if edges.contains(wlr_layer::Anchor::LEFT) {
+        left = clamp(left.saturating_add(dx), max_x);
+    } else if edges.contains(wlr_layer::Anchor::RIGHT) {
+        right = clamp(right.saturating_sub(dx), max_x);
+    }
+    if edges.contains(wlr_layer::Anchor::TOP) {
+        top = clamp(top.saturating_add(dy), max_y);
+    } else if edges.contains(wlr_layer::Anchor::BOTTOM) {
+        bottom = clamp(bottom.saturating_sub(dy), max_y);
+    }
+    (top, right, bottom, left)
+}
+
+/// Franjas horizontales `(x, y, ancho, alto)` que aproximan el círculo
+/// inscrito en la superficie; forman la región de entrada de la esfera.
+fn circle_strips(size: SurfaceSize) -> Vec<(i32, i32, i32, i32)> {
+    let (w, h) = (f64::from(size.width), f64::from(size.height));
+    let radius = w.min(h) / 2.0;
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    let mut strips = Vec::new();
+    let mut y = 0;
+    while y < size.height {
+        let strip_h = INPUT_STRIP_HEIGHT.min(size.height - y);
+        // Se usa el punto de la franja más cercano al centro: el círculo queda
+        // cubierto por completo (nunca se recorta la esfera).
+        let top = f64::from(y);
+        let bottom = f64::from(y + strip_h);
+        let nearest = cy.clamp(top, bottom);
+        let dy = (nearest - cy).abs();
+        if dy < radius {
+            let half = (radius * radius - dy * dy).sqrt();
+            let x0 = (cx - half).floor().max(0.0);
+            let x1 = (cx + half).ceil().min(w);
+            // Valores acotados al tamaño de la superficie (u32 → i32 seguro).
+            strips.push((x0 as i32, y as i32, (x1 - x0) as i32, strip_h as i32));
+        }
+        y += strip_h;
+    }
+    strips
+}
+
+/// Gesto del puntero en curso sobre la esfera.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct DragGesture {
+    /// Posición local de la pulsación izquierda (si el botón sigue pulsado).
+    press: Option<(f64, f64)>,
+    /// Se superó el umbral: la pulsación ya es un arrastre.
+    dragging: bool,
+}
+
+impl DragGesture {
+    fn press(&mut self, position: (f64, f64)) {
+        self.press = Some(position);
+        self.dragging = false;
+    }
+
+    /// Desplazamiento entero a aplicar a la capa, o `None` si no hay arrastre.
+    ///
+    /// Tras mover la capa el compositor reporta coordenadas relativas a la
+    /// nueva posición, por eso el origen de la pulsación no se actualiza.
+    fn motion(&mut self, position: (f64, f64)) -> Option<(i32, i32)> {
+        let (px, py) = self.press?;
+        let (dx, dy) = (position.0 - px, position.1 - py);
+        if !self.dragging && dx.hypot(dy) < DRAG_THRESHOLD {
+            return None;
+        }
+        self.dragging = true;
+        let delta = (dx.round() as i32, dy.round() as i32);
+        (delta != (0, 0)).then_some(delta)
+    }
+
+    /// Suelta el botón; devuelve si la pulsación fue un arrastre.
+    fn release(&mut self) -> bool {
+        let dragged = self.dragging;
+        *self = Self::default();
+        dragged
+    }
+}
+
 fn backend_error(e: impl std::fmt::Display) -> SurfaceError {
     SurfaceError::Backend(e.to_string())
 }
@@ -79,6 +195,13 @@ struct LayerState {
     registry: RegistryState,
     /// Requerido por SCTK para seguir en qué salida está la superficie.
     output: OutputState,
+    seat: SeatState,
+    pointer: Option<wl_pointer::WlPointer>,
+    gesture: DragGesture,
+    anchor: Anchor,
+    margins: Margins,
+    /// Tamaño lógico de la salida donde está la capa (acota el arrastre).
+    output_size: Option<(i32, i32)>,
     compositor: CompositorState,
     shm: Shm,
     pool: SlotPool,
@@ -100,17 +223,46 @@ impl LayerState {
         self.layer.wl_surface()
     }
 
-    /// Región de entrada vacía: los clics atraviesan la esfera.
-    fn apply_empty_input_region(&self) -> Result<(), SurfaceError> {
+    /// Región de entrada circular: la esfera recibe los clics y las esquinas
+    /// transparentes los dejan pasar a la ventana de abajo.
+    fn apply_sphere_input_region(&self) -> Result<(), SurfaceError> {
         let region = Region::new(&self.compositor).map_err(backend_error)?;
+        for (x, y, w, h) in circle_strips(self.size) {
+            region.add(x, y, w, h);
+        }
         self.layer.set_input_region(Some(region.wl_region()));
         Ok(())
     }
 
-    fn apply_anchor(&self, anchor: Anchor, margin: u32) {
-        let (top, right, bottom, left) = margins_for(anchor, margin);
+    /// Ancla la capa en `anchor` con el margen base (descarta arrastres previos).
+    fn apply_anchor(&mut self, anchor: Anchor, margin: u32) {
+        self.anchor = anchor;
+        self.margins = margins_for(anchor, margin);
         self.layer.set_anchor(anchor_to_layer(anchor));
+        self.apply_margins();
+    }
+
+    fn apply_margins(&self) {
+        let (top, right, bottom, left) = self.margins;
         self.layer.set_margin(top, right, bottom, left);
+    }
+
+    /// Hueco libre `(x, y)` de la salida para acotar los márgenes.
+    fn drag_bounds(&self) -> Option<(i32, i32)> {
+        let (w, h) = self.output_size?;
+        let sw = i32::try_from(self.size.width).ok()?;
+        let sh = i32::try_from(self.size.height).ok()?;
+        Some((w - sw, h - sh))
+    }
+
+    /// Desplaza la capa `delta` píxeles (arrastre con el botón izquierdo).
+    fn drag_by(&mut self, delta: (i32, i32)) {
+        let next = drag_margins(self.anchor, self.margins, delta, self.drag_bounds());
+        if next != self.margins {
+            self.margins = next;
+            self.apply_margins();
+            self.layer.commit();
+        }
     }
 
     /// Devuelve el índice de un buffer libre (no retenido por el compositor),
@@ -163,8 +315,9 @@ impl CompositorHandler for LayerState {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        self.output_size = self.output.info(output).and_then(|info| info.logical_size);
     }
 
     fn surface_leave(
@@ -217,6 +370,84 @@ impl OutputHandler for LayerState {
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 
+impl SeatHandler for LayerState {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat
+    }
+
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            match self.seat.get_pointer(qh, &seat) {
+                Ok(pointer) => self.pointer = Some(pointer),
+                Err(e) => eprintln!("[shell] no se pudo obtener el puntero: {e}"),
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+            self.gesture = DragGesture::default();
+        }
+    }
+
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for LayerState {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            if &event.surface != self.layer.wl_surface() {
+                continue;
+            }
+            match event.kind {
+                PointerEventKind::Press {
+                    button: BTN_LEFT, ..
+                } => self.gesture.press(event.position),
+                PointerEventKind::Motion { .. } => {
+                    if let Some(delta) = self.gesture.motion(event.position) {
+                        self.drag_by(delta);
+                    }
+                }
+                PointerEventKind::Release {
+                    button: BTN_LEFT, ..
+                } => {
+                    self.gesture.release();
+                }
+                PointerEventKind::Press {
+                    button: BTN_RIGHT, ..
+                } => {
+                    eprintln!("[shell] clic derecho sobre la esfera: cierre solicitado");
+                    self.closed = true;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 impl ShmHandler for LayerState {
     fn shm_state(&mut self) -> &mut Shm {
         &mut self.shm
@@ -227,7 +458,7 @@ impl ProvidesRegistryState for LayerState {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_registry!(LayerState);
@@ -281,9 +512,15 @@ impl WaylandLayerSurface {
             .insert(event_loop.handle())
             .map_err(|e| backend_error(e.error))?;
 
-        let state = LayerState {
+        let mut state = LayerState {
             registry: RegistryState::new(&globals),
             output: OutputState::new(&globals, &qh),
+            seat: SeatState::new(&globals, &qh),
+            pointer: None,
+            gesture: DragGesture::default(),
+            anchor: options.anchor,
+            margins: margins_for(options.anchor, options.margin),
+            output_size: None,
             compositor,
             shm,
             pool,
@@ -297,7 +534,7 @@ impl WaylandLayerSurface {
             size_mismatch_logged: false,
         };
         state.apply_anchor(options.anchor, options.margin);
-        state.apply_empty_input_region()?;
+        state.apply_sphere_input_region()?;
         // Commit inicial sin buffer: el compositor responde con `configure`.
         state.layer.commit();
         conn.flush().map_err(backend_error)?;
@@ -394,9 +631,12 @@ impl OverlaySurface for WaylandLayerSurface {
             self.state
                 .layer
                 .set_size(self.state.size.width, self.state.size.height);
+            // Se conserva la posición a la que el usuario arrastró la esfera.
             self.state
-                .apply_anchor(self.options.anchor, self.options.margin);
-            if let Err(e) = self.state.apply_empty_input_region() {
+                .layer
+                .set_anchor(anchor_to_layer(self.state.anchor));
+            self.state.apply_margins();
+            if let Err(e) = self.state.apply_sphere_input_region() {
                 eprintln!("[shell] no se pudo restaurar la región de entrada: {e}");
             }
         } else {
@@ -449,6 +689,93 @@ mod tests {
         assert_eq!(margins_for(Anchor::BottomRight, 12), (0, 12, 12, 0));
         assert_eq!(margins_for(Anchor::TopLeft, 8), (8, 0, 0, 8));
         assert_eq!(margins_for(Anchor::Center, 12), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn drag_moves_away_from_anchored_edges() {
+        // BottomRight: mover a la derecha/abajo reduce los márgenes derecho/inferior.
+        let base = margins_for(Anchor::BottomRight, 12);
+        assert_eq!(
+            drag_margins(Anchor::BottomRight, base, (-30, -20), None),
+            (0, 42, 32, 0)
+        );
+        assert_eq!(
+            drag_margins(Anchor::BottomRight, base, (5, 5), None),
+            (0, 7, 7, 0)
+        );
+        // TopLeft: mover a la derecha/abajo aumenta los márgenes izquierdo/superior.
+        let base = margins_for(Anchor::TopLeft, 8);
+        assert_eq!(
+            drag_margins(Anchor::TopLeft, base, (10, 4), None),
+            (12, 0, 0, 18)
+        );
+        // Center no tiene bordes anclados: no se mueve.
+        assert_eq!(
+            drag_margins(Anchor::Center, (0, 0, 0, 0), (50, 50), None),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn drag_is_clamped_to_output() {
+        let base = margins_for(Anchor::BottomRight, 12);
+        // No sale por el borde anclado (margen negativo).
+        assert_eq!(
+            drag_margins(Anchor::BottomRight, base, (100, 100), None),
+            (0, 0, 0, 0)
+        );
+        // Ni por el borde opuesto si se conoce la salida.
+        assert_eq!(
+            drag_margins(Anchor::BottomRight, base, (-5000, -5000), Some((1700, 860))),
+            (0, 1700, 860, 0)
+        );
+    }
+
+    #[test]
+    fn gesture_needs_threshold_before_dragging() {
+        let mut gesture = DragGesture::default();
+        // Movimiento sin pulsación: no hay arrastre.
+        assert_eq!(gesture.motion((50.0, 50.0)), None);
+
+        gesture.press((100.0, 100.0));
+        assert_eq!(gesture.motion((101.0, 102.0)), None);
+        assert_eq!(gesture.motion((110.0, 95.0)), Some((10, -5)));
+        // Ya en arrastre, cualquier desplazamiento cuenta.
+        assert_eq!(gesture.motion((101.0, 100.0)), Some((1, 0)));
+        assert!(gesture.release());
+        assert_eq!(gesture.motion((150.0, 150.0)), None);
+
+        // Pulsar y soltar sin moverse no es arrastre.
+        gesture.press((10.0, 10.0));
+        assert!(!gesture.release());
+    }
+
+    #[test]
+    fn input_region_covers_the_sphere_but_not_the_corners() {
+        let size = SurfaceSize::new(220, 220).unwrap();
+        let strips = circle_strips(size);
+        assert!(!strips.is_empty());
+        let covers = |px: i32, py: i32| {
+            strips
+                .iter()
+                .any(|&(x, y, w, h)| px >= x && px < x + w && py >= y && py < y + h)
+        };
+        // Centro y puntos cardinales cerca del borde del círculo.
+        assert!(covers(110, 110));
+        assert!(covers(110, 2));
+        assert!(covers(2, 110));
+        assert!(covers(217, 110));
+        assert!(covers(110, 217));
+        // Las esquinas transparentes dejan pasar los clics.
+        assert!(!covers(0, 0));
+        assert!(!covers(219, 0));
+        assert!(!covers(0, 219));
+        assert!(!covers(219, 219));
+        // Todas las franjas caen dentro de la superficie.
+        for (x, y, w, h) in strips {
+            assert!(x >= 0 && y >= 0 && w > 0 && h > 0);
+            assert!(x + w <= 220 && y + h <= 220);
+        }
     }
 
     #[test]

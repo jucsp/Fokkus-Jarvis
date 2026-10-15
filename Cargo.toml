@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.99"
 # Los crates del workspace no se publican en crates.io (cargo-deny los trata
@@ -32,6 +32,9 @@ serde_json = "1"
 smithay-client-toolkit = { version = "0.21", default-features = false, features = ["calloop"] }
 # Apagado limpio con SIGINT/SIGTERM en el bucle principal.
 signal-hook = "0.4"
+# `dup2` para redirigir stdout/stderr al log persistente cuando el binario se
+# lanza sin terminal (.desktop). Ya estaba en el árbol vía cpal/calloop.
+libc = "0.2"
 
 # ─── Conversación nativa v0.2.0 ──────────────────────────────────────────────
 # Stack aprobado en docs/specs/sdd-conversacion-nativa-v0.2.0.md §4, con el

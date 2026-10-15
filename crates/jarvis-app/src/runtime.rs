@@ -218,6 +218,14 @@ impl SttAvailability {
         }
     }
 
+    /// `true` si el modelo falta o está dañado y debe (re)descargarse.
+    pub fn needs_download(&self) -> bool {
+        matches!(
+            self,
+            SttAvailability::MissingModel(_) | SttAvailability::InvalidModel(_)
+        )
+    }
+
     /// Etiqueta corta para la línea de arranque (`STT=<estado>`).
     pub fn label(&self) -> &'static str {
         match self {
@@ -266,6 +274,84 @@ pub fn start_listening_if_ready(
             false
         }
     }
+}
+
+/// Registro del progreso de descarga en tramos de 10 % (no inunda el log).
+#[derive(Debug, Default)]
+pub struct ProgressLog {
+    last_decile: Option<u64>,
+}
+
+impl ProgressLog {
+    /// Devuelve el porcentaje a registrar si se cruzó un tramo nuevo.
+    pub fn update(&mut self, done: u64, total: u64) -> Option<u64> {
+        if total == 0 {
+            return None;
+        }
+        let percent = done.min(total).saturating_mul(100) / total;
+        let decile = percent / 10;
+        if self.last_decile.is_some_and(|last| decile <= last) {
+            return None;
+        }
+        self.last_decile = Some(decile);
+        Some(decile * 10)
+    }
+}
+
+/// Descarga y verifica el modelo whisper en un hilo de fondo (primera
+/// ejecución, HU-7). Nunca bloquea el arranque: el flag devuelto pasa a `true`
+/// cuando el modelo queda verificado en disco.
+pub fn spawn_model_download(manager: ModelManager) -> Option<Arc<AtomicBool>> {
+    let ready = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&ready);
+    let spawned = std::thread::Builder::new()
+        .name("jarvis-models".to_string())
+        .spawn(move || {
+            let spec = WHISPER_BASE_Q5_1;
+            println!(
+                "[stt] descargando {} ({} MB) en {}…",
+                spec.id,
+                spec.size / (1024 * 1024),
+                manager.path_of(&spec).display()
+            );
+            let mut log = ProgressLog::default();
+            let mut progress = |done: u64, total: u64| {
+                if let Some(percent) = log.update(done, total) {
+                    println!("[stt] descarga del modelo: {percent} %");
+                }
+            };
+            match manager.ensure(&spec, &mut progress) {
+                Ok(model) => {
+                    println!("[stt] modelo verificado (sha256 {}).", model.sha256());
+                    flag.store(true, Ordering::SeqCst);
+                }
+                Err(e) => eprintln!("[stt] no se pudo descargar el modelo: {e}"),
+            }
+        });
+    match spawned {
+        Ok(_) => Some(ready),
+        Err(e) => {
+            eprintln!("[stt] no se pudo lanzar la descarga del modelo: {e}");
+            None
+        }
+    }
+}
+
+/// Si la descarga pendiente terminó, entra en escucha y la da por resuelta.
+///
+/// Pensada para invocarse en cada frame: solo actúa una vez.
+pub fn poll_model_ready(
+    pending: &mut Option<Arc<AtomicBool>>,
+    coordinator: &mut ConversationCoordinator,
+) -> bool {
+    if !pending
+        .as_ref()
+        .is_some_and(|ready| ready.load(Ordering::SeqCst))
+    {
+        return false;
+    }
+    *pending = None;
+    start_listening_if_ready(coordinator, &SttAvailability::Ready)
 }
 
 #[cfg(test)]
@@ -391,6 +477,48 @@ mod tests {
             .warning()
             .is_some());
         assert!(SttAvailability::NoDataDir.warning().is_some());
+    }
+
+    #[test]
+    fn only_missing_or_invalid_models_are_downloaded() {
+        assert!(SttAvailability::MissingModel(None).needs_download());
+        assert!(SttAvailability::InvalidModel("roto".to_string()).needs_download());
+        assert!(!SttAvailability::Ready.needs_download());
+        assert!(!SttAvailability::NoDataDir.needs_download());
+    }
+
+    #[test]
+    fn progress_is_logged_by_deciles() {
+        let mut log = ProgressLog::default();
+        assert_eq!(log.update(0, 0), None);
+        assert_eq!(log.update(0, 100), Some(0));
+        assert_eq!(log.update(5, 100), None);
+        assert_eq!(log.update(10, 100), Some(10));
+        assert_eq!(log.update(11, 100), None);
+        // Un salto grande registra solo el tramo alcanzado.
+        assert_eq!(log.update(73, 100), Some(70));
+        assert_eq!(log.update(100, 100), Some(100));
+        assert_eq!(log.update(100, 100), None);
+    }
+
+    #[test]
+    fn model_ready_flag_starts_listening_once() {
+        let mut coordinator = ConversationCoordinator::new(EdgeTtsEngine::new());
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut pending = Some(Arc::clone(&flag));
+
+        // Descarga en curso: sigue en Idle.
+        assert!(!poll_model_ready(&mut pending, &mut coordinator));
+        assert!(pending.is_some());
+        assert_eq!(coordinator.state(), JarvisState::Idle);
+
+        flag.store(true, Ordering::SeqCst);
+        assert!(poll_model_ready(&mut pending, &mut coordinator));
+        assert!(pending.is_none());
+        assert_eq!(coordinator.state(), JarvisState::Listening);
+
+        // Ya resuelto: no vuelve a actuar.
+        assert!(!poll_model_ready(&mut pending, &mut coordinator));
     }
 
     #[test]
