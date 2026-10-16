@@ -7,6 +7,7 @@
 
 mod bus;
 mod config;
+mod fullscreen;
 mod paths;
 mod shared;
 pub mod single_instance;
@@ -15,7 +16,10 @@ mod state;
 pub use bus::{AudioLevel, AudioLevelStore, EventBus};
 pub use config::{
     sphere_size_for_pct, BrainMode, ConfigError, JarvisConfig, Opacity, DEFAULT_CLI_COMMAND,
-    DEFAULT_SPHERE_SIZE_PX, SPHERE_OPACITY_RANGE, SPHERE_SCALE_RANGE,
+    DEFAULT_SPHERE_SIZE_PX, FULLSCREEN_PCT_RANGE, SPHERE_OPACITY_RANGE, SPHERE_SCALE_RANGE,
+};
+pub use fullscreen::{
+    is_effectively_fullscreen, FullscreenBehavior, OutputGeometry, Rect, WindowSnapshot,
 };
 pub use shared::SharedCore;
 pub use state::{JarvisState, StateMachine, StateTransition, TransitionError};

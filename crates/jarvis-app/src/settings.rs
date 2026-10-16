@@ -671,4 +671,28 @@ mod tests {
         assert!(UNIFIED_SETTINGS_SCRIPT.contains("PREVIEW_INTERVAL_MS = 33"));
         assert!(UNIFIED_SETTINGS_SCRIPT.contains("{\"preview\": {key: int(value)}}"));
     }
+
+    #[test]
+    fn unified_settings_script_offers_fullscreen_behaviors() {
+        assert!(UNIFIED_SETTINGS_SCRIPT.contains("\"fullscreen_behavior\": \"dim\""));
+        for (key, label) in [
+            ("dim", "Atenuar al 25% (recomendado)"),
+            ("hide", "Ocultar esfera"),
+            ("ignore", "Ignorar (desactivado)"),
+        ] {
+            assert!(
+                UNIFIED_SETTINGS_SCRIPT.contains(&format!("(\"{key}\", \"{label}\")")),
+                "falta {key}"
+            );
+            // El valor debe ser uno de los que acepta `FullscreenBehavior`.
+            let parsed: jarvis_core::FullscreenBehavior =
+                serde_json::from_str(&format!("\"{key}\"")).unwrap();
+            assert_eq!(
+                serde_json::to_string(&parsed).unwrap(),
+                format!("\"{key}\"")
+            );
+        }
+        assert!(UNIFIED_SETTINGS_SCRIPT
+            .contains("\"fullscreen_behavior\": self.fullscreen_combo.currentData()"));
+    }
 }

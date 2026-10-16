@@ -8,6 +8,9 @@ description = "Abstracción de la superficie overlay (ventana flotante transpare
 
 [dependencies]
 jarvis-core = { path = "../jarvis-core" }
+crossbeam-channel.workspace = true
+serde.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 smithay-client-toolkit.workspace = true
+zbus.workspace = true

@@ -214,6 +214,9 @@ struct LayerState {
     margins: Margins,
     /// Tamaño lógico de la salida donde está la capa (acota el arrastre).
     output_size: Option<(i32, i32)>,
+    /// Nombre de la última salida en la que entró la capa (HU-35). Se conserva
+    /// al ocultarla para seguir comparando con la ventana a pantalla completa.
+    output_name: Option<String>,
     compositor: CompositorState,
     shm: Shm,
     pool: SlotPool,
@@ -360,7 +363,11 @@ impl CompositorHandler for LayerState {
         _: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
-        self.output_size = self.output.info(output).and_then(|info| info.logical_size);
+        let info = self.output.info(output);
+        self.output_size = info.as_ref().and_then(|info| info.logical_size);
+        if let Some(name) = info.and_then(|info| info.name) {
+            self.output_name = Some(name);
+        }
     }
 
     fn surface_leave(
@@ -589,6 +596,7 @@ impl WaylandLayerSurface {
             base_margin: options.margin,
             margins: margins_for(options.anchor, options.margin),
             output_size: None,
+            output_name: None,
             compositor,
             shm,
             pool,
@@ -793,6 +801,10 @@ impl OverlaySurface for WaylandLayerSurface {
 
     fn set_opacity(&mut self, opacity: Opacity) {
         self.state.opacity = opacity;
+    }
+
+    fn current_output(&self) -> Option<String> {
+        self.state.output_name.clone()
     }
 }
 

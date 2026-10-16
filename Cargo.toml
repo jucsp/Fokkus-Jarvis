@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.15"
+version = "0.2.16"
 edition = "2021"
 rust-version = "1.99"
 # Los crates del workspace no se publican en crates.io (cargo-deny los trata
@@ -35,6 +35,10 @@ signal-hook = "0.4"
 # `dup2` para redirigir stdout/stderr al log persistente cuando el binario se
 # lanza sin terminal (.desktop). Ya estaba en el árbol vía cpal/calloop.
 libc = "0.2"
+# Servicio D-Bus de sesión que recibe los reportes del script de KWin (HU-35,
+# decisión D-35.1). Ya estaba en el árbol vía keyring (secret-service) con
+# estos mismos features: no suma crates nuevos. Sin tokio.
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
 
 # ─── Conversación nativa v0.2.0 ──────────────────────────────────────────────
 # Stack aprobado en docs/specs/sdd-conversacion-nativa-v0.2.0.md §4, con el

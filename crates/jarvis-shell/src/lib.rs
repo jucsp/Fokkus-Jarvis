@@ -6,6 +6,8 @@
 //!   `zwlr_layer_shell_v1` (KWin, Hyprland, Sway…).
 //! - [`HeadlessSurface`]: sin ventana; valida frames y regula el ritmo del bucle.
 //!
+//! [`window_watch`] detecta ventanas a pantalla completa (HU-35).
+//!
 //! El backend `winit` (X11, Windows, macOS, GNOME) llega en otra tarea.
 
 use std::fmt;
@@ -17,6 +19,7 @@ mod headless;
 pub mod menu;
 #[cfg(target_os = "linux")]
 mod wayland_layer;
+pub mod window_watch;
 
 pub use headless::HeadlessSurface;
 pub use menu::{ContextMenu, MenuItem};
@@ -259,6 +262,12 @@ pub trait OverlaySurface {
     ///
     /// Es solo visual: la región de entrada no cambia.
     fn set_opacity(&mut self, _opacity: Opacity) {}
+
+    /// Nombre del output (monitor) donde está la superficie, si se conoce
+    /// (HU-35: la directiva de pantalla completa solo aplica en ese monitor).
+    fn current_output(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Convierte píxeles RGBA premultiplicados (tiny-skia) a `Argb8888` de

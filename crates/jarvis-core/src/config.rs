@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fullscreen::FullscreenBehavior;
 use crate::paths;
 
 /// Comando CLI por defecto del cerebro (Antigravity, como en Fokkus IDE).
@@ -24,6 +25,11 @@ pub const SPHERE_SCALE_RANGE: std::ops::RangeInclusive<u16> = 50..=200;
 
 /// Rango válido de opacidad de la esfera, en porcentaje.
 pub const SPHERE_OPACITY_RANGE: std::ops::RangeInclusive<u8> = 20..=100;
+
+/// Rango válido de opacidad de la esfera bajo detección de pantalla completa
+/// (HU-35), en porcentaje. Compartido por `fullscreen_dim_pct` y
+/// `fullscreen_active_pct`.
+pub const FULLSCREEN_PCT_RANGE: std::ops::RangeInclusive<u8> = 5..=100;
 
 /// Lado de la esfera en píxeles lógicos para un porcentaje de escala,
 /// saturado a [`SPHERE_SCALE_RANGE`] (lo usa también la vista previa en vivo).
@@ -124,6 +130,15 @@ pub struct JarvisConfig {
     /// Opacidad de la esfera en % (20–100). Entero para conservar `Eq`.
     #[serde(rename = "sphere_opacity_pct", default = "default_sphere_opacity_pct")]
     sphere_opacity_pct: u8,
+    /// Comportamiento al detectar una ventana a pantalla completa (HU-35).
+    fullscreen_behavior: FullscreenBehavior,
+    /// Opacidad de la esfera atenuada por pantalla completa (5–100, default 25).
+    #[serde(default = "default_fullscreen_dim_pct")]
+    fullscreen_dim_pct: u8,
+    /// Opacidad de la esfera durante un turno activo estando atenuada
+    /// (5–100, default 60).
+    #[serde(default = "default_fullscreen_active_pct")]
+    fullscreen_active_pct: u8,
 }
 
 fn default_sphere_scale_pct() -> u16 {
@@ -132,6 +147,14 @@ fn default_sphere_scale_pct() -> u16 {
 
 fn default_sphere_opacity_pct() -> u8 {
     100
+}
+
+fn default_fullscreen_dim_pct() -> u8 {
+    25
+}
+
+fn default_fullscreen_active_pct() -> u8 {
+    60
 }
 
 impl Default for JarvisConfig {
@@ -148,6 +171,9 @@ impl Default for JarvisConfig {
             api_model: String::new(),
             sphere_scale_pct: 100,
             sphere_opacity_pct: 100,
+            fullscreen_behavior: FullscreenBehavior::Dim,
+            fullscreen_dim_pct: 25,
+            fullscreen_active_pct: 60,
         }
     }
 }
@@ -228,6 +254,11 @@ impl JarvisConfig {
         self
     }
 
+    pub fn with_fullscreen_behavior(mut self, behavior: FullscreenBehavior) -> Self {
+        self.fullscreen_behavior = behavior;
+        self
+    }
+
     /// Comando CLI efectivo (el por defecto si quedó vacío).
     pub fn effective_cli_command(&self) -> &str {
         let command = self.cli_command.trim();
@@ -260,6 +291,24 @@ impl JarvisConfig {
         Opacity::from_pct(self.sphere_opacity_pct)
     }
 
+    /// Comportamiento al detectar pantalla completa (HU-35).
+    pub fn fullscreen_behavior(&self) -> FullscreenBehavior {
+        self.fullscreen_behavior
+    }
+
+    /// Opacidad de la esfera atenuada por pantalla completa, saturada a 5–100.
+    pub fn fullscreen_dim_pct(&self) -> u8 {
+        self.fullscreen_dim_pct
+            .clamp(*FULLSCREEN_PCT_RANGE.start(), *FULLSCREEN_PCT_RANGE.end())
+    }
+
+    /// Opacidad de la esfera durante un turno activo estando atenuada,
+    /// saturada a 5–100.
+    pub fn fullscreen_active_pct(&self) -> u8 {
+        self.fullscreen_active_pct
+            .clamp(*FULLSCREEN_PCT_RANGE.start(), *FULLSCREEN_PCT_RANGE.end())
+    }
+
     /// Satura los valores fuera de rango al cargar (no es error de parseo).
     fn saturate(&mut self) {
         let scale = self.sphere_scale_pct();
@@ -279,6 +328,23 @@ impl JarvisConfig {
                 self.sphere_opacity_pct
             );
             self.sphere_opacity_pct = opacity;
+        }
+
+        let dim = self.fullscreen_dim_pct();
+        if dim != self.fullscreen_dim_pct {
+            eprintln!(
+                "[config] fullscreen_dim_pct fuera de rango ({}): se satura a {dim}",
+                self.fullscreen_dim_pct
+            );
+            self.fullscreen_dim_pct = dim;
+        }
+        let active = self.fullscreen_active_pct();
+        if active != self.fullscreen_active_pct {
+            eprintln!(
+                "[config] fullscreen_active_pct fuera de rango ({}): se satura a {active}",
+                self.fullscreen_active_pct
+            );
+            self.fullscreen_active_pct = active;
         }
     }
 
@@ -563,5 +629,62 @@ mod tests {
         assert_eq!(loaded.sphere_size_px(), 220);
         assert_eq!(loaded.sphere_opacity(), Opacity::OPAQUE);
         cleanup(&path);
+    }
+
+    #[test]
+    fn fullscreen_defaults_and_builder() {
+        let config = JarvisConfig::default();
+        assert_eq!(config.fullscreen_behavior(), FullscreenBehavior::Dim);
+        assert_eq!(config.fullscreen_dim_pct(), 25);
+        assert_eq!(config.fullscreen_active_pct(), 60);
+
+        let config = config.with_fullscreen_behavior(FullscreenBehavior::Hide);
+        assert_eq!(config.fullscreen_behavior(), FullscreenBehavior::Hide);
+    }
+
+    #[test]
+    fn fullscreen_fields_roundtrip_through_toml() {
+        let path = temp_config_path("fullscreen-roundtrip");
+        cleanup(&path);
+        let config = JarvisConfig {
+            fullscreen_behavior: FullscreenBehavior::Hide,
+            fullscreen_dim_pct: 40,
+            fullscreen_active_pct: 80,
+            ..JarvisConfig::default()
+        };
+        config.save_to(&path).unwrap();
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("fullscreen_behavior = \"hide\""), "{toml}");
+        assert!(toml.contains("fullscreen_dim_pct = 40"), "{toml}");
+        assert!(toml.contains("fullscreen_active_pct = 80"), "{toml}");
+
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded, config);
+        assert_eq!(loaded.fullscreen_behavior(), FullscreenBehavior::Hide);
+        assert_eq!(loaded.fullscreen_dim_pct(), 40);
+        assert_eq!(loaded.fullscreen_active_pct(), 80);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn out_of_range_fullscreen_pct_saturates_on_load() {
+        let path = temp_config_path("fullscreen-sat");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "fullscreen_dim_pct = 0\nfullscreen_active_pct = 250\n",
+        )
+        .unwrap();
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.fullscreen_dim_pct(), 5);
+        assert_eq!(loaded.fullscreen_active_pct(), 100);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn fullscreen_behavior_serializes_lowercase_by_default() {
+        let toml = toml::to_string(&JarvisConfig::default()).expect("serializa");
+        assert!(toml.contains("fullscreen_behavior = \"dim\""), "{toml}");
     }
 }

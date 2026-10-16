@@ -59,11 +59,11 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
   - 📁 _Repositorio:_ `Fokkus-Jarvis`
   - 🎯 _Capa a trabajar:_ `crates/jarvis-render` y `crates/jarvis-app`.
   - 📌 _Objetivo técnico:_ Añadir parámetro de opacidad global en la configuración y modular el canal alfa durante la composición en `tiny-skia` con interpolador temporal lineal `OpacityFade` de 150 ms (✅ 398 tests pasando).
-- [ ] **feat(ui): detección universal de pantalla completa y modo ventana sin bordes (Auto-Dim / Auto-Hide)** (HU-35)
+- [x] **feat(ui): detección universal de pantalla completa y modo ventana sin bordes (Auto-Dim / Auto-Hide)** (HU-35)
   - _Contexto de negocio:_ Si el usuario entra a pantalla completa (video en YouTube, juego en modo frameless o Steam), Jarvis debe detectarlo genéricamente para no entorpecer la vista.
   - 📁 _Repositorio:_ `Fokkus-Jarvis`
   - 🎯 _Capa a trabajar:_ `crates/jarvis-shell` / integración de ventanas de SO.
-  - 📌 _Objetivo técnico:_ Implementar un monitor agnóstico de estado de ventanas (KWin DBus / XDG toplevel / APIs nativas de OS) que active automáticamente atenuación de opacidad o minimizado temporal.
+  - 📌 _Objetivo técnico:_ Implementar un monitor agnóstico de estado de ventanas (KWin DBus / XDG toplevel / APIs nativas de OS) que active automáticamente atenuación de opacidad o minimizado temporal. Implementado con watcher D-Bus de KWin Scripting, máquina `FullscreenPolicy` con histéresis de 300 ms, override vocal temporal durante conversación y selector en Ajustes Generales (✅ 440 tests pasando).
 - [ ] **feat(ui): mensajes efímeros flotantes en burbujas transparentes (Speech Popups HUD)** (HU-36)
   - _Contexto de negocio:_ Confirmación visual rápida de lo que el usuario dijo y lo que Jarvis responde, sin recurrir a una ventana pesada de chat permanente.
   - 📁 _Repositorio:_ `Fokkus-Jarvis`

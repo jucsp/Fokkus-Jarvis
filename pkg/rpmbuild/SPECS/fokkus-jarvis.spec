@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.2.15
+Version:        0.2.16
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,11 +23,12 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.16-1
+- HU-35: Detección universal de pantalla completa y modo ventana sin bordes (Auto-Dim al 25% / Auto-Hide).
+- Integración con KWin Scripting sobre D-Bus de sesión (io.fokkus.Jarvis.WindowWatch).
+- Histéresis de 300 ms, override vocal para visibilidad al hablar y selector en Ajustes Generales.
+
 * Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.15-1
 - HU-33: Redimensionado dinámico en tiempo real (50% a 200%) desde Ajustes Generales.
 - HU-34: Opacidad y transparencia variable (20% a 100%) con interpolador OpacityFade.
 - Actualización reactiva por stdout piped entre subproceso de ajustes y daemon.
-
-* Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.14-1
-- Apertura local de la carpeta de Descargas ("abre la carpeta de descargas").
-- El prompt del CLI pide usar herramientas para ejecutar acciones en el equipo.

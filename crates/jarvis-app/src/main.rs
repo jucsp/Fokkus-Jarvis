@@ -21,6 +21,7 @@
 //! segundo plano y la escucha arranca al quedar cargado.
 
 mod logging;
+mod presence;
 mod runtime;
 mod settings;
 
@@ -38,7 +39,9 @@ use jarvis_audio::{
     VoiceDeps, VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
 };
 use jarvis_core::single_instance::{self, InstanceError};
-use jarvis_core::{sphere_size_for_pct, JarvisConfig, JarvisCore, Opacity, SharedCore};
+use jarvis_core::{
+    sphere_size_for_pct, FullscreenBehavior, JarvisConfig, JarvisCore, Opacity, SharedCore,
+};
 use jarvis_ipc::{IpcError, IpcServer, ServerState, SpeechSink, Utterance};
 use jarvis_shell::{
     HeadlessSurface, OverlayOptions, OverlaySurface, ShellCommand, SurfaceError, SurfaceSize,
@@ -545,6 +548,12 @@ fn run() -> ExitCode {
         }
         ShellCommand::Quit => {}
     };
+    // Detección de pantalla completa (HU-35): con `ignore` no carga nada.
+    let mut fullscreen = presence::FullscreenMonitor::start(
+        std::process::id(),
+        persisted_look.get().fullscreen,
+        jarvis_shell::window_watch::detect_watcher,
+    );
     let exit = runtime::run_loop(
         surface.as_mut(),
         &mut view,
@@ -553,12 +562,15 @@ fn run() -> ExitCode {
         &shutdown,
         &reset_position,
         None,
+        Some(&mut fullscreen),
         &mut on_first_frame,
         &mut on_command,
     );
 
-    // Apagado ordenado: superficie → orquestador (y coordinador) → streams y
-    // DSP → IPC (borra el socket) → lock.
+    // Apagado ordenado: script de KWin → superficie → orquestador (y
+    // coordinador) → streams y DSP → IPC (borra el socket) → lock.
+    fullscreen.shutdown();
+    drop(fullscreen);
     surface.set_visible(false);
     drop(surface);
     if let Some(orchestrator) = orchestrator.as_mut() {
@@ -744,6 +756,19 @@ fn run_health_check() -> ExitCode {
             format!("overlay no disponible ({e}); modo headless, solo IPC"),
         )),
     }
+
+    // 9. Detección de pantalla completa (HU-35). Nunca se finge detección.
+    let fullscreen = match config.fullscreen_behavior() {
+        FullscreenBehavior::Ignore => (
+            Health::Ok,
+            "desactivada (fullscreen_behavior = ignore)".to_string(),
+        ),
+        behavior => match jarvis_shell::window_watch::probe(behavior) {
+            Ok(kind) => (Health::Ok, format!("{kind} ({behavior:?})")),
+            Err(reason) => (Health::Warn, format!("no disponible ({reason})")),
+        },
+    };
+    checks.push(("detección de pantalla completa", fullscreen.0, fullscreen.1));
 
     // Informe.
     for (name, health, detail) in &checks {

@@ -17,6 +17,8 @@ use jarvis_core::{AudioLevel, JarvisConfig, JarvisState, Opacity};
 use jarvis_render::{OpacityFade, Pixmap, RenderError, SphereRenderer};
 use jarvis_shell::{FrameBuffer, OverlaySurface, ShellCommand, SurfaceSize, SurfaceStatus};
 
+use crate::presence::{FullscreenMonitor, FullscreenSettings, PresenceDirective};
+
 /// Intervalo entre frames en estados activos (60 FPS).
 pub const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
@@ -89,6 +91,8 @@ pub struct SphereLook {
     pub size: u32,
     /// Opacidad de usuario (20–100 %).
     pub opacity: Opacity,
+    /// Reacción a ventanas a pantalla completa (HU-35).
+    pub fullscreen: FullscreenSettings,
 }
 
 impl SphereLook {
@@ -97,6 +101,7 @@ impl SphereLook {
         Self {
             size: config.sphere_size_px(),
             opacity: config.sphere_opacity(),
+            fullscreen: FullscreenSettings::from_config(config),
         }
     }
 }
@@ -194,9 +199,11 @@ impl ErrorOnce {
 /// de `view` se reutiliza en cada frame (solo se reasigna al cambiar de
 /// tamaño). Antes de dibujar aplica `look` (config o vista previa): como
 /// máximo un cambio de tamaño por frame y la opacidad con un fundido de
-/// [`OPACITY_FADE`]. `on_first_frame` se invoca una vez tras presentar el
-/// primer frame. "Salir" en el menú contextual termina el bucle; el resto de
-/// acciones se entregan a `on_command`.
+/// [`OPACITY_FADE`]. `presence` (HU-35) multiplica esa opacidad por el factor
+/// de pantalla completa u oculta la superficie tras fundirla a transparente.
+/// `on_first_frame` se invoca una vez tras presentar el primer frame. "Salir"
+/// en el menú contextual termina el bucle; el resto de acciones se entregan a
+/// `on_command`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     surface: &mut dyn OverlaySurface,
@@ -206,6 +213,7 @@ pub fn run_loop(
     shutdown: &AtomicBool,
     reset_position: &AtomicBool,
     max_frames: Option<u64>,
+    mut presence: Option<&mut FullscreenMonitor>,
     on_first_frame: &mut dyn FnMut(),
     on_command: &mut CommandHandler<'_>,
 ) -> LoopExit {
@@ -215,6 +223,8 @@ pub fn run_loop(
     let mut opacity_target = look.get().opacity;
     let mut fade = OpacityFade::new(opacity_target, OPACITY_FADE);
     surface.set_opacity(opacity_target);
+    // La superficie está mapeada (la oculta solo la directiva `Hidden`).
+    let mut shown = true;
     // Último tamaño rechazado: no se reintenta en cada frame.
     let mut rejected_size: Option<u32> = None;
 
@@ -263,9 +273,32 @@ pub fn run_loop(
                 }
             }
         }
-        if target.opacity != opacity_target {
-            opacity_target = target.opacity;
+        let directive = match presence.as_deref_mut() {
+            Some(monitor) => monitor.update(
+                target.fullscreen,
+                state,
+                surface.current_output().as_deref(),
+                now,
+            ),
+            None => PresenceDirective::Normal,
+        };
+        let (show, auto) = match directive {
+            PresenceDirective::Normal => (true, Opacity::OPAQUE),
+            PresenceDirective::Dimmed(factor) => (true, factor),
+            // Se funde a transparente y luego se desmapea.
+            PresenceDirective::Hidden => (false, Opacity::from_raw(0)),
+        };
+        let wanted = target.opacity.mul(auto);
+        if wanted != opacity_target {
+            opacity_target = wanted;
             fade.retarget(opacity_target, now);
+        }
+        if show && !shown {
+            surface.set_visible(true);
+            shown = true;
+        } else if !show && shown && fade.is_settled(now) {
+            surface.set_visible(false);
+            shown = false;
         }
         surface.set_opacity(fade.value_at(now));
 
@@ -503,6 +536,8 @@ pub fn local_time() -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jarvis_core::FullscreenBehavior;
+    use jarvis_shell::window_watch::{WatcherKind, WindowEvent, WindowWatcher};
     use jarvis_shell::{HeadlessSurface, SurfaceSize};
 
     #[test]
@@ -548,6 +583,7 @@ mod tests {
         Cell::new(SphereLook {
             size,
             opacity: Opacity::OPAQUE,
+            fullscreen: FullscreenSettings::default(),
         })
     }
 
@@ -565,6 +601,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(5),
+            None,
             &mut || first += 1,
             &mut |_| {},
         );
@@ -594,6 +631,7 @@ mod tests {
             &mut || (JarvisState::Idle, 0.0),
             &shutdown,
             &AtomicBool::new(false),
+            None,
             None,
             &mut || {},
             &mut |_| {},
@@ -625,6 +663,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             None,
+            None,
             &mut || {},
             &mut |command| handled.push(command),
         );
@@ -645,6 +684,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(1),
+            None,
             &mut || {},
             &mut |_| {},
         );
@@ -675,6 +715,7 @@ mod tests {
                     look.set(SphereLook {
                         size,
                         opacity: Opacity::from_pct(60),
+                        fullscreen: FullscreenSettings::default(),
                     });
                 }
             }
@@ -688,6 +729,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(3),
+            None,
             &mut || {},
             &mut |_| {},
         );
@@ -705,12 +747,14 @@ mod tests {
         let persisted = SphereLook {
             size: 32,
             opacity: Opacity::OPAQUE,
+            fullscreen: FullscreenSettings::default(),
         };
         let mut view = SphereView::new(32).unwrap();
         let mut surface = headless(&view);
         let look = Cell::new(SphereLook {
             size: 48,
             opacity: Opacity::from_pct(30),
+            fullscreen: FullscreenSettings::default(),
         });
         let shutdown = AtomicBool::new(false);
         let mut frames = 0;
@@ -730,11 +774,102 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(2),
+            None,
             &mut || {},
             &mut |_| {},
         );
         assert_eq!(view.size(), 32);
         assert_eq!(surface.size(), SurfaceSize::new(32, 32).unwrap());
+    }
+
+    /// Monitor que emite una ventana a pantalla completa y nada más.
+    struct FakeWatcher(crossbeam_channel::Receiver<WindowEvent>);
+
+    impl WindowWatcher for FakeWatcher {
+        fn kind(&self) -> WatcherKind {
+            WatcherKind::KwinScript
+        }
+        fn events(&self) -> crossbeam_channel::Receiver<WindowEvent> {
+            self.0.clone()
+        }
+        fn shutdown(&mut self) {}
+    }
+
+    fn fullscreen_watcher(_pid: u32, _b: FullscreenBehavior) -> Box<dyn WindowWatcher> {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let rect = jarvis_core::Rect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        tx.send(WindowEvent::Active(
+            jarvis_core::WindowSnapshot {
+                app_id: "mpv".into(),
+                fullscreen: true,
+                decorated: false,
+                geometry: rect,
+                output: "DP-1".into(),
+                own: false,
+            },
+            jarvis_core::OutputGeometry {
+                name: "DP-1".into(),
+                rect,
+            },
+        ))
+        .unwrap();
+        Box::new(FakeWatcher(rx))
+    }
+
+    fn run_with_presence(behavior: FullscreenBehavior, frames: u64) -> HeadlessSurface {
+        let mut view = SphereView::new(32).unwrap();
+        let mut surface = headless(&view);
+        surface.set_visible(true);
+        let fullscreen = FullscreenSettings {
+            behavior,
+            ..FullscreenSettings::default()
+        };
+        let look = Cell::new(SphereLook {
+            size: 32,
+            opacity: Opacity::OPAQUE,
+            fullscreen,
+        });
+        let mut monitor = FullscreenMonitor::start(1, fullscreen, fullscreen_watcher);
+        // 60 FPS: suficientes frames para cruzar histéresis + fundido.
+        run_loop(
+            &mut surface,
+            &mut view,
+            &look,
+            &mut || (JarvisState::Idle, 0.0),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            Some(frames),
+            Some(&mut monitor),
+            &mut || {},
+            &mut |_| {},
+        );
+        surface
+    }
+
+    #[test]
+    fn loop_dims_the_sphere_on_fullscreen() {
+        // ~0,6 s: 300 ms de histéresis + 150 ms de fundido.
+        let surface = run_with_presence(FullscreenBehavior::Dim, 36);
+        assert!(surface.is_visible());
+        assert_eq!(surface.opacity(), FullscreenSettings::default().dim);
+    }
+
+    #[test]
+    fn loop_hides_the_sphere_on_fullscreen() {
+        let surface = run_with_presence(FullscreenBehavior::Hide, 36);
+        assert!(!surface.is_visible());
+    }
+
+    #[test]
+    fn loop_ignores_fullscreen_when_disabled() {
+        let surface = run_with_presence(FullscreenBehavior::Ignore, 36);
+        assert!(surface.is_visible());
+        assert_eq!(surface.opacity(), Opacity::OPAQUE);
     }
 
     #[test]

@@ -1,11 +1,36 @@
 # Sprint Board — Fokkus-Jarvis
 
 **Épica 6:** Experiencia Visual Adaptativa y Personalización de Interfaz
-**Sprint:** HU-33 (tamaño dinámico) + HU-34 (opacidad variable)
-**Actualizado:** 2026-10-16 · **PM/QA:** Claude
-**Contratos:** [HU-33](docs/specs/sdd-contracts/sdd-hu33-tamano-dinamico-burbuja.md) · [HU-34](docs/specs/sdd-contracts/sdd-hu34-opacidad-transparencia-esfera.md)
+**Sprint:** HU-35 (detección universal de pantalla completa y auto-dim / auto-hide)
+**Actualizado:** 2026-10-16 · **PM/QA:** Claude · **PO:** Antigravity
+**Contratos:** [HU-35](docs/specs/sdd-contracts/sdd-hu35-deteccion-pantalla-completa.md) · [HU-34](docs/specs/sdd-contracts/sdd-hu34-opacidad-transparencia-esfera.md) · [HU-33](docs/specs/sdd-contracts/sdd-hu33-tamano-dinamico-burbuja.md)
 
 Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere prueba manual
+
+---
+
+## HU-35 — Detección universal de pantalla completa y modo ventana sin bordes (Auto-Dim / Auto-Hide)
+
+### jarvis-core
+- [x] 35.1 `FullscreenBehavior` enum (`Ignore`, `Dim`, `Hide`) con serde lowercase y default `Dim` [Responsable: DeepSeek]
+- [x] 35.2 `Rect` struct (`x`, `y`, `w`, `h`) y tipos `WindowSnapshot`, `OutputGeometry` [Responsable: DeepSeek]
+- [x] 35.3 Función pura `is_effectively_fullscreen(&WindowSnapshot, &OutputGeometry) -> bool` (fullscreen o borderless >= 98% con +/-2px) [Responsable: DeepSeek]
+- [x] 35.4 Campos en `JarvisConfig`: `fullscreen_behavior`, `fullscreen_dim_pct` (5..=100, default 25), `fullscreen_active_pct` (5..=100, default 60) [Responsable: DeepSeek]
+- [x] 35.5 Tests unitarios exhaustivos para `is_effectively_fullscreen` y config (55 tests pasando ✅) [Responsable: DeepSeek]
+
+### jarvis-shell
+- [x] 35.6 Módulo `window_watch` con `WindowEvent`, `WatcherKind` y trait `WindowWatcher` [Responsable: Claude]
+- [x] 35.7 Script de KWin `assets/kwin_fullscreen_watch.js` con escucha de eventos de ventana y reporte DBus [Responsable: Claude]
+- [x] 35.8 `KwinScriptWatcher`: servicio DBus `io.fokkus.Jarvis.WindowWatch`, carga/descarga con `org.kde.kwin.Scripting` y emisión a crossbeam channel [Responsable: Claude]
+- [x] 35.9 `NullWatcher` y fábrica `detect_watcher(jarvis_pid: u32, behavior: FullscreenBehavior)` [Responsable: Claude]
+- [x] 35.10 Tests unitarios e integración para `window_watch` [Responsable: Claude]
+
+### jarvis-app
+- [x] 35.11 `PresenceDirective` (`Normal`, `Dimmed(Opacity)`, `Hidden`) y máquina de estados `FullscreenPolicy` con histéresis 300 ms y override vocal [Responsable: Claude]
+- [x] 35.12 Integración en `run_loop.rs`: consumo de eventos de ventana, modulación de `auto_factor` de HU-34 / visibilidad de superficie [Responsable: Claude]
+- [x] 35.13 Selector "Pantalla completa" en Ajustes Generales (`unified_settings.py`) [Responsable: Claude]
+- [x] 35.14 Verificación integral `cargo test --workspace`, clippy y formato [Responsable: Claude]
+
 
 ---
 
@@ -32,7 +57,7 @@ Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere 
 ### jarvis-app
 - [x] 34.13 Slider "Opacidad" 20–100 % (paso 5) en General → Esfera [Responsable: Claude]
 - [x] 34.14 Vista previa `{"preview":{"sphere_opacity_pct":Y}}` ≤ 30 Hz, aplicada con fundido de 150 ms en `run_loop` [Responsable: Claude]
-- [ ] 34.15 Composición con la atenuación automática de HU-35 (`user × auto`) — depende de HU-35 [Responsable: DeepSeek]
+- [x] 34.15 Composición con la atenuación automática de HU-35 (`user × auto`) — depende de HU-35 [Responsable: DeepSeek]
 - [ ] 🧪 34.16 Prueba manual: esfera al 30 % sobre un editor, colores de estado distinguibles [Responsable: Claude]
 - [ ] 34.17 Benchmark de sobrecoste (≤ 0.3 ms a 220 px, ≤ 1.2 ms a 440 px) [Responsable: DeepSeek]
 
@@ -68,7 +93,8 @@ Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere 
 ---
 
 ## Verificación (2026-10-16)
-- `cargo test --workspace`: ✅ 398 passed, 0 failed (2 ignored preexistentes)
+- `cargo test --workspace`: ✅ 440 passed, 0 failed (2 ignored preexistentes)
 - `cargo clippy --workspace --all-targets -- -D warnings`: ✅ limpio
 - `cargo fmt --all -- --check`: ✅ limpio
-- `unified_settings.py` en Qt offscreen: ráfaga de 151 cambios → 2 líneas JSON; valores saturados y alineados al paso; TOML guardado con `sphere_scale_pct`/`sphere_opacity_pct`
+- `cargo deny check`: ✅ limpio (advisories ok, bans ok, licenses ok, sources ok)
+- `unified_settings.py` en Qt offscreen: selector "Pantalla completa" (`dim`, `hide`, `ignore`); ráfaga de 151 cambios → 2 líneas JSON; valores saturados y alineados al paso; TOML guardado con `sphere_scale_pct`/`sphere_opacity_pct`/`fullscreen_behavior`

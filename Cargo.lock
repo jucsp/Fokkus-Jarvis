@@ -1234,7 +1234,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jarvis-app"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "cpal",
  "crossbeam-channel",
@@ -1251,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-audio"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "cpal",
  "crossbeam-channel",
@@ -1273,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-core"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "crossbeam-channel",
  "serde",
@@ -1282,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-ipc"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "jarvis-core",
  "serde",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-render"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
  "jarvis-core",
  "tiny-skia",
@@ -1299,10 +1299,13 @@ dependencies = [
 
 [[package]]
 name = "jarvis-shell"
-version = "0.2.15"
+version = "0.2.16"
 dependencies = [
+ "crossbeam-channel",
  "jarvis-core",
+ "serde",
  "smithay-client-toolkit",
+ "zbus",
 ]
 
 [[package]]

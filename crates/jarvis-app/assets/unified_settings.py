@@ -42,6 +42,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFrame,
     QGraphicsDropShadowEffect,
     QGridLayout,
@@ -96,7 +97,15 @@ DEFAULTS = {
     "gaming_mode": False,
     "sphere_scale_pct": 100,
     "sphere_opacity_pct": 100,
+    "fullscreen_behavior": "dim",
 }
+
+# Reacción a ventanas a pantalla completa (HU-35): (valor TOML, etiqueta).
+FULLSCREEN_BEHAVIORS = [
+    ("dim", "Atenuar al 25% (recomendado)"),
+    ("hide", "Ocultar esfera"),
+    ("ignore", "Ignorar (desactivado)"),
+]
 
 # (id, nombre, género, lang, región, bandera)
 VOICES = [
@@ -577,6 +586,11 @@ class UnifiedSettings(QWidget):
         )
         layout.addWidget(self.opacity_card)
 
+        self.fullscreen_card, self.fullscreen_combo = self._fullscreen_card(
+            self.current.get("fullscreen_behavior")
+        )
+        layout.addWidget(self.fullscreen_card)
+
         save = QPushButton("Guardar")
         save.setObjectName("primary")
         save.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -663,6 +677,37 @@ class UnifiedSettings(QWidget):
         slider.valueChanged.connect(changed)
         slider.sliderReleased.connect(throttle.flush)
         return card, slider
+
+    def _fullscreen_card(self, value):
+        card = QFrame()
+        card.setObjectName("card")
+        layout = QHBoxLayout(card)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
+
+        text = QVBoxLayout()
+        text.setSpacing(3)
+        t = QLabel("Pantalla completa")
+        t.setObjectName("label")
+        h = QLabel(
+            "Al ver un video, jugar o presentar. La esfera sigue escuchando"
+            " y reaparece mientras le hablas."
+        )
+        h.setObjectName("hint")
+        h.setWordWrap(True)
+        text.addWidget(t)
+        text.addWidget(h)
+        layout.addLayout(text, 1)
+
+        combo = QComboBox()
+        combo.setObjectName("field")
+        combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        for key, label in FULLSCREEN_BEHAVIORS:
+            combo.addItem(label, key)
+        keys = [key for key, _label in FULLSCREEN_BEHAVIORS]
+        combo.setCurrentIndex(keys.index(value) if value in keys else 0)
+        layout.addWidget(combo)
+        return card, combo
 
     def _check_card(self, title, hint, checked):
         card = QFrame()
@@ -806,6 +851,8 @@ class UnifiedSettings(QWidget):
                 "voice_lang": voice[3],
                 "sphere_scale_pct": int(self.scale_slider.value()),
                 "sphere_opacity_pct": int(self.opacity_slider.value()),
+                "fullscreen_behavior": self.fullscreen_combo.currentData()
+                or DEFAULTS["fullscreen_behavior"],
             }
         )
         try:
@@ -871,6 +918,11 @@ class UnifiedSettings(QWidget):
         }}
         QLineEdit#field {{ background: {FIELD}; color: {TEXT}; border: 1px solid {BORDER};
                            border-radius: 9px; padding: 9px 12px; font-size: 13px; }}
+        QComboBox#field {{ background: {FIELD}; color: {TEXT}; border: 1px solid {BORDER};
+                           border-radius: 9px; padding: 7px 12px; font-size: 13px; }}
+        QComboBox#field QAbstractItemView {{ background: {CARD}; color: {TEXT};
+                                             selection-background-color: {ACCENT};
+                                             selection-color: #0B0F14; }}
         QCheckBox#switch {{ color: {TEXT}; font-size: 13px; spacing: 10px; }}
         QCheckBox#switch::indicator {{
             width: 40px; height: 22px; border-radius: 11px; background: {SWITCH_OFF};
