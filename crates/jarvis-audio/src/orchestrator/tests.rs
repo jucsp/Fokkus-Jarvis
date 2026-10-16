@@ -109,19 +109,22 @@ impl AudioSink for FakeSink {
 
 /// Guion de transcripciones: el primer valor del PCM indica la línea.
 const SCRIPT: &[&str] = &[
-    "esto no va contigo",         // 0: sin palabra clave
-    "Jarvis, ¿qué tal el clima?", // 1
-    "¿y mañana?",                 // 2: seguimiento
-    "cuéntame otra cosa",         // 3: tras barge-in
-    "Jarvis, qué hora es",        // 4: local
-    "Jarvis, deja de escuchar",   // 5: silencio por voz
-    "Jarvis, busca el archivo y", // 6: conector
-    "ábrelo",                     // 7: continuación
-    "Jarvis, abre el menú y",     // 8: conector inicial
-    "ajústalo y",                 // 9: continuación también conector
-    "guárdalo",                   // 10: cierre
-    "Jarvis, ábreme Spotify",     // 11: abrir aplicación
-    "Jarvis, cierra Spotify",     // 12: cerrar aplicación
+    "esto no va contigo",                                    // 0: sin palabra clave
+    "Jarvis, ¿qué tal el clima?",                            // 1
+    "¿y mañana?",                                            // 2: seguimiento
+    "cuéntame otra cosa",                                    // 3: tras barge-in
+    "Jarvis, qué hora es",                                   // 4: local
+    "Jarvis, deja de escuchar",                              // 5: silencio por voz
+    "Jarvis, busca el archivo y",                            // 6: conector
+    "ábrelo",                                                // 7: continuación
+    "Jarvis, abre el menú y",                                // 8: conector inicial
+    "ajústalo y",                                            // 9: continuación también conector
+    "guárdalo",                                              // 10: cierre
+    "Jarvis, ábreme Spotify",                                // 11: abrir aplicación
+    "Jarvis, cierra Spotify",                                // 12: cerrar aplicación
+    "Jarvis, revisa mis correos y dime si hay algo urgente", // 13: tarea pesada
+    "Jarvis, cancela todas las tareas",                      // 14
+    "Jarvis, qué tareas tengo",                              // 15
 ];
 
 struct ScriptTranscriber;
@@ -174,10 +177,18 @@ impl TokenStream for FakeBrain {
         let tokens = self.tokens.lock().unwrap().clone();
         let delay = *self.delay.lock().unwrap();
         for token in &tokens {
-            if self.cancelled.load(Ordering::SeqCst) {
-                return Err(BrainError::Cancelled);
+            // Espera cancelable (como matar el árbol del CLI a mitad).
+            let until = Instant::now() + delay;
+            loop {
+                if self.cancelled.load(Ordering::SeqCst) {
+                    return Err(BrainError::Cancelled);
+                }
+                let now = Instant::now();
+                if now >= until {
+                    break;
+                }
+                std::thread::sleep((until - now).min(Duration::from_millis(2)));
             }
-            std::thread::sleep(delay);
             on_token(token);
         }
         Ok(Completion {
@@ -236,7 +247,7 @@ fn wav(samples: usize) -> Vec<u8> {
 const FILLER_SAMPLES: usize = 12_345;
 
 fn harness(name: &str, brain: Option<Arc<FakeBrain>>, config: VoiceConfig) -> Harness {
-    harness_with_synth_delay(name, brain, config, Duration::ZERO)
+    harness_full(name, brain, config, Duration::ZERO, None)
 }
 
 fn harness_with_synth_delay(
@@ -244,6 +255,16 @@ fn harness_with_synth_delay(
     brain: Option<Arc<FakeBrain>>,
     config: VoiceConfig,
     synth_delay: Duration,
+) -> Harness {
+    harness_full(name, brain, config, synth_delay, None)
+}
+
+fn harness_full(
+    name: &str,
+    brain: Option<Arc<FakeBrain>>,
+    config: VoiceConfig,
+    synth_delay: Duration,
+    factory: Option<Arc<dyn BrainFactory>>,
 ) -> Harness {
     let cache = std::env::temp_dir().join(format!("jarvis-orq-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cache);
@@ -282,6 +303,7 @@ fn harness_with_synth_delay(
         coordinator,
         brain: brain.map(|b| b as Arc<dyn TokenStream + Send + Sync>),
         activation: Arc::clone(&activation),
+        factory,
     };
     let orchestrator = VoiceOrchestrator::start(deps, config).expect("hilos");
     orchestrator.set_transcriber(Box::new(ScriptTranscriber));
@@ -363,6 +385,70 @@ impl Harness {
     fn drained(&self) -> usize {
         self.sink.drained.lock().unwrap().len()
     }
+
+    fn task_status(&self) -> Vec<crate::tasks::TaskStatus> {
+        let tasks = self.orchestrator.tasks().expect("gestor de tareas");
+        tasks.list().into_iter().map(|r| r.status).collect()
+    }
+}
+
+/// Fábrica de cerebros de tarea: cada uno es un `FakeBrain` nuevo con la
+/// respuesta y latencia indicadas (HU-37).
+struct FakeFactory {
+    reply: String,
+    delay: Duration,
+    spawned: Mutex<Vec<Arc<FakeBrain>>>,
+}
+
+impl FakeFactory {
+    fn new(reply: &str, delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            reply: reply.to_string(),
+            delay,
+            spawned: Mutex::new(Vec::new()),
+        })
+    }
+}
+
+impl BrainFactory for FakeFactory {
+    fn spawn(&self, _timeout: Duration) -> Result<Arc<dyn TokenStream + Send + Sync>, BrainError> {
+        let brain = Arc::new(FakeBrain::default());
+        // Dos tokens: la latencia total ≈ 2 × delay.
+        let half = self
+            .reply
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|i| *i >= self.reply.len() / 2)
+            .unwrap_or(0);
+        let (a, b) = self.reply.split_at(half);
+        *brain.tokens.lock().unwrap() = vec![a.to_string(), b.to_string()];
+        *brain.delay.lock().unwrap() = self.delay;
+        self.spawned.lock().unwrap().push(Arc::clone(&brain));
+        Ok(brain)
+    }
+}
+
+fn tasks_config(name: &str) -> VoiceConfig {
+    VoiceConfig {
+        tasks: Some(crate::tasks::TaskConfig {
+            max_parallel: 2,
+            timeout: Duration::from_secs(30),
+            quiet_gap: Duration::ZERO,
+            dir: std::env::temp_dir()
+                .join(format!("jarvis-orq-tasks-{name}-{}", std::process::id())),
+        }),
+        ..fast()
+    }
+}
+
+fn task_harness(name: &str, brain: Arc<FakeBrain>, factory: Arc<FakeFactory>) -> Harness {
+    harness_full(
+        name,
+        Some(brain),
+        tasks_config(name),
+        Duration::ZERO,
+        Some(factory as Arc<dyn BrainFactory>),
+    )
 }
 
 // ----------------------------------------------------------------- tests
@@ -935,5 +1021,166 @@ fn close_app_runs_pkill_and_answers_without_llm() {
     assert_eq!(
         *launched.lock().unwrap(),
         vec![vec!["pkill", "-i", "-x", "spotify"]]
+    );
+}
+
+// ------------------------------------------------------------ HU-37 tareas
+
+const TASK_REPLY: &str = "RESUMEN_HABLADO: Tienes dos correos urgentes. DETALLE: - a - b";
+
+#[test]
+fn heavy_turn_acks_fast_and_a_light_turn_runs_while_the_task_works() {
+    use crate::tasks::TaskStatus;
+    let brain = FakeBrain::new("Respuesta ligera.");
+    let factory = FakeFactory::new(TASK_REPLY, Duration::from_millis(400));
+    let h = task_harness("task-ack", brain.clone(), factory.clone());
+
+    let started = Instant::now();
+    h.say_line(13);
+    h.wait_spoken_and_listening(0, 0);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "acuse en {:?} (CA-37.1)",
+        started.elapsed()
+    );
+    assert!(
+        brain.queries().is_empty(),
+        "el cerebro conversacional no recibe la tarea"
+    );
+    assert_eq!(h.task_status(), vec![TaskStatus::Running]);
+
+    // Turno ligero mientras la tarea sigue (CA-37.2).
+    let (p, d) = (h.played().len(), h.drained());
+    h.say_line(1);
+    h.wait_spoken_and_listening(p, d);
+    assert_eq!(brain.queries(), vec!["¿qué tal el clima?".to_string()]);
+    assert_eq!(h.task_status(), vec![TaskStatus::Running], "la tarea sigue");
+
+    // Al terminar, el resultado se locuta solo (CA-37.4).
+    let (p, d) = (h.played().len(), h.drained());
+    wait_until("tarea terminada", || {
+        h.task_status() == vec![TaskStatus::Done]
+    });
+    h.wait_spoken_and_listening(p, d);
+    let spawned = factory.spawned.lock().unwrap();
+    assert_eq!(spawned.len(), 1, "un cerebro aislado por tarea");
+    assert!(spawned[0].queries()[0].contains("revisa mis correos"));
+}
+
+#[test]
+fn barge_in_cancels_the_reply_but_not_the_background_task() {
+    use crate::tasks::TaskStatus;
+    let brain = FakeBrain::new("x");
+    let factory = FakeFactory::new(TASK_REPLY, Duration::from_millis(300));
+    let h = task_harness("task-barge", brain.clone(), factory);
+
+    h.say_line(13);
+    h.wait_spoken_and_listening(0, 0);
+
+    brain.set_reply(
+        "Mañana llueve por la mañana. Luego despeja. Y por la noche hiela. Fin.",
+        Duration::from_millis(30),
+    );
+    h.say_line(2);
+    h.wait_state(JarvisState::Speaking);
+    h.capture.set_vad(0.9);
+    h.voice_start();
+    wait_until("barge-in", || h.stats().barge_ins == 1);
+    h.capture.set_vad(0.0);
+
+    wait_until("tarea terminada (CA-37.3)", || {
+        h.task_status() == vec![TaskStatus::Done]
+    });
+}
+
+#[test]
+fn results_are_held_while_muted_and_announced_on_unmute() {
+    use crate::tasks::TaskStatus;
+    let brain = FakeBrain::new("x");
+    let factory = FakeFactory::new(TASK_REPLY, Duration::from_millis(150));
+    let h = task_harness("task-mute", brain, factory);
+
+    h.say_line(13);
+    h.wait_spoken_and_listening(0, 0);
+    h.core.transition(JarvisState::Muted).unwrap();
+    wait_until("tarea terminada", || {
+        h.task_status() == vec![TaskStatus::Done]
+    });
+    let played = h.played().len();
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        h.played().len(),
+        played,
+        "en silencio no se locuta (CA-37.8)"
+    );
+
+    let drained = h.drained();
+    h.core.transition(JarvisState::Idle).unwrap();
+    // Primero "Tienes 1 resultado pendiente." y luego el resultado.
+    wait_until("anuncio y resultado", || h.drained() >= drained + 2);
+    h.wait_state(JarvisState::Listening);
+}
+
+#[test]
+fn voice_commands_list_and_cancel_tasks() {
+    use crate::tasks::TaskStatus;
+    let brain = FakeBrain::new("x");
+    let factory = FakeFactory::new(TASK_REPLY, Duration::from_secs(5));
+    let h = task_harness("task-cancel", brain.clone(), factory);
+
+    h.say_line(13);
+    h.wait_spoken_and_listening(0, 0);
+    let (p, d) = (h.played().len(), h.drained());
+    h.say_line(15);
+    h.wait_spoken_and_listening(p, d);
+
+    let (p, d) = (h.played().len(), h.drained());
+    h.say_line(14);
+    h.wait_spoken_and_listening(p, d);
+    wait_until("cancelada (CA-37.7)", || {
+        h.task_status() == vec![TaskStatus::Cancelled]
+    });
+    assert!(brain.queries().is_empty(), "comandos locales, sin LLM");
+}
+
+#[test]
+fn heavy_turn_without_task_manager_goes_to_the_conversational_brain() {
+    let brain = FakeBrain::new("Respuesta.");
+    let h = harness("task-off", Some(brain.clone()), fast());
+    h.say_line(13);
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(brain.queries().len(), 1);
+    assert!(h.orchestrator.tasks().is_none());
+}
+
+#[test]
+fn queued_speech_reports_position_and_is_spoken_in_order() {
+    let brain = FakeBrain::new("x");
+    let h = harness("queue", Some(brain), fast());
+    let speaker = h.orchestrator.speaker();
+    let a = speaker.enqueue("primero", SpeechPriority::Notice);
+    let b = speaker.enqueue("segundo", SpeechPriority::Notice);
+    assert!(a >= 1 && b == a + 1, "posiciones {a} {b}");
+    wait_until("dos locuciones", || h.drained() >= 2);
+    h.wait_state(JarvisState::Listening);
+}
+
+#[test]
+fn local_command_recognizes_task_commands() {
+    assert_eq!(
+        local_command("cancela todas las tareas"),
+        Some(LocalCommand::CancelTask {
+            spoken_target: None
+        })
+    );
+    assert_eq!(
+        local_command("cancela la tarea de los correos"),
+        Some(LocalCommand::CancelTask {
+            spoken_target: Some("correos".into())
+        })
+    );
+    assert_eq!(
+        local_command("¿qué tareas tengo?"),
+        Some(LocalCommand::ListTasks)
     );
 }

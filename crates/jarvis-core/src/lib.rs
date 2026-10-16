@@ -21,6 +21,7 @@ pub use config::{
 pub use fullscreen::{
     is_effectively_fullscreen, FullscreenBehavior, OutputGeometry, Rect, WindowSnapshot,
 };
+pub use paths::{state_dir, tasks_dir};
 pub use shared::SharedCore;
 pub use state::{JarvisState, StateMachine, StateTransition, TransitionError};
 

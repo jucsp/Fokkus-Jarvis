@@ -30,7 +30,9 @@ pub mod io;
 pub mod models;
 pub mod orchestrator;
 pub mod playback;
+pub mod speech_queue;
 pub mod stt;
+pub mod tasks;
 pub mod tts;
 pub mod vad;
 pub mod voices;
@@ -62,7 +64,14 @@ pub use orchestrator::{
     VoiceOrchestrator, VoiceSpeaker, VoiceStatsSnapshot,
 };
 pub use playback::AudioPlayback;
+pub use speech_queue::{
+    Delivery, DeliveryGate, SpeechPriority, SpeechQueue, SPEECH_QUEUE_CAPACITY,
+};
 pub use stt::{SttError, Transcriber, WhisperEngine};
+pub use tasks::{
+    classify_workload, split_task_output, summarize, BrainFactory, TaskConfig, TaskId, TaskManager,
+    TaskOrigin, TaskRecord, TaskStatus, Workload,
+};
 pub use tts::{EdgeTtsEngine, FillerCategory, PcmAudio, PhraseSplitter, TtsBackend, TtsError};
 pub use vad::{EndpointConfig, Endpointer, VadDetector};
 pub use voices::{resolve_voice, Gender, VoiceInfo, DEFAULT_VOICE_ID, DEFAULT_VOICE_LANG, VOICES};

@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.2.16
+Version:        0.2.17
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,6 +23,11 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.17-1
+- HU-37: Tareas pesadas asíncronas en segundo plano sin bloqueo conversacional.
+- Acuse vocal inmediato (< 1s) y entrega secuencial en SpeechQueue con DeliveryGate.
+- Inmunidad a barge-in para workers en segundo plano y métodos IPC de despacho y consulta.
+
 * Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.16-1
 - HU-35: Detección universal de pantalla completa y modo ventana sin bordes (Auto-Dim al 25% / Auto-Hide).
 - Integración con KWin Scripting sobre D-Bus de sesión (io.fokkus.Jarvis.WindowWatch).

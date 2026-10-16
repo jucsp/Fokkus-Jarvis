@@ -44,10 +44,11 @@ use crate::paths;
 #[cfg(unix)]
 use crate::protocol::MAX_MESSAGE_BYTES;
 use crate::protocol::{
-    error_codes, methods, task_status, Ack, DispatchSwarmParams, HelloParams, HelloResult,
-    HelloSession, Incoming, JsonRpcError, NotifySwarmCompletedParams, NotifySwarmProgressParams,
-    NotifyTriageAlertParams, PingResult, Response, SetMutedParams, SetMutedResult, SpeakParams,
-    SpeakResult, StateResult, SwarmStatusResult, SwarmTask, TriageAlert, Utterance,
+    error_codes, methods, speech_priority, task_status, Ack, CancelTaskResult, DispatchSwarmParams,
+    DispatchTaskParams, DispatchTaskResult, HelloParams, HelloResult, HelloSession, Incoming,
+    JsonRpcError, NotifySwarmCompletedParams, NotifySwarmProgressParams, NotifyTriageAlertParams,
+    PingResult, Response, SetMutedParams, SetMutedResult, SpeakParams, SpeakResult, StateResult,
+    SwarmStatusResult, SwarmTask, TaskIdParams, TasksResult, TriageAlert, Utterance,
     PROTOCOL_VERSION, SERVER_VERSION,
 };
 
@@ -81,6 +82,27 @@ pub enum PeerPolicy {
 pub trait SpeechSink: Send + Sync {
     /// Notifica una locución aceptada por el servidor.
     fn speak(&self, utterance: &Utterance);
+
+    /// Encola la locución en la cola hablada priorizada (HU-37) con una de
+    /// las prioridades de [`speech_priority`]. Devuelve la posición
+    /// (1 = la siguiente; 0 = rechazada por cola llena) o `None` si el
+    /// sumidero no tiene cola.
+    fn enqueue(&self, _utterance: &Utterance, _priority: &str) -> Option<u32> {
+        None
+    }
+}
+
+/// Puerto de tareas pesadas (HU-37): lo implementa `jarvis-app` sobre el
+/// `TaskManager` de `jarvis-audio`, sin que este crate dependa de él.
+pub trait TaskPort: Send + Sync {
+    /// Despacha una tarea y devuelve su id estable.
+    fn dispatch(&self, title: String, prompt: String) -> u64;
+    /// Registros de todas las tareas, ordenados por id.
+    fn list(&self) -> Vec<Value>;
+    /// Registro de una tarea, si existe.
+    fn get(&self, id: u64) -> Option<Value>;
+    /// Cancela una tarea en cola o en curso; `false` si no existe o ya terminó.
+    fn cancel(&self, id: u64) -> bool;
 }
 
 /// Estado compartido que atiende las llamadas del protocolo.
@@ -95,6 +117,7 @@ pub struct ServerState {
     alerts: Mutex<Vec<TriageAlert>>,
     utterances: Mutex<Vec<Utterance>>,
     sink: Mutex<Option<Arc<dyn SpeechSink>>>,
+    tasks: Mutex<Option<Arc<dyn TaskPort>>>,
     hello: Mutex<Option<HelloSession>>,
 }
 
@@ -114,6 +137,7 @@ impl ServerState {
             alerts: Mutex::new(Vec::new()),
             utterances: Mutex::new(Vec::new()),
             sink: Mutex::new(None),
+            tasks: Mutex::new(None),
             hello: Mutex::new(None),
         }
     }
@@ -127,6 +151,18 @@ impl ServerState {
     pub fn with_speech_sink(self, sink: Arc<dyn SpeechSink>) -> Self {
         *lock(&self.sink) = Some(sink);
         self
+    }
+
+    /// Registra el puerto de tareas pesadas (HU-37).
+    pub fn with_task_port(self, tasks: Arc<dyn TaskPort>) -> Self {
+        self.set_task_port(tasks);
+        self
+    }
+
+    /// Instala el puerto de tareas con el servidor ya en marcha (el
+    /// orquestador de voz arranca después del IPC).
+    pub fn set_task_port(&self, tasks: Arc<dyn TaskPort>) {
+        *lock(&self.tasks) = Some(tasks);
     }
 
     /// Núcleo compartido (el mismo que ven la esfera y el orquestador).
@@ -299,7 +335,46 @@ impl ServerState {
                 "el campo \"text\" no puede estar vacío",
             ));
         }
+        let priority = params
+            .priority
+            .as_deref()
+            .unwrap_or(speech_priority::NOTICE);
+        if !speech_priority::ALL.contains(&priority) {
+            return Err(JsonRpcError::new(
+                error_codes::INVALID_PARAMS,
+                format!(
+                    "prioridad desconocida: {priority} (válidas: {})",
+                    speech_priority::ALL.join(", ")
+                ),
+            ));
+        }
         let muted = self.is_muted();
+        let utterance = Utterance {
+            text: params.text.clone(),
+            category: params.category.clone(),
+        };
+        // Se clona el Arc para no retener el lock durante la locución.
+        let sink = lock(&self.sink).as_ref().map(Arc::clone);
+
+        // Con `queue: true` se encola aunque esté silenciado: la cola retiene
+        // la locución hasta que el *gate* lo permita (CA-37.8/37.9).
+        if params.queue == Some(true) {
+            if let Some(position) = sink.as_ref().and_then(|s| s.enqueue(&utterance, priority)) {
+                if position > 0 {
+                    lock(&self.utterances).push(utterance);
+                }
+                return Ok(SpeakResult {
+                    spoken: false,
+                    muted,
+                    text: params.text,
+                    category: params.category,
+                    reason: (position == 0).then(|| "queue_full".to_string()),
+                    queued: Some(position > 0),
+                    position: (position > 0).then_some(position),
+                });
+            }
+        }
+
         if muted {
             return Ok(SpeakResult {
                 spoken: false,
@@ -307,15 +382,11 @@ impl ServerState {
                 text: params.text,
                 category: params.category,
                 reason: Some("muted".to_string()),
+                queued: None,
+                position: None,
             });
         }
-        let utterance = Utterance {
-            text: params.text.clone(),
-            category: params.category.clone(),
-        };
         lock(&self.utterances).push(utterance.clone());
-        // Se clona el Arc para no retener el lock durante la locución.
-        let sink = lock(&self.sink).as_ref().map(Arc::clone);
         if let Some(sink) = sink {
             sink.speak(&utterance);
         }
@@ -325,6 +396,50 @@ impl ServerState {
             text: params.text,
             category: params.category,
             reason: None,
+            queued: None,
+            position: None,
+        })
+    }
+
+    fn task_port(&self) -> Result<Arc<dyn TaskPort>, JsonRpcError> {
+        lock(&self.tasks).as_ref().map(Arc::clone).ok_or_else(|| {
+            JsonRpcError::new(
+                error_codes::INTERNAL_ERROR,
+                "las tareas de fondo no están activas (falta cerebro o configuración)",
+            )
+        })
+    }
+
+    fn dispatch_task(
+        &self,
+        params: DispatchTaskParams,
+    ) -> Result<DispatchTaskResult, JsonRpcError> {
+        if params.prompt.trim().is_empty() {
+            return Err(JsonRpcError::new(
+                error_codes::INVALID_PARAMS,
+                "el campo \"prompt\" no puede estar vacío",
+            ));
+        }
+        let port = self.task_port()?;
+        let id = port.dispatch(params.title.trim().to_string(), params.prompt);
+        Ok(DispatchTaskResult {
+            id,
+            status: "queued".to_string(),
+        })
+    }
+
+    fn get_task(&self, id: u64) -> Result<Value, JsonRpcError> {
+        self.task_port()?.get(id).ok_or_else(|| unknown_task(id))
+    }
+
+    fn cancel_task(&self, id: u64) -> Result<CancelTaskResult, JsonRpcError> {
+        let port = self.task_port()?;
+        if port.get(id).is_none() {
+            return Err(unknown_task(id));
+        }
+        Ok(CancelTaskResult {
+            id,
+            cancelled: port.cancel(id),
         })
     }
 
@@ -437,12 +552,34 @@ impl ServerState {
                 let params: NotifyTriageAlertParams = params_as(method, params)?;
                 to_value(self.record_alert(params)?)
             }
+            methods::DISPATCH_TASK => {
+                let params: DispatchTaskParams = params_as(method, params)?;
+                to_value(self.dispatch_task(params)?)
+            }
+            methods::GET_TASKS => to_value(TasksResult {
+                tasks: self.task_port()?.list(),
+            }),
+            methods::GET_TASK => {
+                let params: TaskIdParams = params_as(method, params)?;
+                self.get_task(params.id)
+            }
+            methods::CANCEL_TASK => {
+                let params: TaskIdParams = params_as(method, params)?;
+                to_value(self.cancel_task(params.id)?)
+            }
             other => Err(JsonRpcError::new(
                 error_codes::METHOD_NOT_FOUND,
                 format!("método desconocido: {other}"),
             )),
         }
     }
+}
+
+fn unknown_task(id: u64) -> JsonRpcError {
+    JsonRpcError::new(
+        error_codes::INVALID_PARAMS,
+        format!("no existe la tarea {id}"),
+    )
 }
 
 impl fmt::Debug for ServerState {
@@ -1125,6 +1262,166 @@ mod tests {
         assert_eq!(result.category.as_deref(), Some("dev"));
         assert_eq!(state.utterances().len(), 1);
         assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Sumidero con cola: devuelve posiciones crecientes.
+    struct QueueSink {
+        queued: Mutex<Vec<(String, String)>>,
+    }
+
+    impl SpeechSink for QueueSink {
+        fn speak(&self, _utterance: &Utterance) {}
+
+        fn enqueue(&self, utterance: &Utterance, priority: &str) -> Option<u32> {
+            let mut queued = lock(&self.queued);
+            queued.push((utterance.text.clone(), priority.to_string()));
+            Some(queued.len() as u32)
+        }
+    }
+
+    /// Puerto de tareas en memoria: `dispatch` deja la tarea `running` y
+    /// `finish` la marca `done`.
+    #[derive(Default)]
+    struct MemoryTasks {
+        tasks: Mutex<BTreeMap<u64, Value>>,
+    }
+
+    impl MemoryTasks {
+        fn finish(&self, id: u64) {
+            if let Some(task) = lock(&self.tasks).get_mut(&id) {
+                task["status"] = json!("done");
+            }
+        }
+    }
+
+    impl TaskPort for MemoryTasks {
+        fn dispatch(&self, title: String, prompt: String) -> u64 {
+            let mut tasks = lock(&self.tasks);
+            let id = tasks.len() as u64 + 1;
+            tasks.insert(
+                id,
+                json!({"id": id, "title": title, "prompt": prompt, "status": "running"}),
+            );
+            id
+        }
+
+        fn list(&self) -> Vec<Value> {
+            lock(&self.tasks).values().cloned().collect()
+        }
+
+        fn get(&self, id: u64) -> Option<Value> {
+            lock(&self.tasks).get(&id).cloned()
+        }
+
+        fn cancel(&self, id: u64) -> bool {
+            match lock(&self.tasks).get_mut(&id) {
+                Some(task) if task["status"] == "running" => {
+                    task["status"] = json!("cancelled");
+                    true
+                }
+                _ => false,
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_get_and_cancel_tasks() {
+        let port = Arc::new(MemoryTasks::default());
+        let state = ServerState::with_default_config().with_task_port(port.clone());
+        let line = concat!(
+            r#"{"jsonrpc":"2.0","method":"jarvis.dispatchTask","#,
+            r#""params":{"title":"tus correos","prompt":"revisa mis correos"},"id":1}"#,
+        );
+        let dispatched: DispatchTaskResult =
+            serde_json::from_value(result_of(&call(&state, line))).expect("dispatch");
+        assert_eq!(dispatched.id, 1);
+        assert_eq!(dispatched.status, "queued");
+
+        let list = r#"{"jsonrpc":"2.0","method":"jarvis.getTasks","id":2}"#;
+        let tasks: TasksResult = serde_json::from_value(result_of(&call(&state, list))).unwrap();
+        assert_eq!(tasks.tasks.len(), 1);
+        assert_eq!(tasks.tasks[0]["status"], "running");
+
+        port.finish(1);
+        let get = r#"{"jsonrpc":"2.0","method":"jarvis.getTask","params":{"id":1},"id":3}"#;
+        assert_eq!(result_of(&call(&state, get))["status"], "done");
+
+        // Cancelar una tarea terminada: existe pero ya no se cancela.
+        let cancel = r#"{"jsonrpc":"2.0","method":"jarvis.cancelTask","params":{"id":1},"id":4}"#;
+        let result: CancelTaskResult =
+            serde_json::from_value(result_of(&call(&state, cancel))).unwrap();
+        assert!(!result.cancelled);
+
+        let missing = r#"{"jsonrpc":"2.0","method":"jarvis.cancelTask","params":{"id":99},"id":5}"#;
+        assert_eq!(
+            call(&state, missing).error.expect("error").code,
+            error_codes::INVALID_PARAMS
+        );
+        let missing = r#"{"jsonrpc":"2.0","method":"jarvis.getTask","params":{"id":99},"id":6}"#;
+        assert_eq!(
+            call(&state, missing).error.expect("error").code,
+            error_codes::INVALID_PARAMS
+        );
+    }
+
+    #[test]
+    fn dispatch_task_validates_prompt_and_requires_a_port() {
+        let state = ServerState::with_default_config();
+        let line = concat!(
+            r#"{"jsonrpc":"2.0","method":"jarvis.dispatchTask","#,
+            r#""params":{"title":"x","prompt":"hola"},"id":1}"#,
+        );
+        assert_eq!(
+            call(&state, line).error.expect("sin puerto").code,
+            error_codes::INTERNAL_ERROR
+        );
+        let state = state.with_task_port(Arc::new(MemoryTasks::default()));
+        let empty = concat!(
+            r#"{"jsonrpc":"2.0","method":"jarvis.dispatchTask","#,
+            r#""params":{"title":"x","prompt":"  "},"id":2}"#,
+        );
+        assert_eq!(
+            call(&state, empty).error.expect("prompt vacío").code,
+            error_codes::INVALID_PARAMS
+        );
+    }
+
+    #[test]
+    fn speak_with_queue_returns_position_even_while_muted() {
+        let sink = Arc::new(QueueSink {
+            queued: Mutex::new(Vec::new()),
+        });
+        let state = ServerState::with_default_config().with_speech_sink(sink.clone());
+        state.set_muted(true).expect("mute");
+        let line = concat!(
+            r#"{"jsonrpc":"2.0","method":"jarvis.speak","#,
+            r#""params":{"text":"build listo","queue":true,"priority":"task_result"},"id":1}"#,
+        );
+        let result: SpeakResult = serde_json::from_value(result_of(&call(&state, line))).unwrap();
+        assert_eq!(result.queued, Some(true));
+        assert_eq!(result.position, Some(1));
+        assert!(!result.spoken);
+        assert_eq!(
+            lock(&sink.queued).clone(),
+            vec![("build listo".to_string(), "task_result".to_string())]
+        );
+
+        let bad = concat!(
+            r#"{"jsonrpc":"2.0","method":"jarvis.speak","#,
+            r#""params":{"text":"x","queue":true,"priority":"urgente"},"id":2}"#,
+        );
+        assert_eq!(
+            call(&state, bad).error.expect("prioridad inválida").code,
+            error_codes::INVALID_PARAMS
+        );
+    }
+
+    #[test]
+    fn speak_without_queue_keeps_legacy_fields_absent() {
+        let state = ServerState::with_default_config();
+        let line = r#"{"jsonrpc":"2.0","method":"jarvis.speak","params":{"text":"hola"},"id":1}"#;
+        let value = result_of(&call(&state, line));
+        assert!(value.get("queued").is_none() && value.get("position").is_none());
     }
 
     #[test]

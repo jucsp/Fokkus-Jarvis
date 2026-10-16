@@ -487,6 +487,12 @@ mod tests {
         Box::new(NullWatcher::new(format!("{behavior:?}")))
     }
 
+    /// Fábrica sin contador: los tests que no miden arranques no deben
+    /// tocar `STARTED`, porque corren en paralelo con el que sí lo mide.
+    fn null_factory(_pid: u32, behavior: FullscreenBehavior) -> Box<dyn WindowWatcher> {
+        Box::new(NullWatcher::new(format!("{behavior:?}")))
+    }
+
     #[test]
     fn monitor_restarts_the_watcher_only_when_toggling_ignore() {
         let start = STARTED.load(Ordering::SeqCst);
@@ -519,8 +525,7 @@ mod tests {
     fn monitor_drains_window_events() {
         let (tx, rx) = crossbeam_channel::unbounded();
         let t0 = Instant::now();
-        let mut m =
-            FullscreenMonitor::start(1, settings(FullscreenBehavior::Hide), counting_factory);
+        let mut m = FullscreenMonitor::start(1, settings(FullscreenBehavior::Hide), null_factory);
         m.events = rx;
         tx.send(window("mpv", true, "DP-1", false)).unwrap();
         let s = settings(FullscreenBehavior::Hide);

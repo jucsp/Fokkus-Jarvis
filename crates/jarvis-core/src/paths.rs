@@ -33,6 +33,33 @@ pub fn config_dir() -> PathBuf {
     std::env::temp_dir().join(APP_DIR_NAME)
 }
 
+/// Devuelve el directorio de estado (datos que no son configuración):
+///
+/// 1. `$XDG_STATE_HOME/fokkus-jarvis` si `XDG_STATE_HOME` está definido;
+/// 2. `$HOME/.local/state/fokkus-jarvis` en caso contrario (Linux/macOS);
+/// 3. `std::env::temp_dir()/fokkus-jarvis` como último recurso.
+pub fn state_dir() -> PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join(APP_DIR_NAME);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join(APP_DIR_NAME);
+        }
+    }
+    std::env::temp_dir().join(APP_DIR_NAME)
+}
+
+/// Directorio donde se guardan los resultados de las tareas pesadas (HU-37).
+pub fn tasks_dir() -> PathBuf {
+    state_dir().join("tasks")
+}
+
 /// Ruta del archivo de configuración TOML.
 pub fn config_file() -> PathBuf {
     config_dir().join(CONFIG_FILE_NAME)
@@ -67,5 +94,33 @@ mod tests {
         let lock = lock_file();
         assert_eq!(lock.parent().unwrap(), dir);
         assert_eq!(lock.file_name().unwrap(), LOCK_FILE_NAME);
+    }
+
+    #[test]
+    fn state_dir_is_absolute_and_ends_with_app_name() {
+        let dir = state_dir();
+        assert!(dir.is_absolute(), "la ruta debe ser absoluta: {dir:?}");
+        assert_eq!(dir.file_name().unwrap(), APP_DIR_NAME);
+    }
+
+    #[test]
+    fn tasks_dir_lives_inside_state_dir() {
+        let dir = state_dir();
+        let tasks = tasks_dir();
+        assert_eq!(tasks.parent().unwrap(), dir);
+        assert_eq!(tasks.file_name().unwrap(), "tasks");
+    }
+
+    #[test]
+    fn config_and_state_are_different_roots_by_default() {
+        // Solo es determinista si las variables XDG no están definidas: en ese
+        // caso la configuración vive en ~/.config y el estado en ~/.local/state.
+        if std::env::var_os("XDG_CONFIG_HOME").is_none()
+            && std::env::var_os("XDG_STATE_HOME").is_none()
+        {
+            let config = config_dir();
+            let state = state_dir();
+            assert!(config != state, "config {config:?} vs state {state:?}");
+        }
     }
 }

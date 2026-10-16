@@ -41,14 +41,16 @@ pub use paths::{
     SOCKET_FILE_NAME,
 };
 pub use protocol::{
-    error_codes, methods, task_status, Ack, DispatchSwarmParams, HelloParams, HelloResult,
-    HelloSession, Id, Incoming, JsonRpcError, Notification, NotifySwarmCompletedParams,
-    NotifySwarmProgressParams, NotifyTriageAlertParams, PingResult, Request, Response,
-    SetMutedParams, SetMutedResult, SpeakParams, SpeakResult, StateResult, SwarmStatusResult,
-    SwarmTask, TriageAlert, Utterance, JSONRPC_VERSION, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
-    SERVER_VERSION,
+    error_codes, methods, speech_priority, task_status, Ack, CancelTaskResult, DispatchSwarmParams,
+    DispatchTaskParams, DispatchTaskResult, HelloParams, HelloResult, HelloSession, Id, Incoming,
+    JsonRpcError, Notification, NotifySwarmCompletedParams, NotifySwarmProgressParams,
+    NotifyTriageAlertParams, PingResult, Request, Response, SetMutedParams, SetMutedResult,
+    SpeakParams, SpeakResult, StateResult, SwarmStatusResult, SwarmTask, TaskIdParams, TasksResult,
+    TriageAlert, Utterance, JSONRPC_VERSION, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, SERVER_VERSION,
 };
-pub use server::{IpcError, IpcServer, PeerPolicy, ServerState, SpeechSink, MAX_CONNECTIONS};
+pub use server::{
+    IpcError, IpcServer, PeerPolicy, ServerState, SpeechSink, TaskPort, MAX_CONNECTIONS,
+};
 
 pub use jarvis_core::{JarvisConfig, JarvisCore, JarvisState};
 

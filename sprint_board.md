@@ -1,11 +1,44 @@
 # Sprint Board — Fokkus-Jarvis
 
-**Épica 6:** Experiencia Visual Adaptativa y Personalización de Interfaz
-**Sprint:** HU-35 (detección universal de pantalla completa y auto-dim / auto-hide)
+**Épica 7:** Agente Visual Multiplataforma y Automatización Generalista
+**Sprint:** HU-37 (tareas pesadas asíncronas con notificación secuencial)
 **Actualizado:** 2026-10-16 · **PM/QA:** Claude · **PO:** Antigravity
-**Contratos:** [HU-35](docs/specs/sdd-contracts/sdd-hu35-deteccion-pantalla-completa.md) · [HU-34](docs/specs/sdd-contracts/sdd-hu34-opacidad-transparencia-esfera.md) · [HU-33](docs/specs/sdd-contracts/sdd-hu33-tamano-dinamico-burbuja.md)
+**Contratos:** [HU-37](docs/specs/sdd-contracts/sdd-hu37-tareas-pesadas-asincronas-ipc.md) · [HU-36](docs/specs/sdd-contracts/sdd-hu36-burbujas-chat-efimeras-hud.md) · [HU-35](docs/specs/sdd-contracts/sdd-hu35-deteccion-pantalla-completa.md)
 
 Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere prueba manual
+
+---
+
+## HU-37 — Tareas pesadas en segundo plano con notificación vocal secuencial vía IPC
+
+### jarvis-core
+- [x] 37.1 `paths::state_dir()` (`$XDG_STATE_HOME/fokkus-jarvis`, default `~/.local/state/fokkus-jarvis`) y subdirectorio `tasks/` [Responsable: DeepSeek]
+- [x] 37.2 Campos en `JarvisConfig`: `tasks_max_parallel` (1..=4, default 2), `tasks_timeout_secs` (60..=3600, default 900), `tasks_quiet_gap_ms` (500..=5000, default 1500) [Responsable: DeepSeek]
+- [x] 37.3 Tests de config y paths para state_dir [Responsable: DeepSeek]
+
+### jarvis-audio
+- [x] 37.4 `classify_workload(query: &str) -> Workload` (heurística pesada vs conversacional) [Responsable: DeepSeek]
+- [x] 37.5 `SpeechPriority`, `Delivery`, `DeliveryGate` y `SpeechQueue` con `BinaryHeap` (prioridad > FIFO, tope 32) [Responsable: DeepSeek]
+- [x] 37.6 `TaskRecord`, `TaskStatus`, `TaskOrigin`, `BrainFactory` trait y `TaskManager` con pool desacoplado [Responsable: DeepSeek]
+- [x] 37.7 Integración en `BrainLoop`: acuse rápido (< 1s) para tareas pesadas, despacho a worker independiente sin bloqueo, tick de 250ms para drenar `SpeechQueue` con `DeliveryGate` [Responsable: DeepSeek · cierre: Claude]
+- [x] 37.8 Comandos de voz locales: cancelación ("cancela la tarea de los correos", "cancela todas las tareas"), estado y pendientes [Responsable: DeepSeek · cierre: Claude]
+- [x] 37.9 Tests unitarios de `SpeechQueue`, `classify_workload` y `TaskManager` [Responsable: DeepSeek]
+
+### jarvis-ipc
+- [x] 37.10 Métodos JSON-RPC: `jarvis.dispatchTask`, `jarvis.getTasks`, `jarvis.getTask`, `jarvis.cancelTask` [Responsable: Claude]
+- [ ] 37.10b Notificación servidor→cliente `jarvis.taskUpdated` (requiere canal de push por conexión en `IpcServer`) [Responsable: pendiente]
+- [x] 37.11 Soporte de cola en `jarvis.speak`: params `queue`, `priority` y respuesta `queued`, `position` [Responsable: Claude]
+- [x] 37.12 Implementación del trait `TaskPort` sobre `ServerState` [Responsable: Claude]
+
+### jarvis-app
+- [x] 37.13 Implementación de `BrainFactory` en `jarvis-app` para generar instancias limpias e independientes de CLI/Claude [Responsable: Claude]
+- [x] 37.14 Cableado de `TaskManager` en `main.rs` y pasarela hacia `BrainLoop` y servidor IPC [Responsable: Claude]
+- [x] 37.15 Tests de integración completos y suite de QA `cargo test --workspace` [Responsable: Claude]
+- [ ] 37.16 🧪 Prueba manual: "Jarvis, revisa mis correos de hoy y dime si hay algo urgente" con `agy`/`claude` real, conversar mientras corre y verificar entrega + archivo en `~/.local/state/fokkus-jarvis/tasks/` [Responsable: PO]
+- [ ] 37.17 Timeout por tarea en modo API (`ClaudeClient` no tiene timeout total; hoy solo lo aplica `CliBrain`) y política "máx. 60 s de espera del gate → siguiente Idle" (CA-37.5) [Responsable: pendiente]
+
+**QA 2026-10-16 (Claude):** `make test` → 474 passed / 0 failed (audio 241, ipc 67, core 61, app 44, shell 42, render 13, no_alloc 6) · `make lint` (cargo-deny + clippy `-D warnings`) OK · `make fmt-check` OK.
+
 
 ---
 

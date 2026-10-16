@@ -35,14 +35,17 @@ use std::time::Duration;
 use jarvis_audio::io::{AudioBackend, CpalBackend, InputPort, OutputPort, PortShared};
 use jarvis_audio::{
     ActivationDetector, AudioEngine, AudioPlayback, ConversationCoordinator, DspThreadConfig,
-    EdgeTtsEngine, EngineConfig, EngineControl, ModelManager, ModelStatus, TtsBackend, VoiceConfig,
-    VoiceDeps, VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
+    EdgeTtsEngine, EngineConfig, EngineControl, ModelManager, ModelStatus, SpeechPriority,
+    TaskConfig, TaskManager, TaskOrigin, TaskStatus, TtsBackend, VoiceConfig, VoiceDeps,
+    VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
 };
 use jarvis_core::single_instance::{self, InstanceError};
 use jarvis_core::{
     sphere_size_for_pct, FullscreenBehavior, JarvisConfig, JarvisCore, Opacity, SharedCore,
 };
-use jarvis_ipc::{IpcError, IpcServer, ServerState, SpeechSink, Utterance};
+use jarvis_ipc::{
+    speech_priority, IpcError, IpcServer, ServerState, SpeechSink, TaskPort, Utterance,
+};
 use jarvis_shell::{
     HeadlessSurface, OverlayOptions, OverlaySurface, ShellCommand, SurfaceError, SurfaceSize,
 };
@@ -115,6 +118,76 @@ impl SpeechSink for VoiceSpeechSink {
             Some(speaker) => speaker.say(utterance.text.clone()),
             None => eprintln!("[ipc] locución descartada: el motor de voz aún no arranca."),
         }
+    }
+
+    fn enqueue(&self, utterance: &Utterance, priority: &str) -> Option<u32> {
+        let speaker = self
+            .speaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()?;
+        Some(speaker.enqueue(utterance.text.clone(), parse_priority(priority)))
+    }
+}
+
+/// Prioridad IPC (`notice`, `task_result`…) → prioridad de la cola hablada.
+fn parse_priority(priority: &str) -> SpeechPriority {
+    match priority {
+        speech_priority::CRITICAL => SpeechPriority::Critical,
+        speech_priority::REPLY => SpeechPriority::Reply,
+        speech_priority::TASK_RESULT => SpeechPriority::TaskResult,
+        _ => SpeechPriority::Notice,
+    }
+}
+
+/// Puerto IPC de tareas (`jarvis.dispatchTask`…) sobre el gestor de tareas
+/// del orquestador (HU-37).
+struct VoiceTaskPort(TaskManager);
+
+impl TaskPort for VoiceTaskPort {
+    fn dispatch(&self, title: String, prompt: String) -> u64 {
+        let title = if title.is_empty() {
+            jarvis_audio::tasks::task_title(&prompt)
+        } else {
+            title
+        };
+        self.0.submit(
+            title,
+            jarvis_audio::tasks::task_prompt(&prompt),
+            TaskOrigin::Ipc,
+        )
+    }
+
+    fn list(&self) -> Vec<serde_json::Value> {
+        self.0
+            .list()
+            .iter()
+            .filter_map(|record| serde_json::to_value(record).ok())
+            .collect()
+    }
+
+    fn get(&self, id: u64) -> Option<serde_json::Value> {
+        self.0
+            .get(id)
+            .and_then(|record| serde_json::to_value(record).ok())
+    }
+
+    fn cancel(&self, id: u64) -> bool {
+        let active = self
+            .0
+            .get(id)
+            .is_some_and(|r| matches!(r.status, TaskStatus::Queued | TaskStatus::Running));
+        active && self.0.cancel(id)
+    }
+}
+
+/// Configuración del gestor de tareas a partir de `config.toml` (HU-37).
+fn task_config(config: &JarvisConfig) -> TaskConfig {
+    TaskConfig {
+        max_parallel: usize::from(config.tasks_max_parallel()),
+        timeout: Duration::from_secs(u64::from(config.tasks_timeout_secs())),
+        quiet_gap: Duration::from_millis(u64::from(config.tasks_quiet_gap_ms())),
+        ..TaskConfig::default()
     }
 }
 
@@ -199,6 +272,7 @@ fn run_set_api_key() -> ExitCode {
 fn apply_config(
     core: &SharedCore,
     orchestrator: Option<&VoiceOrchestrator>,
+    task_factory: &settings::TaskBrainFactory,
 ) -> Option<JarvisConfig> {
     let config = match JarvisConfig::load() {
         Ok(config) => config,
@@ -212,6 +286,9 @@ fn apply_config(
         orchestrator.set_continuous_listening(config.continuous_listening);
         orchestrator.set_voice(&config.voice_id);
         orchestrator.set_brain(settings::build_brain(&config).ok());
+        orchestrator.set_gaming_mode(config.gaming_mode);
+        // Las tareas nuevas usan el cerebro nuevo; las en curso no cambian.
+        task_factory.update(&config);
         if !orchestrator.has_brain() {
             orchestrator.speaker().say(
                 "No pude activar el cerebro con esa configuración. Solo puedo darte la hora o silenciarme.",
@@ -363,6 +440,9 @@ fn run() -> ExitCode {
         Err(notice) => (None, Some(notice)),
     };
 
+    // Fábrica de cerebros aislados para las tareas de fondo (HU-37).
+    let task_factory = Arc::new(settings::TaskBrainFactory::new(&config));
+
     // Orquestador de voz (HU-9).
     let mut orchestrator = engine.as_ref().and_then(|engine| {
         let deps = VoiceDeps {
@@ -376,16 +456,23 @@ fn run() -> ExitCode {
             activation: Arc::new(
                 ActivationDetector::new().with_continuous(config.continuous_listening),
             ),
+            factory: Some(Arc::clone(&task_factory) as Arc<dyn jarvis_audio::BrainFactory>),
         };
+        let gaming_mode = config.gaming_mode;
         let config = VoiceConfig {
             startup_notice: brain_notice.map(str::to_string),
             clock: Arc::new(runtime::local_time),
             barge_in_enabled: config.barge_in_enabled,
+            tasks: Some(task_config(&config)),
             ..VoiceConfig::default()
         };
         match VoiceOrchestrator::start(deps, config) {
             Ok(orchestrator) => {
                 speech_sink.connect(orchestrator.speaker());
+                orchestrator.set_gaming_mode(gaming_mode);
+                if let Some(tasks) = orchestrator.tasks() {
+                    server_state.set_task_port(Arc::new(VoiceTaskPort(tasks)));
+                }
                 Some(orchestrator)
             }
             Err(e) => {
@@ -453,7 +540,8 @@ fn run() -> ExitCode {
             quick_panel.borrow_mut().take();
             match outcome {
                 settings::PanelOutcome::Saved => {
-                    if let Some(config) = apply_config(&core, orchestrator.as_ref()) {
+                    if let Some(config) = apply_config(&core, orchestrator.as_ref(), &task_factory)
+                    {
                         persisted_look.set(SphereLook::from_config(&config));
                         sphere_look.set(persisted_look.get());
                     }
@@ -495,13 +583,15 @@ fn run() -> ExitCode {
             match outcome {
                 settings::FormOutcome::Saved => {
                     // El TOML es la fuente de verdad: se relee y se aplica.
-                    if let Some(config) = apply_config(&core, orchestrator.as_ref()) {
+                    if let Some(config) = apply_config(&core, orchestrator.as_ref(), &task_factory)
+                    {
                         persisted_look.set(SphereLook::from_config(&config));
                     }
                 }
                 settings::FormOutcome::ResetPosition => {
                     // "Volver a posición inicial" también guarda el resto.
-                    if let Some(config) = apply_config(&core, orchestrator.as_ref()) {
+                    if let Some(config) = apply_config(&core, orchestrator.as_ref(), &task_factory)
+                    {
                         persisted_look.set(SphereLook::from_config(&config));
                     }
                     reset_position.store(true, Ordering::SeqCst);

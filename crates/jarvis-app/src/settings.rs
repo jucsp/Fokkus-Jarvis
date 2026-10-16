@@ -8,11 +8,12 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use jarvis_audio::orchestrator::{NO_API_KEY_NOTICE, NO_CLI_NOTICE};
-use jarvis_audio::{ClaudeClient, CliBrain, TokenStream};
+use jarvis_audio::{BrainError, BrainFactory, ClaudeClient, CliBrain, TokenStream};
 use jarvis_core::{BrainMode, JarvisConfig, SPHERE_OPACITY_RANGE, SPHERE_SCALE_RANGE};
 
 /// Script del formulario (ver `assets/config_form.py`).
@@ -76,6 +77,62 @@ pub fn build_brain(config: &JarvisConfig) -> Result<Brain, &'static str> {
                 Err(NO_API_KEY_NOTICE)
             }
         },
+    }
+}
+
+/// Fábrica de cerebros para las tareas de fondo (HU-37): misma lógica que
+/// [`build_brain`] pero cada llamada crea una instancia **nueva** (historial,
+/// cancelación y timeout propios). `apply_config` actualiza la configuración;
+/// las tareas en curso terminan con el cerebro con que empezaron.
+pub struct TaskBrainFactory {
+    config: RwLock<JarvisConfig>,
+}
+
+impl TaskBrainFactory {
+    pub fn new(config: &JarvisConfig) -> Self {
+        Self {
+            config: RwLock::new(config.clone()),
+        }
+    }
+
+    /// Las tareas nuevas usarán esta configuración.
+    pub fn update(&self, config: &JarvisConfig) {
+        *self.config.write().unwrap_or_else(PoisonError::into_inner) = config.clone();
+    }
+}
+
+impl BrainFactory for TaskBrainFactory {
+    fn spawn(&self, timeout: Duration) -> Result<Brain, BrainError> {
+        let config = self
+            .config
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        build_task_brain(&config, timeout)
+    }
+}
+
+/// Cerebro aislado para una tarea de fondo, sin avisos por consola.
+pub fn build_task_brain(config: &JarvisConfig, timeout: Duration) -> Result<Brain, BrainError> {
+    match config.brain_mode {
+        BrainMode::Cli => {
+            let brain = CliBrain::new(config.effective_cli_command())?.with_timeout(timeout);
+            if !brain.is_available() {
+                return Err(BrainError::Cli(format!(
+                    "no se encontró `{}` en el PATH",
+                    brain.program()
+                )));
+            }
+            Ok(Arc::new(brain))
+        }
+        BrainMode::Api => {
+            let key = jarvis_audio::resolve_api_key(None)?;
+            let mut client = ClaudeClient::with_api_key(key).with_base_url(&config.api_base_url);
+            if !config.api_model.trim().is_empty() {
+                client = client.with_model(config.api_model.trim());
+            }
+            Ok(Arc::new(client))
+        }
     }
 }
 
@@ -532,6 +589,20 @@ mod tests {
     fn cli_mode_with_missing_program_has_no_brain() {
         let config = JarvisConfig::default().with_cli_command("no-existe-jarvis-cli -p");
         assert_eq!(build_brain(&config).err(), Some(NO_CLI_NOTICE));
+    }
+
+    #[test]
+    fn task_factory_builds_independent_brains_and_follows_updates() {
+        let factory = TaskBrainFactory::new(&JarvisConfig::default().with_cli_command("echo"));
+        let a = factory.spawn(Duration::from_secs(5)).expect("cerebro");
+        let b = factory.spawn(Duration::from_secs(5)).expect("cerebro");
+        assert!(!Arc::ptr_eq(&a, &b), "una instancia por tarea");
+
+        factory.update(&JarvisConfig::default().with_cli_command("no-existe-jarvis-cli -p"));
+        assert!(matches!(
+            factory.spawn(Duration::from_secs(5)),
+            Err(BrainError::Cli(_))
+        ));
     }
 
     #[test]

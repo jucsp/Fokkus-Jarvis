@@ -9,8 +9,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::protocol::{
-    HelloResult, Id, JsonRpcError, PingResult, SetMutedResult, SpeakResult, StateResult,
-    SwarmStatusResult, SwarmTask,
+    CancelTaskResult, DispatchTaskResult, HelloResult, Id, JsonRpcError, PingResult,
+    SetMutedResult, SpeakResult, StateResult, SwarmStatusResult, SwarmTask, TasksResult,
 };
 use crate::server::IpcError;
 
@@ -18,9 +18,9 @@ use crate::server::IpcError;
 use crate::paths;
 #[cfg(unix)]
 use crate::protocol::{
-    methods, DispatchSwarmParams, HelloParams, Notification, NotifySwarmCompletedParams,
-    NotifySwarmProgressParams, NotifyTriageAlertParams, Request, Response, SetMutedParams,
-    SpeakParams, PROTOCOL_VERSION,
+    methods, DispatchSwarmParams, DispatchTaskParams, HelloParams, Notification,
+    NotifySwarmCompletedParams, NotifySwarmProgressParams, NotifyTriageAlertParams, Request,
+    Response, SetMutedParams, SpeakParams, TaskIdParams, PROTOCOL_VERSION,
 };
 #[cfg(unix)]
 use serde::de::DeserializeOwned;
@@ -164,9 +164,60 @@ impl IpcClient {
         let params = SpeakParams {
             text: text.to_string(),
             category: category.map(str::to_string),
+            queue: None,
+            priority: None,
         };
         let value = self.request(methods::SPEAK, Some(to_params(&params)?))?;
         decode(methods::SPEAK, value)
+    }
+
+    /// `jarvis.speak` con `queue: true`: encola con la prioridad indicada
+    /// (`notice` si `None`) y devuelve la posición en la cola (HU-37).
+    pub fn speak_queued(
+        &mut self,
+        text: &str,
+        priority: Option<&str>,
+    ) -> Result<SpeakResult, ClientError> {
+        let params = SpeakParams {
+            text: text.to_string(),
+            category: None,
+            queue: Some(true),
+            priority: priority.map(str::to_string),
+        };
+        let value = self.request(methods::SPEAK, Some(to_params(&params)?))?;
+        decode(methods::SPEAK, value)
+    }
+
+    /// `jarvis.dispatchTask` (HU-37).
+    pub fn dispatch_task(
+        &mut self,
+        title: &str,
+        prompt: &str,
+    ) -> Result<DispatchTaskResult, ClientError> {
+        let params = DispatchTaskParams {
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+        };
+        let value = self.request(methods::DISPATCH_TASK, Some(to_params(&params)?))?;
+        decode(methods::DISPATCH_TASK, value)
+    }
+
+    /// `jarvis.getTasks` (HU-37).
+    pub fn get_tasks(&mut self) -> Result<TasksResult, ClientError> {
+        let value = self.request(methods::GET_TASKS, None)?;
+        decode(methods::GET_TASKS, value)
+    }
+
+    /// `jarvis.getTask` (HU-37).
+    pub fn get_task(&mut self, id: u64) -> Result<serde_json::Value, ClientError> {
+        let value = self.request(methods::GET_TASK, Some(to_params(&TaskIdParams { id })?))?;
+        decode(methods::GET_TASK, value)
+    }
+
+    /// `jarvis.cancelTask` (HU-37).
+    pub fn cancel_task(&mut self, id: u64) -> Result<CancelTaskResult, ClientError> {
+        let value = self.request(methods::CANCEL_TASK, Some(to_params(&TaskIdParams { id })?))?;
+        decode(methods::CANCEL_TASK, value)
     }
 
     /// `jarvis.dispatchSwarm`.

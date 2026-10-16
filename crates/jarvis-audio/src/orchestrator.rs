@@ -39,9 +39,8 @@
 //! [`ConnectorSignal::signal`] (el turno nuevo espera el silencio extendido)
 //! y ambos textos se unen en una sola consulta.
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -55,8 +54,13 @@ use crate::dsp::ConnectorSignal;
 use crate::events::VoiceEvent;
 use crate::io::{to_output_pcm, AudioEngine, EngineShared, PlayOutcome, Player};
 use crate::playback::AudioPlayback;
+use crate::speech_queue::{Delivery, DeliveryGate, SpeechPriority};
 use crate::stt::Transcriber;
-use crate::tts::{synth_chime, PcmAudio};
+use crate::tasks::{
+    classify_workload, task_prompt, task_title, BrainFactory, SpeechQueueHandle, TaskConfig,
+    TaskManager, TaskOrigin, Workload,
+};
+use crate::tts::{synth_chime, FillerCategory, PcmAudio};
 
 /// Lo que dice Jarvis cuando no hay cerebro (ni CLI ni API key) y la
 /// consulta lo necesita.
@@ -69,6 +73,9 @@ pub const NO_CLI_NOTICE: &str =
 /// Aviso hablado al arrancar sin API key (una sola vez).
 pub const NO_API_KEY_NOTICE: &str =
     "Hola. Me falta la clave de Anthropic; guárdala con fokkus-jarvis guion guion set api key.";
+
+/// Respuesta a los comandos de tareas cuando el gestor está desactivado.
+pub const NO_TASKS_PHRASE: &str = "No tengo tareas de fondo activadas.";
 
 /// Respuesta cuando se cae la red a mitad de una respuesta (CA-6.4).
 pub const NETWORK_ERROR_PHRASE: &str = "Perdí la conexión. Inténtalo de nuevo en un momento.";
@@ -179,6 +186,8 @@ pub struct VoiceConfig {
     /// empieza mientras Jarvis suena se trata como eco: no pausa, no corta y
     /// no se transcribe.
     pub barge_in_enabled: bool,
+    /// Gestión de tareas pesadas (HU-37). `None` = desactivada.
+    pub tasks: Option<TaskConfig>,
 }
 
 impl Default for VoiceConfig {
@@ -192,6 +201,7 @@ impl Default for VoiceConfig {
             barge_in_window: Duration::from_millis(250),
             vad_threshold: crate::vad::EndpointConfig::default().threshold,
             barge_in_enabled: false,
+            tasks: None,
         }
     }
 }
@@ -246,6 +256,8 @@ pub struct VoiceDeps {
     /// `None` sin API key: solo comandos locales.
     pub brain: Option<Arc<dyn TokenStream + Send + Sync>>,
     pub activation: Arc<ActivationDetector>,
+    /// Fábrica de cerebros para tareas pesadas (HU-37). `None` = sin tareas.
+    pub factory: Option<Arc<dyn BrainFactory>>,
 }
 
 /// Contadores del orquestador (diagnóstico; nunca contienen texto).
@@ -318,6 +330,14 @@ pub enum LocalCommand {
         /// Cómo se nombra en la respuesta: "Cerrando {display_name}."
         display_name: String,
     },
+    /// Cancela una o todas las tareas pesadas en curso ("cancela la tarea de
+    /// los correos" / "cancela todas las tareas").
+    CancelTask {
+        /// Texto que identifica la tarea; `None` = cancelarlas todas.
+        spoken_target: Option<String>,
+    },
+    /// Lista las tareas pesadas ("¿qué tareas tengo?").
+    ListTasks,
 }
 
 /// Frases que cierran la sesión por voz (HU-17). No son un mute duro: el
@@ -341,6 +361,21 @@ const TIME_PHRASES: &[&str] = &[
     "dime la hora",
     "qué hora tienes",
     "que hora tienes",
+];
+
+/// Verbos que cancelan tareas pesadas (HU-37).
+const CANCEL_TASK_VERBS: &[&str] = &["cancela", "cancelar", "cancelame"];
+
+/// Frases que piden listar las tareas pesadas.
+const LIST_TASK_PHRASES: &[&str] = &[
+    "qué tareas tengo",
+    "que tareas tengo",
+    "tareas pendientes",
+    "lista de tareas",
+    "qué tareas hay",
+    "que tareas hay",
+    "tareas activas",
+    "dime las tareas",
 ];
 
 /// Verbos que piden abrir una aplicación (texto ya sin acentos).
@@ -565,6 +600,10 @@ pub fn local_command(query: &str) -> Option<LocalCommand> {
         Some(LocalCommand::Standby)
     } else if has(TIME_PHRASES) {
         Some(LocalCommand::Time)
+    } else if has(LIST_TASK_PHRASES) {
+        Some(LocalCommand::ListTasks)
+    } else if let Some(command) = cancel_task_command(&text) {
+        Some(command)
     } else {
         let folded = fold_accents(&text);
         let words: Vec<&str> = folded.split_whitespace().collect();
@@ -576,6 +615,35 @@ pub fn local_command(query: &str) -> Option<LocalCommand> {
             requested_app(&words).map(open_app_command)
         }
     }
+}
+
+/// Reconoce "cancela la tarea de …" o "cancela todas las tareas".
+fn cancel_task_command(text: &str) -> Option<LocalCommand> {
+    let folded = fold_accents(text);
+    let words: Vec<&str> = folded.split_whitespace().collect();
+    let pos = words.iter().position(|w| CANCEL_TASK_VERBS.contains(w))?;
+    let rest = &words[pos + 1..];
+    if rest.iter().any(|w| *w == "todas" || *w == "todo") {
+        return Some(LocalCommand::CancelTask {
+            spoken_target: None,
+        });
+    }
+    let target = rest
+        .iter()
+        .position(|w| *w == "tarea" || *w == "tareas")
+        .and_then(|i| {
+            let after = &rest[i + 1..];
+            let mut j = 0;
+            while j < after.len()
+                && ["de", "del", "la", "las", "los", "el", "una", "un"].contains(&after[j])
+            {
+                j += 1;
+            }
+            (j < after.len()).then(|| after[j..].join(" "))
+        });
+    target.map(|spoken_target| LocalCommand::CancelTask {
+        spoken_target: Some(spoken_target),
+    })
 }
 
 /// Frase con la hora: "Es la 1:05." / "Son las 15:30."
@@ -608,11 +676,21 @@ pub fn ends_with_connector(text: &str) -> bool {
 
 /// Envía locuciones al orquestador (IPC `jarvis.speak`, avisos).
 #[derive(Clone)]
-pub struct VoiceSpeaker(Sender<BrainJob>);
+pub struct VoiceSpeaker {
+    tx: Sender<BrainJob>,
+    queue: SpeechQueueHandle,
+}
 
 impl VoiceSpeaker {
+    /// Encola una locución en la cola priorizada (HU-37): se dirá cuando el
+    /// *gate* lo permita. Devuelve la posición (1 = la siguiente; 0 = rechazada
+    /// por cola llena).
+    pub fn enqueue(&self, text: impl Into<String>, priority: SpeechPriority) -> u32 {
+        self.queue.push(Delivery::new(text, priority))
+    }
+
     pub fn say(&self, text: impl Into<String>) {
-        let _ = self.0.send(BrainJob::Say(text.into()));
+        let _ = self.tx.send(BrainJob::Say(text.into()));
     }
 }
 
@@ -659,6 +737,9 @@ pub struct VoiceOrchestrator {
     barge_in: Arc<AtomicBool>,
     stt_ready: Arc<AtomicBool>,
     activation: Arc<ActivationDetector>,
+    tasks: Option<TaskManager>,
+    gaming_mode: Arc<AtomicBool>,
+    queue: SpeechQueueHandle,
 }
 
 enum ControlMsg {
@@ -726,10 +807,13 @@ impl VoiceOrchestrator {
             mut coordinator,
             brain,
             activation,
+            factory,
         } = deps;
         coordinator.set_deferred_finish(true);
         let brain = BrainSlot::new(brain);
         let barge_in = Arc::new(AtomicBool::new(config.barge_in_enabled));
+        let gaming_mode = Arc::new(AtomicBool::new(false));
+        let last_voice_activity = Arc::new(Mutex::new(None::<Instant>));
 
         let stats = Arc::new(VoiceStats::default());
         let stt_ready = Arc::new(AtomicBool::new(false));
@@ -739,6 +823,20 @@ impl VoiceOrchestrator {
         let (stt_out_tx, stt_out_rx) = crossbeam_channel::unbounded();
         let (brain_tx, brain_rx) = crossbeam_channel::unbounded();
         let (tts_tx, tts_rx) = crossbeam_channel::unbounded();
+        let queue = SpeechQueueHandle::new();
+
+        // Gestor de tareas pesadas: solo si hay fábrica y configuración. Si no
+        // se puede preparar (directorio de estado), la voz sigue sin tareas.
+        let tasks = match (factory, config.tasks.clone()) {
+            (Some(factory), Some(cfg)) => match TaskManager::start(factory, cfg, queue.clone()) {
+                Ok(tasks) => Some(tasks),
+                Err(e) => {
+                    eprintln!("[tareas] gestor de tareas desactivado: {e}");
+                    None
+                }
+            },
+            _ => None,
+        };
 
         let mut threads = Vec::new();
         let spawn = |name: &'static str, f: Box<dyn FnOnce() + Send>| {
@@ -776,7 +874,12 @@ impl VoiceOrchestrator {
                 stats: Arc::clone(&stats),
                 ready: Arc::clone(&ready),
                 speaking: None,
-                deferred: VecDeque::new(),
+                tasks: tasks.clone(),
+                queue: queue.clone(),
+                last_voice_activity: Arc::clone(&last_voice_activity),
+                gaming_mode: Arc::clone(&gaming_mode),
+                quiet_gap: config.tasks.clone().unwrap_or_default().quiet_gap,
+                held: false,
             };
             threads.push(spawn(
                 "jarvis-brain",
@@ -803,6 +906,7 @@ impl VoiceOrchestrator {
                 candidate: None,
                 echo_segment: false,
                 last_sounding: None,
+                last_voice_activity,
             };
             threads.push(spawn(
                 "jarvis-voice",
@@ -822,7 +926,21 @@ impl VoiceOrchestrator {
             barge_in,
             stt_ready,
             activation,
+            tasks,
+            gaming_mode,
+            queue,
         })
+    }
+
+    /// Gestor de tareas pesadas (HU-37), si está activo. Es un *handle*
+    /// clonable: lo usa el servidor IPC (`jarvis.dispatchTask`…).
+    pub fn tasks(&self) -> Option<TaskManager> {
+        self.tasks.clone()
+    }
+
+    /// Modo juego: retiene las locuciones no críticas (CA-37.8).
+    pub fn set_gaming_mode(&self, enabled: bool) {
+        self.gaming_mode.store(enabled, Ordering::Relaxed);
     }
 
     /// Reemplaza el cerebro (cambio de configuración). Cancela el turno que
@@ -867,7 +985,10 @@ impl VoiceOrchestrator {
     }
 
     pub fn speaker(&self) -> VoiceSpeaker {
-        VoiceSpeaker(self.brain_tx.clone())
+        VoiceSpeaker {
+            tx: self.brain_tx.clone(),
+            queue: self.queue.clone(),
+        }
     }
 
     pub fn stats(&self) -> VoiceStatsSnapshot {
@@ -887,6 +1008,10 @@ impl VoiceOrchestrator {
         let _ = self.stt_tx.try_send(SttJob::Shutdown);
         let _ = self.brain_tx.send(BrainJob::Shutdown);
         let _ = self.tts_tx.send(TtsJob::Shutdown);
+        if let Some(tasks) = &self.tasks {
+            // Mata los árboles de procesos de las tareas en curso.
+            tasks.shutdown(deadline / 2);
+        }
 
         let limit = Instant::now() + deadline;
         let mut pending = std::mem::take(&mut self.threads);
@@ -947,6 +1072,9 @@ struct ControlLoop {
     echo_segment: bool,
     /// Último instante en que Jarvis sonaba (cola de eco sin barge-in).
     last_sounding: Option<Instant>,
+    /// Última voz del usuario: el *gate* de la cola hablada espera un hueco
+    /// de silencio tras ella (CA-37.5).
+    last_voice_activity: Arc<Mutex<Option<Instant>>>,
 }
 
 /// Barge-in por confirmar (ver [`ControlLoop::on_voice`]).
@@ -1071,6 +1199,7 @@ impl ControlLoop {
         }
         match event {
             VoiceEvent::VoiceStart { at } => {
+                self.mark_voice(at);
                 // Con Jarvis sonando, la voz puede ser su propio eco que el
                 // AEC no canceló. Se pausa la salida en el acto (silencio
                 // ≤ 50 ms, CA-9.1) y se confirma con Jarvis callado: si la
@@ -1115,6 +1244,7 @@ impl ControlLoop {
                 }
             }
             VoiceEvent::EndOfTurn { at, segment } => {
+                self.mark_voice(at);
                 self.stats.segments.fetch_add(1, Ordering::Relaxed);
                 if std::mem::take(&mut self.echo_segment) && segment.duration_ms <= ECHO_MAX_MS {
                     // Eco corto de la voz de Jarvis: no se transcribe. Un eco
@@ -1248,6 +1378,13 @@ impl ControlLoop {
                 self.config.barge_in_window.as_millis()
             );
         }
+    }
+
+    fn mark_voice(&self, at: Instant) {
+        *self
+            .last_voice_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(at);
     }
 
     /// `true` si Jarvis está hablando o diciendo un filler.
@@ -1453,30 +1590,170 @@ struct BrainLoop {
     ready: Arc<AtomicBool>,
     /// Locución en curso: (generación, qué hacer al terminar).
     speaking: Option<(u64, AfterSpeech)>,
-    /// Locuciones pedidas (IPC, avisos) mientras otra sonaba.
-    deferred: VecDeque<String>,
+    /// Gestor de tareas pesadas (HU-37); `None` = desactivado.
+    tasks: Option<TaskManager>,
+    /// Cola hablada priorizada: avisos (IPC) y resultados de tareas.
+    queue: SpeechQueueHandle,
+    /// Última voz del usuario (la escribe el hilo de voz).
+    last_voice_activity: Arc<Mutex<Option<Instant>>>,
+    gaming_mode: Arc<AtomicBool>,
+    /// Silencio mínimo tras la voz del usuario antes de entregar.
+    quiet_gap: Duration,
+    /// Hubo resultados retenidos por silencio/modo juego: al salir se
+    /// anuncian antes de entregarlos (CA-37.8).
+    held: bool,
 }
+
+/// Cada cuánto el cerebro evalúa la cola hablada sin esperar otro evento.
+const QUEUE_TICK: Duration = Duration::from_millis(250);
 
 impl BrainLoop {
     fn run(mut self, jobs: &Receiver<BrainJob>) {
-        for job in jobs {
-            match job {
-                BrainJob::Turn { query, at } => self.on_turn(&query, at),
-                BrainJob::Say(text) => {
-                    if self.speaking.is_some() {
-                        self.deferred.push_back(text);
-                    } else {
-                        self.say(&text, AfterSpeech::Listen);
+        loop {
+            select! {
+                recv(jobs) -> job => match job {
+                    Ok(BrainJob::Turn { query, at }) => self.on_turn(&query, at),
+                    Ok(BrainJob::Say(text)) => {
+                        if self.speaking.is_some() {
+                            // Otra locución suena: espera su turno en la cola.
+                            self.queue.push(Delivery::new(text, SpeechPriority::Notice));
+                        } else {
+                            self.say(&text, AfterSpeech::Listen);
+                        }
                     }
-                }
-                BrainJob::SetVoice(voice_id) => self.set_voice(&voice_id),
-                BrainJob::SpeechDone {
-                    generation,
-                    outcome,
-                } => self.on_speech_done(generation, outcome),
-                BrainJob::Shutdown => break,
+                    Ok(BrainJob::SetVoice(voice_id)) => self.set_voice(&voice_id),
+                    Ok(BrainJob::SpeechDone {
+                        generation,
+                        outcome,
+                    }) => self.on_speech_done(generation, outcome),
+                    Ok(BrainJob::Shutdown) | Err(_) => break,
+                },
+                default(QUEUE_TICK) => {}
             }
+            self.drain_queue();
         }
+    }
+
+    /// Dice la siguiente locución de la cola si el *gate* lo permite: Jarvis
+    /// en reposo/escucha, sin hablar, tras un hueco de silencio del usuario y
+    /// sin silencio ni modo juego (salvo `Critical`).
+    fn drain_queue(&mut self) {
+        if self.queue.pending() == 0 {
+            self.held = false;
+            return;
+        }
+        let gate = DeliveryGate {
+            state: self.core.state(),
+            speaking: self.speaking.is_some(),
+            last_voice_activity: *self
+                .last_voice_activity
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            quiet_gap: self.quiet_gap,
+            muted: self.core.is_muted(),
+            gaming_mode: self.gaming_mode.load(Ordering::Relaxed),
+        };
+        let now = Instant::now();
+        if gate.muted || gate.gaming_mode {
+            self.held = true;
+        } else if self.held && gate.allows(SpeechPriority::TaskResult, now) {
+            self.held = false;
+            let n = self.queue.pending();
+            let text = if n == 1 {
+                "Tienes 1 resultado pendiente.".to_string()
+            } else {
+                format!("Tienes {n} resultados pendientes.")
+            };
+            self.say(&text, AfterSpeech::Listen);
+            return;
+        }
+        let next = self.queue.lock().pop_ready(&gate, now);
+        if let Some(delivery) = next {
+            self.say(&delivery.text, AfterSpeech::Listen);
+        }
+    }
+
+    /// Turno pesado (HU-37): acuse inmediato y despacho a un trabajador con
+    /// cerebro propio. Devuelve `false` si no hay gestor de tareas.
+    fn dispatch_task(&mut self, query: &str) -> bool {
+        let Some(tasks) = self.tasks.clone() else {
+            return false;
+        };
+        self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+        let title = task_title(query);
+        let id = tasks.submit(title.clone(), task_prompt(query), TaskOrigin::Voice);
+        println!("[tareas] #{id} despachada en segundo plano.");
+        let ack = match crate::conversation::classify_intent(query) {
+            FillerCategory::Inbox => "Reviso tu bandeja y te aviso.",
+            _ => "Voy con eso, te aviso cuando termine.",
+        };
+        self.say(ack, AfterSpeech::Listen);
+        true
+    }
+
+    /// "Cancela la tarea de los correos" / "cancela todas las tareas".
+    fn cancel_tasks(&mut self, target: Option<&str>) {
+        self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+        let Some(tasks) = self.tasks.clone() else {
+            self.say(NO_TASKS_PHRASE, AfterSpeech::Listen);
+            return;
+        };
+        let phrase = match target {
+            None => match tasks.cancel_all() {
+                0 => "No hay tareas en curso.".to_string(),
+                1 => "Cancelé la tarea en curso.".to_string(),
+                n => format!("Cancelé {n} tareas."),
+            },
+            Some(target) => {
+                let active: Vec<_> = tasks.active().into_iter().map(|r| r.id).collect();
+                let matches: Vec<_> = tasks
+                    .find_by_title(target)
+                    .into_iter()
+                    .filter(|id| active.contains(id))
+                    .collect();
+                match matches.as_slice() {
+                    [] => "No encontré esa tarea en curso.".to_string(),
+                    [id] => {
+                        tasks.cancel(*id);
+                        let title = tasks.get(*id).map(|r| r.title).unwrap_or_default();
+                        format!("Cancelé la tarea sobre {title}.")
+                    }
+                    many => format!(
+                        "Hay {} tareas que coinciden. ¿Cuál cancelo, la primera o la segunda?",
+                        many.len()
+                    ),
+                }
+            }
+        };
+        self.say(&phrase, AfterSpeech::Listen);
+    }
+
+    /// "¿Qué tareas tengo?": tareas vivas y resultados por decir.
+    fn list_tasks(&mut self) {
+        self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+        let Some(tasks) = self.tasks.clone() else {
+            self.say(NO_TASKS_PHRASE, AfterSpeech::Listen);
+            return;
+        };
+        let active = tasks.active();
+        let mut phrase = match active.as_slice() {
+            [] => "No tienes tareas en curso.".to_string(),
+            [one] => format!("Tienes una tarea en curso: {}.", one.title),
+            many => {
+                let titles: Vec<&str> = many.iter().map(|r| r.title.as_str()).collect();
+                format!(
+                    "Tienes {} tareas en curso: {}.",
+                    many.len(),
+                    titles.join(", ")
+                )
+            }
+        };
+        match self.queue.pending() {
+            0 => {}
+            1 => phrase.push_str(" Y 1 resultado pendiente."),
+            n => phrase.push_str(&format!(" Y {n} resultados pendientes.")),
+        }
+        self.say(&phrase, AfterSpeech::Listen);
     }
 
     fn on_turn(&mut self, query: &str, _at: Instant) {
@@ -1532,6 +1809,11 @@ impl BrainLoop {
                     }
                 }
             }
+            Some(LocalCommand::CancelTask { spoken_target }) => {
+                self.cancel_tasks(spoken_target.as_deref());
+            }
+            Some(LocalCommand::ListTasks) => self.list_tasks(),
+            None if classify_workload(query) == Workload::Heavy && self.dispatch_task(query) => {}
             None => match self.client.get() {
                 Some(client) => self.converse(client.as_ref(), query),
                 None => self.say(NO_API_KEY_PHRASE, AfterSpeech::Listen),
@@ -1735,9 +2017,7 @@ impl BrainLoop {
                 }
             }
         }
-        if let Some(text) = self.deferred.pop_front() {
-            self.say(&text, AfterSpeech::Listen);
-        }
+        // La cola hablada se drena en `run` tras cada evento (y cada tick).
     }
 }
 

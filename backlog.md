@@ -73,11 +73,11 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 ---
 
 ## 👁️ Épica 7: Agente Visual Multiplataforma y Automatización Generalista (Computer Use)
-- [ ] **feat(automation): tareas pesadas en segundo plano con notificación vocal secuencial vía IPC** (HU-37)
+- [x] **feat(automation): tareas pesadas en segundo plano con notificación vocal secuencial vía IPC** (HU-37)
   - _Contexto de negocio:_ Las tareas de larga duración (revisión de correos, Slack, análisis de datos) no deben bloquear la voz ni ser canceladas accidentalmente si el usuario sigue conversando.
   - 📁 _Repositorio:_ `Fokkus-Jarvis`
   - 🎯 _Capa a trabajar:_ `crates/jarvis-audio` (orquestador de tareas) y `crates/jarvis-ipc`.
-  - 📌 _Objetivo técnico:_ Acuse de recibo vocal inmediato (< 1s), despacho a worker desacoplado que no se aborte por turnos posteriores, y encolamiento FIFO garantizado en `deferred` de `jarvis.speak` para entregar resultados completos sin colisiones de audio.
+  - 📌 _Objetivo técnico:_ Acuse de recibo vocal inmediato (< 1s), despacho a worker desacoplado que no se aborte por turnos posteriores, y encolamiento FIFO garantizado en `SpeechQueue` con `DeliveryGate` para entregar resultados completos sin colisiones de audio (✅ 474 tests pasando).
 - [ ] **feat(automation): ojos y manos multiplataforma (Screen Inspector & Input Synthesizer)** (HU-38)
   - _Contexto de negocio:_ Dotar a Jarvis de capacidad genérica para ver la pantalla y enviar entradas de mouse/teclado de forma consistente en Linux (Wayland/X11) y Windows.
   - 📁 _Repositorio:_ `Fokkus-Jarvis`

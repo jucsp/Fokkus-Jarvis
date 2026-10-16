@@ -55,9 +55,17 @@ pub mod methods {
     pub const NOTIFY_SWARM_COMPLETED: &str = "jarvis.notifySwarmCompleted";
     /// Alerta de triage (Slack/Gmail) (notification).
     pub const NOTIFY_TRIAGE_ALERT: &str = "jarvis.notifyTriageAlert";
+    /// Despacha una tarea pesada en segundo plano (HU-37).
+    pub const DISPATCH_TASK: &str = "jarvis.dispatchTask";
+    /// Lista las tareas pesadas registradas (HU-37).
+    pub const GET_TASKS: &str = "jarvis.getTasks";
+    /// Una tarea pesada por id, con su resultado si ya terminó (HU-37).
+    pub const GET_TASK: &str = "jarvis.getTask";
+    /// Cancela una tarea pesada por id (HU-37).
+    pub const CANCEL_TASK: &str = "jarvis.cancelTask";
 
     /// Catálogo completo, para el handshake y para documentación.
-    pub const ALL: [&str; 10] = [
+    pub const ALL: [&str; 14] = [
         HELLO,
         PING,
         GET_STATE,
@@ -68,6 +76,10 @@ pub mod methods {
         NOTIFY_SWARM_PROGRESS,
         NOTIFY_SWARM_COMPLETED,
         NOTIFY_TRIAGE_ALERT,
+        DISPATCH_TASK,
+        GET_TASKS,
+        GET_TASK,
+        CANCEL_TASK,
     ];
 }
 
@@ -490,6 +502,23 @@ pub struct SpeakParams {
     /// Categoría del texto (p. ej. `general`, `dev`, `inbox`).
     #[serde(default)]
     pub category: Option<String>,
+    /// `true` = encolar en la cola hablada en vez de hablar/rechazar en el
+    /// acto (HU-37). Por defecto `false` (compatibilidad).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<bool>,
+    /// Prioridad en la cola: `notice` (defecto), `task_result`, `reply` o
+    /// `critical` (ver [`speech_priority`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+}
+
+/// Prioridades aceptadas por `jarvis.speak` con `queue: true`.
+pub mod speech_priority {
+    pub const NOTICE: &str = "notice";
+    pub const TASK_RESULT: &str = "task_result";
+    pub const REPLY: &str = "reply";
+    pub const CRITICAL: &str = "critical";
+    pub const ALL: [&str; 4] = [NOTICE, TASK_RESULT, REPLY, CRITICAL];
 }
 
 /// Resultado de `jarvis.speak`.
@@ -507,6 +536,52 @@ pub struct SpeakResult {
     /// Motivo por el que se rechazó (`"muted"`), si aplica.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// `true` si quedó en la cola hablada (`queue: true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued: Option<bool>,
+    /// Posición en la cola (1 = la siguiente).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<u32>,
+}
+
+/// Parámetros de `jarvis.dispatchTask` (HU-37).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchTaskParams {
+    /// Título corto para el encabezado hablado ("tus correos"). Vacío =
+    /// se deriva del prompt.
+    #[serde(default)]
+    pub title: String,
+    /// Instrucción en lenguaje natural para el subagente de fondo.
+    pub prompt: String,
+}
+
+/// Resultado de `jarvis.dispatchTask`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchTaskResult {
+    /// Id estable de la tarea.
+    pub id: u64,
+    /// Estado inicial (`queued`).
+    pub status: String,
+}
+
+/// Parámetros de `jarvis.getTask` y `jarvis.cancelTask`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskIdParams {
+    pub id: u64,
+}
+
+/// Resultado de `jarvis.getTasks`: registros tal como los serializa el
+/// gestor de tareas (`id`, `title`, `status`, `spoken_summary`…).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TasksResult {
+    pub tasks: Vec<Value>,
+}
+
+/// Resultado de `jarvis.cancelTask`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelTaskResult {
+    pub id: u64,
+    pub cancelled: bool,
 }
 
 /// Resultado de `jarvis.getState`.

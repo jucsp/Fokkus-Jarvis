@@ -31,6 +31,15 @@ pub const SPHERE_OPACITY_RANGE: std::ops::RangeInclusive<u8> = 20..=100;
 /// `fullscreen_active_pct`.
 pub const FULLSCREEN_PCT_RANGE: std::ops::RangeInclusive<u8> = 5..=100;
 
+/// Tareas pesadas simultáneas permitidas (HU-37).
+pub const TASKS_PARALLEL_RANGE: std::ops::RangeInclusive<u8> = 1..=4;
+
+/// Timeout por tarea pesada, en segundos (HU-37).
+pub const TASKS_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 60..=3_600;
+
+/// Hueco de silencio para entregar resultados de tareas, en milisegundos (HU-37).
+pub const TASKS_QUIET_GAP_RANGE: std::ops::RangeInclusive<u32> = 500..=5_000;
+
 /// Lado de la esfera en píxeles lógicos para un porcentaje de escala,
 /// saturado a [`SPHERE_SCALE_RANGE`] (lo usa también la vista previa en vivo).
 pub fn sphere_size_for_pct(pct: u16) -> u32 {
@@ -139,6 +148,16 @@ pub struct JarvisConfig {
     /// (5–100, default 60).
     #[serde(default = "default_fullscreen_active_pct")]
     fullscreen_active_pct: u8,
+    /// Tareas pesadas simultáneas (1–4, default 2).
+    #[serde(default = "default_tasks_max_parallel")]
+    tasks_max_parallel: u8,
+    /// Timeout por tarea pesada en segundos (60–3600, default 900).
+    #[serde(default = "default_tasks_timeout_secs")]
+    tasks_timeout_secs: u32,
+    /// Hueco de silencio en ms antes de entregar un resultado (500–5000,
+    /// default 1500).
+    #[serde(default = "default_tasks_quiet_gap_ms")]
+    tasks_quiet_gap_ms: u32,
 }
 
 fn default_sphere_scale_pct() -> u16 {
@@ -155,6 +174,18 @@ fn default_fullscreen_dim_pct() -> u8 {
 
 fn default_fullscreen_active_pct() -> u8 {
     60
+}
+
+fn default_tasks_max_parallel() -> u8 {
+    2
+}
+
+fn default_tasks_timeout_secs() -> u32 {
+    900
+}
+
+fn default_tasks_quiet_gap_ms() -> u32 {
+    1_500
 }
 
 impl Default for JarvisConfig {
@@ -174,6 +205,9 @@ impl Default for JarvisConfig {
             fullscreen_behavior: FullscreenBehavior::Dim,
             fullscreen_dim_pct: 25,
             fullscreen_active_pct: 60,
+            tasks_max_parallel: 2,
+            tasks_timeout_secs: 900,
+            tasks_quiet_gap_ms: 1_500,
         }
     }
 }
@@ -259,6 +293,21 @@ impl JarvisConfig {
         self
     }
 
+    pub fn with_tasks_max_parallel(mut self, value: u8) -> Self {
+        self.tasks_max_parallel = value;
+        self
+    }
+
+    pub fn with_tasks_timeout_secs(mut self, value: u32) -> Self {
+        self.tasks_timeout_secs = value;
+        self
+    }
+
+    pub fn with_tasks_quiet_gap_ms(mut self, value: u32) -> Self {
+        self.tasks_quiet_gap_ms = value;
+        self
+    }
+
     /// Comando CLI efectivo (el por defecto si quedó vacío).
     pub fn effective_cli_command(&self) -> &str {
         let command = self.cli_command.trim();
@@ -309,6 +358,24 @@ impl JarvisConfig {
             .clamp(*FULLSCREEN_PCT_RANGE.start(), *FULLSCREEN_PCT_RANGE.end())
     }
 
+    /// Tareas pesadas simultáneas, saturado a 1–4.
+    pub fn tasks_max_parallel(&self) -> u8 {
+        self.tasks_max_parallel
+            .clamp(*TASKS_PARALLEL_RANGE.start(), *TASKS_PARALLEL_RANGE.end())
+    }
+
+    /// Timeout por tarea pesada en segundos, saturado a 60–3600.
+    pub fn tasks_timeout_secs(&self) -> u32 {
+        self.tasks_timeout_secs
+            .clamp(*TASKS_TIMEOUT_RANGE.start(), *TASKS_TIMEOUT_RANGE.end())
+    }
+
+    /// Hueco de silencio en ms para entregar resultados, saturado a 500–5000.
+    pub fn tasks_quiet_gap_ms(&self) -> u32 {
+        self.tasks_quiet_gap_ms
+            .clamp(*TASKS_QUIET_GAP_RANGE.start(), *TASKS_QUIET_GAP_RANGE.end())
+    }
+
     /// Satura los valores fuera de rango al cargar (no es error de parseo).
     fn saturate(&mut self) {
         let scale = self.sphere_scale_pct();
@@ -345,6 +412,31 @@ impl JarvisConfig {
                 self.fullscreen_active_pct
             );
             self.fullscreen_active_pct = active;
+        }
+
+        let parallel = self.tasks_max_parallel();
+        if parallel != self.tasks_max_parallel {
+            eprintln!(
+                "[config] tasks_max_parallel fuera de rango ({}): se satura a {parallel}",
+                self.tasks_max_parallel
+            );
+            self.tasks_max_parallel = parallel;
+        }
+        let timeout = self.tasks_timeout_secs();
+        if timeout != self.tasks_timeout_secs {
+            eprintln!(
+                "[config] tasks_timeout_secs fuera de rango ({}): se satura a {timeout}",
+                self.tasks_timeout_secs
+            );
+            self.tasks_timeout_secs = timeout;
+        }
+        let quiet_gap = self.tasks_quiet_gap_ms();
+        if quiet_gap != self.tasks_quiet_gap_ms {
+            eprintln!(
+                "[config] tasks_quiet_gap_ms fuera de rango ({}): se satura a {quiet_gap}",
+                self.tasks_quiet_gap_ms
+            );
+            self.tasks_quiet_gap_ms = quiet_gap;
         }
     }
 
@@ -686,5 +778,62 @@ mod tests {
     fn fullscreen_behavior_serializes_lowercase_by_default() {
         let toml = toml::to_string(&JarvisConfig::default()).expect("serializa");
         assert!(toml.contains("fullscreen_behavior = \"dim\""), "{toml}");
+    }
+
+    #[test]
+    fn tasks_defaults_and_builders() {
+        let config = JarvisConfig::default();
+        assert_eq!(config.tasks_max_parallel(), 2);
+        assert_eq!(config.tasks_timeout_secs(), 900);
+        assert_eq!(config.tasks_quiet_gap_ms(), 1_500);
+
+        let config = config
+            .with_tasks_max_parallel(4)
+            .with_tasks_timeout_secs(1_200)
+            .with_tasks_quiet_gap_ms(2_000);
+        assert_eq!(config.tasks_max_parallel(), 4);
+        assert_eq!(config.tasks_timeout_secs(), 1_200);
+        assert_eq!(config.tasks_quiet_gap_ms(), 2_000);
+    }
+
+    #[test]
+    fn tasks_fields_roundtrip_through_toml() {
+        let path = temp_config_path("tasks-roundtrip");
+        cleanup(&path);
+        let config = JarvisConfig {
+            tasks_max_parallel: 3,
+            tasks_timeout_secs: 600,
+            tasks_quiet_gap_ms: 800,
+            ..JarvisConfig::default()
+        };
+        config.save_to(&path).unwrap();
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("tasks_max_parallel = 3"), "{toml}");
+        assert!(toml.contains("tasks_timeout_secs = 600"), "{toml}");
+        assert!(toml.contains("tasks_quiet_gap_ms = 800"), "{toml}");
+
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded, config);
+        assert_eq!(loaded.tasks_max_parallel(), 3);
+        assert_eq!(loaded.tasks_timeout_secs(), 600);
+        assert_eq!(loaded.tasks_quiet_gap_ms(), 800);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn out_of_range_tasks_values_saturate_on_load() {
+        let path = temp_config_path("tasks-sat");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "tasks_max_parallel = 9\ntasks_timeout_secs = 1\ntasks_quiet_gap_ms = 9_999\n",
+        )
+        .unwrap();
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.tasks_max_parallel(), 4);
+        assert_eq!(loaded.tasks_timeout_secs(), 60);
+        assert_eq!(loaded.tasks_quiet_gap_ms(), 5_000);
+        cleanup(&path);
     }
 }
