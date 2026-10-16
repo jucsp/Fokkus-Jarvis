@@ -90,7 +90,7 @@ mod tests {
         let mut seed = 0x1234_5678u32;
         let (mut sum, mut noise_max) = (0.0f32, 0.0f32);
         let (mut streak, mut max_streak) = (0usize, 0usize);
-        let threshold = EndpointConfig::default().threshold;
+        let threshold = EndpointConfig::default().voice_open;
         for _ in 0..FRAMES {
             white_noise(&mut seed, 0.1 * 3f32.sqrt(), &mut frame);
             let score = vad.score(&mut frame);
@@ -107,7 +107,7 @@ mod tests {
         );
         // Medido el 2026-10-15: silencio 0,15–0,28 (decae tras el arranque);
         // ruido −20 dBFS media 0,25, picos de 0,54 y rachas de hasta 3 frames
-        // sobre el umbral 0,5: con ruido crudo el hangover por defecto (2)
+        // sobre el umbral 0,45: con ruido crudo el hangover por defecto (2)
         // abriría turno. En producción el VAD ve la señal ya pasada por NS
         // (ver `dsp::tests`); CA-3.1 se calibra con el corpus real.
         assert!(silence_max < 0.3, "el silencio digital debe puntuar bajo");

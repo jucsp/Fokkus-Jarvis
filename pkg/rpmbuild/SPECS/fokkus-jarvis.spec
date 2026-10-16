@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.2.19
+Version:        0.2.20
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,6 +23,11 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.20-1
+- HU-AUDIO-CONTINUITY: histéresis VAD de dos niveles (open 0.45, hold 0.25) y silencio extendido a 1200 ms / conector a 2000 ms.
+- Concatenación de turnos consecutivos en Thinking para pausas naturales sin pérdida de contexto ni corte de frases.
+- Fusión de globos de texto del usuario en HUD renovando TTL en continuaciones.
+
 * Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.19-1
 - Fix HUD Wayland: evitar desconfiguración en remapeo/resize manteniendo capa activa transparente.
 - Voz: ampliar silencio de cierre de 450 ms a 750 ms en endpointer para pausas naturales sin corte.

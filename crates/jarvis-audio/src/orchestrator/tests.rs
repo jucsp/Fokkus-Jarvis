@@ -803,6 +803,35 @@ fn long_user_speech_during_speaker_echo_is_not_discarded() {
     assert_eq!(brain.queries()[1], "cuéntame otra cosa");
 }
 
+#[test]
+fn user_speech_during_thinking_concatenates_into_single_turn() {
+    let brain = FakeBrain::new("Voy con eso.");
+    // Respuesta lenta: Jarvis permanece en Thinking el tiempo suficiente para
+    // que la segunda frase del usuario llegue antes de emitir la respuesta.
+    brain.set_reply("Voy con eso.", Duration::from_millis(500));
+    let h = harness("continuidad", Some(brain.clone()), fast());
+
+    // Primer turno: se acepta, entra al LLM y Jarvis queda pensando.
+    h.say_line(1);
+    wait_until("primer turno en el LLM", || brain.queries().len() == 1);
+    h.wait_state(JarvisState::Thinking);
+
+    // El usuario completa la idea mientras Jarvis piensa: se concatena en un
+    // único turno re-despachado (HU-AUDIO-CONTINUITY).
+    h.say_line(2);
+    wait_until("turno concatenado", || brain.queries().len() == 2);
+
+    assert_eq!(
+        brain.queries(),
+        vec![
+            "¿qué tal el clima?".to_string(),
+            "¿qué tal el clima? ¿y mañana?".to_string(),
+        ]
+    );
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(h.stats().speech_errors, 0);
+}
+
 /// `(argv[0] sin ruta, display_name)` de la orden, o `None` si no es OpenApp.
 fn open_app(query: &str) -> Option<(String, String)> {
     match local_command(query)? {

@@ -4,10 +4,13 @@
 //! Funciona sobre frames de 256 muestras a 16 kHz (16 ms). Mantiene:
 //! * **Hangover de apertura** (`open_frames`): cuántos frames de voz seguidos se
 //!   necesitan para declarar inicio de voz.
-//! * **Silencio de cierre** (`silence_ms`, 750 ms por defecto): cuánto silencio
+//! * **Histéresis VAD**: `voice_open` (0,45) abre el turno y `voice_hold`
+//!   (0,25) lo mantiene abierto; así las consonantes sordas o las caídas de
+//!   volumen a mitad de palabra no cortan el turno.
+//! * **Silencio de cierre** (`silence_ms`, 1,2 s por defecto): cuánto silencio
 //!   continuo cierra el turno. Si el STT informa un conector ("y…", "pero…"),
 //!   [`signal_connector`](Endpointer::signal_connector) extiende la espera a
-//!   `extended_silence_ms` (1,2 s).
+//!   `extended_silence_ms` (2 s).
 //! * **Pre-roll de 300 ms**: el segmento entregado incluye el audio previo al
 //!   inicio detectado, desde un buffer circular preasignado.
 //! * **Duración máxima** (`max_segment_ms`, 30 s): corta el turno limpiamente.
@@ -25,8 +28,10 @@ pub const SAMPLE_RATE: u32 = 16_000;
 /// Configuración del *endpointer*.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EndpointConfig {
-    /// Puntaje mínimo para considerar un frame como voz.
-    pub threshold: f32,
+    /// Puntaje mínimo para ABRIR el turno (histéresis alta).
+    pub voice_open: f32,
+    /// Puntaje mínimo para MANTENER el turno abierto (histéresis baja).
+    pub voice_hold: f32,
     /// Frames de voz consecutivos para abrir el turno.
     pub open_frames: usize,
     /// Silencio de cierre por defecto en milisegundos.
@@ -42,10 +47,11 @@ pub struct EndpointConfig {
 impl Default for EndpointConfig {
     fn default() -> Self {
         Self {
-            threshold: 0.5,
+            voice_open: 0.45,
+            voice_hold: 0.25,
             open_frames: 2,
-            silence_ms: 750,
-            extended_silence_ms: 1_200,
+            silence_ms: 1_200,
+            extended_silence_ms: 2_000,
             pre_roll_ms: 300,
             max_segment_ms: 30_000,
         }
@@ -194,7 +200,12 @@ impl Endpointer {
         if frame.len() != FRAME_SAMPLES {
             return None;
         }
-        let is_voice = score >= self.config.threshold;
+        // Histéresis: abrir exige más energía que mantener (HU-AUDIO-CONTINUITY).
+        let threshold = match self.state {
+            State::Silence => self.config.voice_open,
+            State::Speech => self.config.voice_hold,
+        };
+        let is_voice = score >= threshold;
 
         let event = match self.state {
             State::Silence => {
@@ -301,8 +312,8 @@ mod tests {
     fn frame_ms_and_close_frames_are_consistent() {
         let cfg = EndpointConfig::default();
         assert_eq!(cfg.frame_ms(), 16);
-        assert_eq!(cfg.close_frames(), 47); // 750 / 16 = 46.875 → 47
-        assert_eq!(cfg.extended_close_frames(), 75); // 1200 / 16
+        assert_eq!(cfg.close_frames(), 75); // 1200 / 16
+        assert_eq!(cfg.extended_close_frames(), 125); // 2000 / 16
         assert_eq!(cfg.pre_roll_frames(), 19); // 300 / 16 = 18.75 → 19
         assert_eq!(cfg.max_speech_frames(), 1875); // 30000 / 16 (pre-roll incluido)
     }
@@ -329,8 +340,41 @@ mod tests {
     }
 
     #[test]
+    fn hysteresis_does_not_open_with_scores_below_open_threshold() {
+        let mut ep = Endpointer::new(EndpointConfig::default());
+        let mut now = Instant::now();
+
+        // Entre voice_hold (0.25) y voice_open (0.45) no se abre el turno.
+        for _ in 0..10 {
+            now += std::time::Duration::from_millis(16);
+            assert!(ep.process(&frame(0.0), 0.4, now).is_none());
+        }
+        assert!(!ep.is_speaking());
+    }
+
+    #[test]
+    fn hysteresis_holds_speech_with_scores_below_open_threshold() {
+        let mut ep = Endpointer::new(EndpointConfig::default());
+        let mut now = Instant::now();
+
+        // Abre con voz clara.
+        ep.process(&voice_frame(), 0.9, now);
+        now += std::time::Duration::from_millis(16);
+        ep.process(&voice_frame(), 0.9, now);
+        assert!(ep.is_speaking());
+
+        // Consonantes sordas / caídas de volumen (0.3 ≥ voice_hold y
+        // < voice_open) mantienen el turno abierto.
+        for _ in 0..10 {
+            now += std::time::Duration::from_millis(16);
+            assert!(ep.process(&frame(0.0), 0.3, now).is_none());
+            assert!(ep.is_speaking());
+        }
+    }
+
+    #[test]
     fn pause_shorter_than_endpoint_does_not_close() {
-        let cfg = EndpointConfig::default(); // 750 ms = 47 frames
+        let cfg = EndpointConfig::default(); // 1200 ms = 75 frames
         let mut ep = Endpointer::new(cfg);
         let mut now = Instant::now();
 
@@ -350,8 +394,8 @@ mod tests {
         now += std::time::Duration::from_millis(16);
         assert!(ep.process(&voice_frame(), 0.9, now).is_none());
 
-        // 46 frames de silencio no cierran; el frame 47 sí.
-        feed_silence(&mut ep, 46, &mut now);
+        // 74 frames de silencio no cierran; el frame 75 sí.
+        feed_silence(&mut ep, 74, &mut now);
         assert!(ep.is_speaking());
         now += std::time::Duration::from_millis(16);
         assert!(matches!(
@@ -362,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_silence_of_750ms_closes() {
+    fn endpoint_silence_of_1200ms_closes() {
         let cfg = EndpointConfig::default();
         let mut ep = Endpointer::new(cfg);
         let mut now = Instant::now();
@@ -371,10 +415,10 @@ mod tests {
         now += std::time::Duration::from_millis(16);
         ep.process(&voice_frame(), 0.9, now);
 
-        // 46 frames de silencio (736 ms): aún abierto.
-        feed_silence(&mut ep, 46, &mut now);
+        // 74 frames de silencio (1184 ms): aún abierto.
+        feed_silence(&mut ep, 74, &mut now);
         assert!(ep.is_speaking());
-        // El frame 47 cierra (752 ms).
+        // El frame 75 cierra (1200 ms).
         now += std::time::Duration::from_millis(16);
         assert!(matches!(
             ep.process(&frame(0.0), 0.0, now),
@@ -384,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_extends_timeout_to_1200ms() {
+    fn connector_extends_timeout_to_2000ms() {
         let cfg = EndpointConfig::default();
         let mut ep = Endpointer::new(cfg);
         let mut now = Instant::now();
@@ -395,12 +439,12 @@ mod tests {
 
         ep.signal_connector();
 
-        // 1000 ms de silencio (62 frames): con conector, no cierra.
-        feed_silence(&mut ep, 62, &mut now);
+        // 1600 ms de silencio (100 frames): con conector, no cierra.
+        feed_silence(&mut ep, 100, &mut now);
         assert!(ep.is_speaking());
-        // 1200 ms (75 frames) sí cierra: 12 frames más siguen abiertos y el
-        // 75.º emite el fin de turno.
-        feed_silence(&mut ep, 12, &mut now);
+        // 2000 ms (125 frames) sí cierra: 24 frames más siguen abiertos y el
+        // 125.º emite el fin de turno.
+        feed_silence(&mut ep, 24, &mut now);
         assert!(ep.is_speaking());
         now += std::time::Duration::from_millis(16);
         assert!(matches!(
@@ -431,17 +475,17 @@ mod tests {
             Some(VoiceEvent::VoiceStart { .. })
         ));
 
-        // 46 frames de silencio no cierran; el 47.º cierra.
-        feed_silence(&mut ep, 46, &mut now);
+        // 74 frames de silencio no cierran; el 75.º cierra.
+        feed_silence(&mut ep, 74, &mut now);
         assert!(ep.is_speaking());
         now += std::time::Duration::from_millis(16);
         match ep.process(&frame(0.0), 0.0, now) {
             Some(VoiceEvent::EndOfTurn { segment, .. }) => {
-                // pre-roll (19) + 1 voz + 47 silencio = 67 frames.
-                assert_eq!(segment.pcm.len(), 67 * FRAME_SAMPLES);
+                // pre-roll (19) + 1 voz + 75 silencio = 95 frames.
+                assert_eq!(segment.pcm.len(), 95 * FRAME_SAMPLES);
                 // Los primeros 19 frames (304 ms) son el pre-roll de silencio.
                 assert!(segment.pcm[..19 * FRAME_SAMPLES].iter().all(|s| *s == 0.0));
-                assert_eq!(segment.duration_ms, 67 * 16);
+                assert_eq!(segment.duration_ms, 95 * 16);
             }
             other => panic!("esperaba EndOfTurn, obtuve {other:?}"),
         }
@@ -489,14 +533,14 @@ mod tests {
         let mut now = Instant::now();
         ep.process(&voice_frame(), 0.9, now);
         ep.signal_connector();
-        feed_silence(&mut ep, 74, &mut now);
+        feed_silence(&mut ep, 124, &mut now);
         now += std::time::Duration::from_millis(16);
         assert!(ep.process(&frame(0.0), 0.0, now).is_some());
 
-        // Nuevo turno sin conector: vuelve a cerrar a los 750 ms.
+        // Nuevo turno sin conector: vuelve a cerrar a los 1200 ms.
         now += std::time::Duration::from_millis(16);
         ep.process(&voice_frame(), 0.9, now);
-        feed_silence(&mut ep, 46, &mut now);
+        feed_silence(&mut ep, 74, &mut now);
         now += std::time::Duration::from_millis(16);
         assert!(ep.process(&frame(0.0), 0.0, now).is_some());
     }

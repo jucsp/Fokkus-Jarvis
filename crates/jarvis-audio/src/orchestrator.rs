@@ -199,7 +199,7 @@ impl Default for VoiceConfig {
             clock: Arc::new(utc_clock),
             launcher: Arc::new(launch_detached),
             barge_in_window: Duration::from_millis(250),
-            vad_threshold: crate::vad::EndpointConfig::default().threshold,
+            vad_threshold: crate::vad::EndpointConfig::default().voice_open,
             barge_in_enabled: false,
             tasks: None,
         }
@@ -273,6 +273,39 @@ impl HudTx {
             // Canal lleno o HUD cerrado: se descarta, la voz sigue.
             let _ = tx.try_send(event);
         }
+    }
+}
+
+/// Turno de usuario despachado y aún en curso, compartido entre el hilo de
+/// voz y el cerebro (HU-AUDIO-CONTINUITY).
+///
+/// El hilo de voz lo escribe al despachar y lo lee para fusionar las
+/// continuaciones; el cerebro lo limpia cuando el turno termina de forma
+/// natural. Así una pausa del usuario no convierte su frase completa en dos
+/// turnos separados.
+#[derive(Clone, Default)]
+struct PendingUserTurn(Arc<Mutex<Option<String>>>);
+
+impl PendingUserTurn {
+    fn set(&self, text: String) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(text);
+    }
+
+    fn take(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn clear(&self) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 }
 
@@ -784,6 +817,9 @@ enum BrainJob {
     Turn {
         query: String,
         at: Instant,
+        /// Fragmento nuevo del usuario para el HUD cuando este turno continúa
+        /// uno en curso (HU-AUDIO-CONTINUITY). `Some` solo en continuaciones.
+        hud_fragment: Option<String>,
     },
     Say(String),
     /// Cambio de voz en caliente (formulario CAMBIAR VOZ).
@@ -834,6 +870,7 @@ impl VoiceOrchestrator {
         let barge_in = Arc::new(AtomicBool::new(config.barge_in_enabled));
         let gaming_mode = Arc::new(AtomicBool::new(false));
         let last_voice_activity = Arc::new(Mutex::new(None::<Instant>));
+        let pending_user_turn = PendingUserTurn::default();
 
         let stats = Arc::new(VoiceStats::default());
         let stt_ready = Arc::new(AtomicBool::new(false));
@@ -906,7 +943,9 @@ impl VoiceOrchestrator {
                 held: false,
                 hud,
                 hud_turn: 0,
+                hud_user_turn: 0,
                 hud_open: None,
+                pending_user_turn: pending_user_turn.clone(),
             };
             threads.push(spawn(
                 "jarvis-brain",
@@ -929,6 +968,7 @@ impl VoiceOrchestrator {
                 config,
                 capture_enabled: None,
                 pending: None,
+                pending_user_turn: pending_user_turn.clone(),
                 stt_warned: false,
                 candidate: None,
                 echo_segment: false,
@@ -1092,6 +1132,8 @@ struct ControlLoop {
     config: VoiceConfig,
     capture_enabled: Option<bool>,
     pending: Option<PendingTurn>,
+    /// Turno de usuario despachado y aún en curso (HU-AUDIO-CONTINUITY).
+    pending_user_turn: PendingUserTurn,
     stt_warned: bool,
     /// Voz detectada mientras Jarvis suena: salida en pausa hasta confirmar.
     candidate: Option<BargeCandidate>,
@@ -1318,14 +1360,38 @@ impl ControlLoop {
                     } else {
                         self.dispatch(merged, held.at);
                     }
-                } else if outcome.connector {
-                    self.pending = Some(PendingTurn {
-                        query,
-                        at: outcome.at,
-                        deadline: Some(Instant::now() + self.config.connector_grace),
-                    });
                 } else {
-                    self.dispatch(query, outcome.at);
+                    let is_thinking = self.core.state() == JarvisState::Thinking;
+                    let continuation = if is_thinking {
+                        self.pending_user_turn.take()
+                    } else {
+                        self.pending_user_turn.clear();
+                        None
+                    };
+                    if let Some(previous) = continuation {
+                        // El usuario pausó, Jarvis empezó a procesar y siguió
+                        // hablando: se fusiona con el turno en curso y se vuelve a
+                        // despachar completo (HU-AUDIO-CONTINUITY).
+                        let merged = format!("{previous} {query}");
+                        self.cancel_in_flight();
+                        if outcome.connector {
+                            self.pending = Some(PendingTurn {
+                                query: merged,
+                                at: outcome.at,
+                                deadline: Some(Instant::now() + self.config.connector_grace),
+                            });
+                        } else {
+                            self.dispatch_with_fragment(merged, Some(query), outcome.at);
+                        }
+                    } else if outcome.connector {
+                        self.pending = Some(PendingTurn {
+                            query,
+                            at: outcome.at,
+                            deadline: Some(Instant::now() + self.config.connector_grace),
+                        });
+                    } else {
+                        self.dispatch(query, outcome.at);
+                    }
                 }
             }
             Activation::WakeOnly | Activation::Rejected => {
@@ -1398,6 +1464,9 @@ impl ControlLoop {
             self.stats
                 .last_barge_in_us
                 .store(silence_us, Ordering::Relaxed);
+            // La respuesta interrumpida deja de ser el turno pendiente: lo que
+            // diga ahora es una pregunta nueva, no una continuación.
+            self.pending_user_turn.clear();
             // Lo que diga ahora se acepta sin repetir "Jarvis".
             self.activation.open_follow_up();
             println!(
@@ -1424,13 +1493,25 @@ impl ControlLoop {
 
     /// Entrega un turno al cerebro, cancelando el que esté en curso.
     fn dispatch(&mut self, query: String, at: Instant) {
+        self.dispatch_with_fragment(query, None, at);
+    }
+
+    /// Como [`dispatch`](Self::dispatch), indicando el fragmento nuevo del
+    /// usuario para el HUD cuando este turno continúa uno en curso
+    /// (HU-AUDIO-CONTINUITY).
+    fn dispatch_with_fragment(&mut self, query: String, hud_fragment: Option<String>, at: Instant) {
         if matches!(
             self.core.state(),
             JarvisState::Thinking | JarvisState::Speaking
         ) {
             self.cancel_in_flight();
         }
-        let _ = self.brain.send(BrainJob::Turn { query, at });
+        self.pending_user_turn.set(query.clone());
+        let _ = self.brain.send(BrainJob::Turn {
+            query,
+            at,
+            hud_fragment,
+        });
     }
 
     fn cancel_in_flight(&self) {
@@ -1650,8 +1731,12 @@ struct BrainLoop {
     hud: HudTx,
     /// Último turno numerado para el HUD.
     hud_turn: TurnId,
+    /// Turno del usuario para el HUD; se reutiliza en continuaciones.
+    hud_user_turn: TurnId,
     /// Turno cuya respuesta aún no se cerró en el HUD.
     hud_open: Option<TurnId>,
+    /// Turno de usuario despachado y en curso (se limpia al terminar).
+    pending_user_turn: PendingUserTurn,
 }
 
 /// Cómo se subtitula una locución en el HUD (HU-36).
@@ -1671,7 +1756,11 @@ impl BrainLoop {
         loop {
             select! {
                 recv(jobs) -> job => match job {
-                    Ok(BrainJob::Turn { query, at }) => self.on_turn(&query, at),
+                    Ok(BrainJob::Turn {
+                        query,
+                        at,
+                        hud_fragment,
+                    }) => self.on_turn(&query, at, hud_fragment),
                     Ok(BrainJob::Say(text)) => {
                         if self.speaking.is_some() {
                             // Otra locución suena: espera su turno en la cola.
@@ -1815,17 +1904,31 @@ impl BrainLoop {
         self.say(&phrase, AfterSpeech::Listen);
     }
 
-    fn on_turn(&mut self, query: &str, _at: Instant) {
+    fn on_turn(&mut self, query: &str, _at: Instant, hud_fragment: Option<String>) {
         // Lo que quedó de un turno cancelado (barge-in) no debe bloquear este.
         self.speaking = None;
-        // HUD (HU-36): si la respuesta anterior seguía abierta, se cortó.
-        self.close_hud(true);
-        self.hud_turn += 1;
-        self.hud.emit(HudEvent::UserSaid {
-            turn: self.hud_turn,
-            text: query.to_string(),
-        });
-        self.hud_open = Some(self.hud_turn);
+        if let Some(fragment) = hud_fragment {
+            // Continuación del turno en curso (HU-AUDIO-CONTINUITY): la burbuja
+            // del usuario crece con el fragmento y la nueva respuesta abre una
+            // burbuja de Jarvis nueva (la parcial quedó cancelada).
+            self.close_hud(true);
+            self.hud.emit(HudEvent::UserSaid {
+                turn: self.hud_user_turn,
+                text: fragment,
+            });
+            self.hud_turn += 1;
+            self.hud_open = Some(self.hud_turn);
+        } else {
+            // HUD (HU-36): si la respuesta anterior seguía abierta, se cortó.
+            self.close_hud(true);
+            self.hud_turn += 1;
+            self.hud_user_turn = self.hud_turn;
+            self.hud.emit(HudEvent::UserSaid {
+                turn: self.hud_turn,
+                text: query.to_string(),
+            });
+            self.hud_open = Some(self.hud_turn);
+        }
         let _ = self
             .core
             .transition_from(JarvisState::Thinking, JarvisState::Listening);
@@ -1900,6 +2003,7 @@ impl BrainLoop {
             client.cancel();
         }
         self.speaking = None;
+        self.pending_user_turn.clear();
         self.close_hud(true);
         let _ = self
             .core
@@ -1963,6 +2067,7 @@ impl BrainLoop {
         // Silenciado o en un estado que no admite turnos: se descarta.
         if let Err(e) = self.coordinator.handle_user_utterance(query) {
             eprintln!("[voz] turno descartado: {e}");
+            self.pending_user_turn.clear();
             self.close_hud(false);
             return;
         }
@@ -2001,6 +2106,7 @@ impl BrainLoop {
                         .core
                         .transition_from(JarvisState::Thinking, JarvisState::Listening);
                     self.coordinator.finish_speech(false).ok();
+                    self.pending_user_turn.clear();
                     self.close_hud(false);
                 }
             }
@@ -2020,11 +2126,13 @@ impl BrainLoop {
             Err(ConversationError::Brain(e)) => {
                 self.stats.speech_errors.fetch_add(1, Ordering::Relaxed);
                 eprintln!("[cerebro] la respuesta falló: {e}");
+                self.pending_user_turn.clear();
                 self.speak_now(NETWORK_ERROR_PHRASE, AfterSpeech::Listen);
             }
             Err(e) => {
                 // Transición rechazada: otro hilo cambió el estado (silencio).
                 eprintln!("[voz] turno interrumpido: {e}");
+                self.pending_user_turn.clear();
                 self.close_hud(true);
             }
         }
@@ -2116,6 +2224,7 @@ impl BrainLoop {
             return;
         }
         self.speaking = None;
+        self.pending_user_turn.clear();
         let cut = outcome == PlayOutcome::Cancelled || self.playback.is_stale(generation);
         self.close_hud(cut);
         if outcome == PlayOutcome::NoOutput {

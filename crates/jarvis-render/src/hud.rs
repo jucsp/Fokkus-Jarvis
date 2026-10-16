@@ -140,11 +140,32 @@ impl BubbleStack {
     }
 
     /// Alta de una burbuja del usuario: nace y queda sellada al instante.
+    ///
+    /// Si el turno ya tiene una burbuja (continuación tras una pausa), el
+    /// texto nuevo se concatena y se renueva su TTL sin duplicarla
+    /// (HU-AUDIO-CONTINUITY).
     pub fn push_user(&mut self, turn: TurnId, text: impl Into<String>, now: Instant) {
+        let text = text.into();
+        if let Some(existing) = self
+            .bubbles
+            .iter_mut()
+            .rev()
+            .find(|b| b.speaker == Speaker::User && b.turn == Some(turn))
+        {
+            if !text.is_empty() {
+                if !existing.text.is_empty() {
+                    existing.text.push(' ');
+                }
+                existing.text.push_str(&text);
+            }
+            existing.sealed_at = Some(now);
+            existing.evicted_at = None;
+            return;
+        }
         let bubble = Bubble {
             speaker: Speaker::User,
             turn: Some(turn),
-            text: text.into(),
+            text,
             born: now,
             sealed_at: Some(now),
             interrupted: false,
@@ -666,6 +687,29 @@ mod tests {
         assert_eq!(bubble.sealed_at, Some(now));
         assert!(alpha < 1.0, "recién nacida debe estar entrando");
         assert!(stack.is_animating(now));
+    }
+
+    #[test]
+    fn user_fragments_merge_on_same_turn_and_renew_ttl() {
+        let mut stack = BubbleStack::new(3);
+        let now = base();
+        stack.push_user(7, "hola", now);
+
+        let later = now + Duration::from_secs(10);
+        stack.push_user(7, "mundo", later);
+
+        assert_eq!(stack.len(), 1, "el fragmento no debe duplicar la burbuja");
+        let bubble = stack.bubbles.front().unwrap();
+        assert_eq!(bubble.text, "hola mundo");
+        assert_eq!(bubble.sealed_at, Some(later), "el TTL debe renovarse");
+        assert!(bubble.evicted_at.is_none());
+
+        // El TTL renovado la mantiene viva aunque el original ya habría vencido.
+        let ttl = bubble_ttl(bubble.text.chars().count());
+        let before_expiry = later + ttl - Duration::from_millis(1);
+        assert!(!stack.is_animating(before_expiry));
+        stack.gc(before_expiry);
+        assert_eq!(stack.len(), 1, "el TTL renovado debe mantenerla viva");
     }
 
     #[test]
