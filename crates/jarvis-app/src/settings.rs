@@ -766,4 +766,20 @@ mod tests {
         assert!(UNIFIED_SETTINGS_SCRIPT
             .contains("\"fullscreen_behavior\": self.fullscreen_combo.currentData()"));
     }
+    #[test]
+    fn unified_settings_script_toggles_the_hud() {
+        assert!(UNIFIED_SETTINGS_SCRIPT.contains("\"hud_enabled\": True"));
+        assert!(UNIFIED_SETTINGS_SCRIPT.contains("Mostrar burbujas de conversación (HUD)"));
+        assert!(
+            UNIFIED_SETTINGS_SCRIPT.contains("\"hud_enabled\": bool(self.hud_check.isChecked())")
+        );
+        // La clave coincide con la del núcleo y su default.
+        let path =
+            std::env::temp_dir().join(format!("jarvis-hud-toggle-{}.toml", std::process::id()));
+        std::fs::write(&path, "hud_enabled = false\n").unwrap();
+        let config = jarvis_core::JarvisConfig::load_from(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!config.hud_enabled());
+        assert!(jarvis_core::JarvisConfig::default().hud_enabled());
+    }
 }

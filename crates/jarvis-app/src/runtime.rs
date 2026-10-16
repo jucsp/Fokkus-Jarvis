@@ -17,6 +17,7 @@ use jarvis_core::{AudioLevel, JarvisConfig, JarvisState, Opacity};
 use jarvis_render::{OpacityFade, Pixmap, RenderError, SphereRenderer};
 use jarvis_shell::{FrameBuffer, OverlaySurface, ShellCommand, SurfaceSize, SurfaceStatus};
 
+use crate::hud::{HudFrame, HudPipeline, HudSettings};
 use crate::presence::{FullscreenMonitor, FullscreenSettings, PresenceDirective};
 
 /// Intervalo entre frames en estados activos (60 FPS).
@@ -93,6 +94,8 @@ pub struct SphereLook {
     pub opacity: Opacity,
     /// Reacción a ventanas a pantalla completa (HU-35).
     pub fullscreen: FullscreenSettings,
+    /// Burbujas de conversación (HU-36).
+    pub hud: HudSettings,
 }
 
 impl SphereLook {
@@ -102,6 +105,7 @@ impl SphereLook {
             size: config.sphere_size_px(),
             opacity: config.sphere_opacity(),
             fullscreen: FullscreenSettings::from_config(config),
+            hud: HudSettings::from_config(config),
         }
     }
 }
@@ -201,6 +205,8 @@ impl ErrorOnce {
 /// máximo un cambio de tamaño por frame y la opacidad con un fundido de
 /// [`OPACITY_FADE`]. `presence` (HU-35) multiplica esa opacidad por el factor
 /// de pantalla completa u oculta la superficie tras fundirla a transparente.
+/// `hud` (HU-36) drena los eventos del orquestador y presenta las burbujas en
+/// su propia capa solo cuando cambian o animan.
 /// `on_first_frame` se invoca una vez tras presentar el primer frame. "Salir"
 /// en el menú contextual termina el bucle; el resto de acciones se entregan a
 /// `on_command`.
@@ -214,6 +220,7 @@ pub fn run_loop(
     reset_position: &AtomicBool,
     max_frames: Option<u64>,
     mut presence: Option<&mut FullscreenMonitor>,
+    mut hud: Option<&mut HudPipeline>,
     on_first_frame: &mut dyn FnMut(),
     on_command: &mut CommandHandler<'_>,
 ) -> LoopExit {
@@ -312,6 +319,18 @@ pub fn run_loop(
                 }
                 Err((kind, e)) => errors.report(kind, &e),
             }
+        }
+        if let Some(hud) = hud.as_deref_mut() {
+            // Con la esfera atenuada/oculta fuera de un turno, o en silencio,
+            // no aparecen globos nuevos (CA-36.7).
+            let quiet = !matches!(directive, PresenceDirective::Normal)
+                && !matches!(state, JarvisState::Thinking | JarvisState::Speaking);
+            let frame = HudFrame {
+                settings: target.hud,
+                suppress_new: quiet || state == JarvisState::Muted,
+                text_alpha: fade.value_at(now),
+            };
+            hud.frame(surface, frame, now);
         }
         clock.advance(now, state);
     }
@@ -584,6 +603,7 @@ mod tests {
             size,
             opacity: Opacity::OPAQUE,
             fullscreen: FullscreenSettings::default(),
+            hud: HudSettings::default(),
         })
     }
 
@@ -601,6 +621,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(5),
+            None,
             None,
             &mut || first += 1,
             &mut |_| {},
@@ -631,6 +652,7 @@ mod tests {
             &mut || (JarvisState::Idle, 0.0),
             &shutdown,
             &AtomicBool::new(false),
+            None,
             None,
             None,
             &mut || {},
@@ -664,6 +686,7 @@ mod tests {
             &AtomicBool::new(false),
             None,
             None,
+            None,
             &mut || {},
             &mut |command| handled.push(command),
         );
@@ -684,6 +707,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(1),
+            None,
             None,
             &mut || {},
             &mut |_| {},
@@ -716,6 +740,7 @@ mod tests {
                         size,
                         opacity: Opacity::from_pct(60),
                         fullscreen: FullscreenSettings::default(),
+                        hud: HudSettings::default(),
                     });
                 }
             }
@@ -729,6 +754,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(3),
+            None,
             None,
             &mut || {},
             &mut |_| {},
@@ -748,6 +774,7 @@ mod tests {
             size: 32,
             opacity: Opacity::OPAQUE,
             fullscreen: FullscreenSettings::default(),
+            hud: HudSettings::default(),
         };
         let mut view = SphereView::new(32).unwrap();
         let mut surface = headless(&view);
@@ -755,6 +782,7 @@ mod tests {
             size: 48,
             opacity: Opacity::from_pct(30),
             fullscreen: FullscreenSettings::default(),
+            hud: HudSettings::default(),
         });
         let shutdown = AtomicBool::new(false);
         let mut frames = 0;
@@ -774,6 +802,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(2),
+            None,
             None,
             &mut || {},
             &mut |_| {},
@@ -833,6 +862,7 @@ mod tests {
             size: 32,
             opacity: Opacity::OPAQUE,
             fullscreen,
+            hud: HudSettings::default(),
         });
         let mut monitor = FullscreenMonitor::start(1, fullscreen, fullscreen_watcher);
         // 60 FPS: suficientes frames para cruzar histéresis + fundido.
@@ -845,10 +875,57 @@ mod tests {
             &AtomicBool::new(false),
             Some(frames),
             Some(&mut monitor),
+            None,
             &mut || {},
             &mut |_| {},
         );
         surface
+    }
+
+    #[test]
+    fn loop_drives_the_hud_only_when_there_are_bubbles() {
+        let mut view = SphereView::new(32).unwrap();
+        let mut surface = headless(&view);
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        let mut hud = HudPipeline::new(rx);
+        let shutdown = AtomicBool::new(false);
+        // Sin eventos: la capa existe pero no presenta (CA-36.9).
+        run_loop(
+            &mut surface,
+            &mut view,
+            &look(32),
+            &mut || (JarvisState::Listening, 0.0),
+            &shutdown,
+            &AtomicBool::new(false),
+            Some(5),
+            None,
+            Some(&mut hud),
+            &mut || {},
+            &mut |_| {},
+        );
+        assert!(surface.hud_layer().is_some(), "HUD habilitado por defecto");
+        assert_eq!(surface.hud_presented_frames(), 0);
+
+        tx.send(jarvis_audio::HudEvent::UserSaid {
+            turn: 1,
+            text: "qué hora es".into(),
+        })
+        .unwrap();
+        run_loop(
+            &mut surface,
+            &mut view,
+            &look(32),
+            &mut || (JarvisState::Thinking, 0.0),
+            &shutdown,
+            &AtomicBool::new(false),
+            Some(3),
+            None,
+            Some(&mut hud),
+            &mut || {},
+            &mut |_| {},
+        );
+        assert!(surface.hud_presented_frames() >= 1);
+        assert!(surface.hud_layer().unwrap().is_visible());
     }
 
     #[test]

@@ -4,9 +4,70 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::{
-    Anchor, FrameBuffer, Opacity, OverlaySurface, ShellCommand, SurfaceBackend, SurfaceError,
-    SurfaceSize, SurfaceStatus,
+    Anchor, FrameBuffer, HudSurface, Opacity, OverlaySurface, ShellCommand, SurfaceBackend,
+    SurfaceError, SurfaceSize, SurfaceStatus,
 };
+
+/// Capa de HUD simulada: valida los frames y cuenta los presentados (HU-36).
+#[derive(Debug, Clone)]
+pub struct HeadlessHud {
+    size: SurfaceSize,
+    visible: bool,
+    presented: u64,
+}
+
+impl HeadlessHud {
+    fn new() -> Self {
+        Self {
+            size: SurfaceSize {
+                width: 1,
+                height: 1,
+            },
+            visible: false,
+            presented: 0,
+        }
+    }
+
+    /// Frames del HUD presentados correctamente.
+    pub fn presented_frames(&self) -> u64 {
+        self.presented
+    }
+
+    /// Si la capa está visible.
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+}
+
+impl HudSurface for HeadlessHud {
+    fn set_size(&mut self, size: SurfaceSize) -> Result<(), SurfaceError> {
+        self.size = size;
+        Ok(())
+    }
+
+    fn size(&self) -> SurfaceSize {
+        self.size
+    }
+
+    fn present(&mut self, frame: &FrameBuffer<'_>) -> Result<(), SurfaceError> {
+        let expected = self.size.pixel_count() * 4;
+        if frame.width != self.size.width
+            || frame.height != self.size.height
+            || frame.data.len() != expected
+        {
+            return Err(SurfaceError::InvalidFrame {
+                expected,
+                actual: frame.data.len(),
+            });
+        }
+        self.presented += 1;
+        Ok(())
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        self.visible = visible;
+    }
+}
 
 /// Superficie que valida los frames sin abrir una ventana real.
 ///
@@ -20,6 +81,9 @@ pub struct HeadlessSurface {
     commands: VecDeque<ShellCommand>,
     muted: bool,
     opacity: Opacity,
+    hud: Option<HeadlessHud>,
+    /// Frames de HUD presentados en capas ya destruidas (para los tests).
+    hud_presented_total: u64,
 }
 
 impl HeadlessSurface {
@@ -32,7 +96,19 @@ impl HeadlessSurface {
             commands: VecDeque::new(),
             muted: false,
             opacity: Opacity::OPAQUE,
+            hud: None,
+            hud_presented_total: 0,
         }
+    }
+
+    /// Capa de HUD simulada, si está creada.
+    pub fn hud_layer(&self) -> Option<&HeadlessHud> {
+        self.hud.as_ref()
+    }
+
+    /// Frames de HUD presentados en total (incluye capas ya destruidas).
+    pub fn hud_presented_frames(&self) -> u64 {
+        self.hud_presented_total + self.hud.as_ref().map_or(0, |h| h.presented)
     }
 
     /// Encola una acción como si el usuario la eligiera en el menú (tests).
@@ -122,6 +198,22 @@ impl OverlaySurface for HeadlessSurface {
     fn set_opacity(&mut self, opacity: Opacity) {
         self.opacity = opacity;
     }
+
+    fn set_hud_enabled(&mut self, enabled: bool) {
+        match (enabled, self.hud.is_some()) {
+            (true, false) => self.hud = Some(HeadlessHud::new()),
+            (false, true) => {
+                if let Some(hud) = self.hud.take() {
+                    self.hud_presented_total += hud.presented;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn hud(&mut self) -> Option<&mut dyn HudSurface> {
+        self.hud.as_mut().map(|hud| hud as &mut dyn HudSurface)
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +263,28 @@ mod tests {
         assert_eq!(surface.opacity(), Opacity::OPAQUE);
         surface.set_opacity(Opacity::from_pct(40));
         assert_eq!(surface.opacity(), Opacity::from_pct(40));
+    }
+
+    #[test]
+    fn headless_hud_is_created_validated_and_destroyed() {
+        let mut surface = HeadlessSurface::new(SurfaceSize::new(2, 2).unwrap());
+        assert!(surface.hud().is_none(), "sin habilitar no hay capa");
+        surface.set_hud_enabled(true);
+        let hud = surface.hud().expect("capa creada");
+        hud.set_size(SurfaceSize::new(3, 2).unwrap()).unwrap();
+        hud.set_visible(true);
+        let data = [0u8; 3 * 2 * 4];
+        assert!(hud.present(&FrameBuffer::new(&data, 3, 2).unwrap()).is_ok());
+        let wrong = [0u8; 2 * 2 * 4];
+        assert!(hud
+            .present(&FrameBuffer::new(&wrong, 2, 2).unwrap())
+            .is_err());
+        assert!(surface.hud_layer().unwrap().is_visible());
+        assert_eq!(surface.hud_presented_frames(), 1);
+
+        surface.set_hud_enabled(false);
+        assert!(surface.hud().is_none());
+        assert_eq!(surface.hud_presented_frames(), 1);
     }
 
     #[test]

@@ -21,7 +21,7 @@ pub mod menu;
 mod wayland_layer;
 pub mod window_watch;
 
-pub use headless::HeadlessSurface;
+pub use headless::{HeadlessHud, HeadlessSurface};
 pub use menu::{ContextMenu, MenuItem};
 #[cfg(target_os = "linux")]
 pub use wayland_layer::{anchor_to_layer, WaylandLayerSurface};
@@ -209,6 +209,31 @@ pub enum ShellCommand {
     Quit,
 }
 
+/// Capa del HUD de burbujas de conversación (HU-36).
+///
+/// Es una segunda superficie, anclada junto a la esfera y totalmente
+/// *click-through* (región de entrada vacía). Se presenta solo cuando hay
+/// globos que mostrar; sin globos se oculta y no consume frames.
+pub trait HudSurface {
+    /// Cambia el tamaño de la capa. Los frames siguientes deben medir esto.
+    fn set_size(&mut self, size: SurfaceSize) -> Result<(), SurfaceError>;
+
+    /// Tamaño actual de la capa.
+    fn size(&self) -> SurfaceSize;
+
+    /// `true` si la capa puede presentar ahora (configurada, visible y sin
+    /// frame pendiente). Si es `false`, `present` descarta el frame.
+    fn wants_frame(&self) -> bool {
+        true
+    }
+
+    /// Presenta un frame RGBA premultiplicado del tamaño actual.
+    fn present(&mut self, frame: &FrameBuffer<'_>) -> Result<(), SurfaceError>;
+
+    /// Muestra u oculta la capa.
+    fn set_visible(&mut self, visible: bool);
+}
+
 /// Contrato que debe cumplir cualquier backend de ventana flotante.
 pub trait OverlaySurface {
     /// Backend efectivo de la superficie (para el log y `--check`).
@@ -266,6 +291,15 @@ pub trait OverlaySurface {
     /// Nombre del output (monitor) donde está la superficie, si se conoce
     /// (HU-35: la directiva de pantalla completa solo aplica en ese monitor).
     fn current_output(&self) -> Option<String> {
+        None
+    }
+
+    /// Crea (`true`) o destruye (`false`) la capa del HUD (HU-36). Al
+    /// destruirla se liberan sus buffers. Sin soporte no hace nada.
+    fn set_hud_enabled(&mut self, _enabled: bool) {}
+
+    /// Capa del HUD, si está creada y el backend la soporta.
+    fn hud(&mut self) -> Option<&mut dyn HudSurface> {
         None
     }
 }

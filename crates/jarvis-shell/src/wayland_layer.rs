@@ -9,6 +9,10 @@
 //! reposiciona la capa ajustando sus márgenes; el clic derecho emite
 //! [`ShellCommand::QuickPanel`] para que la aplicación abra el Panel Rápido
 //! (PyQt6) en lugar del antiguo menú nativo.
+//!
+//! HUD (HU-36): una segunda capa overlay en la misma conexión muestra las
+//! burbujas de conversación junto a la esfera. Su región de entrada es vacía
+//! (100 % *click-through*) y solo se mapea mientras hay globos.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -36,13 +40,22 @@ use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 
 use crate::{
-    rgba_premul_to_argb8888_with_alpha, Anchor, FrameBuffer, KeyboardInteractivity, Opacity,
-    OverlayOptions, OverlaySurface, ShellCommand, SurfaceBackend, SurfaceError, SurfaceSize,
-    SurfaceStatus,
+    rgba_premul_to_argb8888_with_alpha, Anchor, FrameBuffer, HudSurface, KeyboardInteractivity,
+    Opacity, OverlayOptions, OverlaySurface, ShellCommand, SurfaceBackend, SurfaceError,
+    SurfaceSize, SurfaceStatus,
 };
 
 /// Namespace de la capa (lo usan los compositores para reglas por app).
 const LAYER_NAMESPACE: &str = "fokkus-jarvis";
+
+/// Namespace de la capa del HUD (HU-36).
+const HUD_NAMESPACE: &str = "fokkus-jarvis-hud";
+
+/// Separación (px) entre la esfera y el HUD.
+const HUD_GAP: i32 = 8;
+
+/// Salida supuesta mientras el compositor no informa la real.
+const FALLBACK_OUTPUT: (i32, i32) = (1920, 1080);
 
 /// Número de buffers `wl_shm` reutilizados (doble buffer).
 const BUFFER_COUNT: usize = 2;
@@ -155,6 +168,195 @@ fn circle_strips(size: SurfaceSize) -> Vec<(i32, i32, i32, i32)> {
     strips
 }
 
+/// Datos de la esfera con los que se coloca el HUD (HU-36).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct HudPlacement {
+    anchor: Anchor,
+    /// Márgenes actuales de la esfera (incluyen el arrastre).
+    sphere_margins: Margins,
+    sphere: SurfaceSize,
+    output: Option<(i32, i32)>,
+}
+
+/// Anclaje y márgenes del HUD para que quede pegado a la esfera.
+///
+/// Esfera anclada abajo: el HUD va **encima**; anclada arriba: **debajo**. Si
+/// no cabe en ese lado se pasa al opuesto y, si tampoco, se satura dentro de
+/// la salida. En horizontal se alinea con el borde anclado de la esfera sin
+/// salirse de la salida. `Center` ancla solo arriba (el compositor centra en
+/// horizontal) y deja el HUD encima de la esfera centrada.
+fn hud_layout(p: &HudPlacement, hud: SurfaceSize) -> (wlr_layer::Anchor, Margins) {
+    let edges = anchor_to_layer(p.anchor);
+    let (out_w, out_h) = p.output.unwrap_or(FALLBACK_OUTPUT);
+    let sphere_h = i32::try_from(p.sphere.height).unwrap_or(i32::MAX);
+    let hud_w = i32::try_from(hud.width).unwrap_or(i32::MAX);
+    let hud_h = i32::try_from(hud.height).unwrap_or(i32::MAX);
+    let max_x = (out_w - hud_w).max(0);
+    let max_y = (out_h - hud_h).max(0);
+    let (top, right, bottom, left) = p.sphere_margins;
+
+    if edges.is_empty() {
+        let above = (out_h - sphere_h) / 2 - HUD_GAP - hud_h;
+        return (wlr_layer::Anchor::TOP, (above.clamp(0, max_y), 0, 0, 0));
+    }
+
+    // Distancia al borde anclado: primero el lado preferido y, si no cabe,
+    // el opuesto (la esfera ocupa `[edge, edge + sphere_h)`).
+    let place = |edge: i32| {
+        let preferred = edge.saturating_add(sphere_h).saturating_add(HUD_GAP);
+        if preferred <= max_y {
+            preferred
+        } else {
+            let opposite = edge - HUD_GAP - hud_h;
+            if opposite >= 0 {
+                opposite
+            } else {
+                preferred.clamp(0, max_y)
+            }
+        }
+    };
+    let mut margins = (0, 0, 0, 0);
+    if edges.contains(wlr_layer::Anchor::BOTTOM) {
+        margins.2 = place(bottom);
+    } else if edges.contains(wlr_layer::Anchor::TOP) {
+        margins.0 = place(top);
+    }
+    if edges.contains(wlr_layer::Anchor::RIGHT) {
+        margins.1 = right.clamp(0, max_x);
+    } else if edges.contains(wlr_layer::Anchor::LEFT) {
+        margins.3 = left.clamp(0, max_x);
+    }
+    (edges, margins)
+}
+
+/// Capa overlay del HUD de burbujas (HU-36): sin entrada y sin teclado.
+struct HudLayer {
+    layer: LayerSurface,
+    pool: SlotPool,
+    buffers: Vec<Buffer>,
+    size: SurfaceSize,
+    placement: HudPlacement,
+    configured: bool,
+    frame_pending: bool,
+    visible: bool,
+    conn: Connection,
+    qh: QueueHandle<LayerState>,
+}
+
+impl HudLayer {
+    /// Aplica anclaje y márgenes según la esfera (sin commit).
+    fn reposition(&self) {
+        let (anchor, (top, right, bottom, left)) = hud_layout(&self.placement, self.size);
+        self.layer.set_anchor(anchor);
+        self.layer.set_margin(top, right, bottom, left);
+    }
+
+    fn free_buffer(&mut self) -> Result<Option<usize>, SurfaceError> {
+        for (i, buffer) in self.buffers.iter().enumerate() {
+            if buffer.canvas(&mut self.pool).is_some() {
+                return Ok(Some(i));
+            }
+        }
+        if self.buffers.len() >= BUFFER_COUNT {
+            return Ok(None);
+        }
+        let width = i32::try_from(self.size.width).map_err(backend_error)?;
+        let height = i32::try_from(self.size.height).map_err(backend_error)?;
+        let (buffer, _) = self
+            .pool
+            .create_buffer(width, height, width * 4, wl_shm::Format::Argb8888)
+            .map_err(backend_error)?;
+        self.buffers.push(buffer);
+        Ok(Some(self.buffers.len() - 1))
+    }
+}
+
+impl HudSurface for HudLayer {
+    /// Cambia el tamaño sin esperar al compositor: mientras llega el
+    /// `configure` los frames se descartan ([`HudSurface::wants_frame`]).
+    fn set_size(&mut self, size: SurfaceSize) -> Result<(), SurfaceError> {
+        if size == self.size {
+            return Ok(());
+        }
+        self.size = size;
+        self.buffers.clear();
+        let needed = size.pixel_count() * 4 * BUFFER_COUNT;
+        if self.pool.len() < needed {
+            self.pool.resize(needed).map_err(backend_error)?;
+        }
+        self.layer.set_size(size.width, size.height);
+        self.reposition();
+        if self.visible {
+            self.configured = false;
+            self.frame_pending = false;
+            self.layer.commit();
+            self.conn.flush().map_err(backend_error)?;
+        }
+        Ok(())
+    }
+
+    fn size(&self) -> SurfaceSize {
+        self.size
+    }
+
+    fn wants_frame(&self) -> bool {
+        self.configured && self.visible && !self.frame_pending
+    }
+
+    fn present(&mut self, frame: &FrameBuffer<'_>) -> Result<(), SurfaceError> {
+        let size = self.size;
+        let expected = size.pixel_count() * 4;
+        if frame.width != size.width || frame.height != size.height || frame.data.len() != expected
+        {
+            return Err(SurfaceError::InvalidFrame {
+                expected,
+                actual: frame.data.len(),
+            });
+        }
+        if !self.wants_frame() {
+            return Ok(());
+        }
+        let Some(index) = self.free_buffer()? else {
+            return Ok(());
+        };
+        let buffer = &self.buffers[index];
+        let canvas = buffer
+            .canvas(&mut self.pool)
+            .ok_or_else(|| SurfaceError::Backend("buffer wl_shm del HUD ocupado".to_string()))?;
+        // La opacidad ya viene aplicada en el render del HUD.
+        rgba_premul_to_argb8888_with_alpha(frame.data, canvas, Opacity::OPAQUE)?;
+
+        let surface = self.layer.wl_surface().clone();
+        let width = i32::try_from(size.width).map_err(backend_error)?;
+        let height = i32::try_from(size.height).map_err(backend_error)?;
+        buffer.attach_to(&surface).map_err(backend_error)?;
+        surface.damage_buffer(0, 0, width, height);
+        surface.frame(&self.qh, FrameCallbackData(surface.clone()));
+        self.layer.commit();
+        self.frame_pending = true;
+        self.conn.flush().map_err(backend_error)?;
+        Ok(())
+    }
+
+    fn set_visible(&mut self, visible: bool) {
+        if visible == self.visible {
+            return;
+        }
+        self.visible = visible;
+        if visible {
+            // Mapear exige un commit sin buffer y esperar el `configure`.
+            self.configured = false;
+            self.frame_pending = false;
+            self.layer.set_size(self.size.width, self.size.height);
+            self.reposition();
+        } else {
+            self.layer.wl_surface().attach(None, 0, 0);
+        }
+        self.layer.commit();
+        let _ = self.conn.flush();
+    }
+}
+
 /// Gesto del puntero en curso sobre la esfera.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct DragGesture {
@@ -235,11 +437,44 @@ struct LayerState {
     opacity: Opacity,
     /// Ya se avisó de un `configure` que no llegó tras redimensionar.
     resize_timeout_logged: bool,
+    /// Capa del HUD de burbujas (HU-36); `None` si está desactivado.
+    hud: Option<HudLayer>,
 }
 
 impl LayerState {
     fn surface(&self) -> &wl_surface::WlSurface {
         self.layer.wl_surface()
+    }
+
+    /// `true` si `surface` es la del HUD.
+    fn is_hud(&self, surface: &wl_surface::WlSurface) -> bool {
+        self.hud
+            .as_ref()
+            .is_some_and(|hud| hud.layer.wl_surface() == surface)
+    }
+
+    fn hud_placement(&self) -> HudPlacement {
+        HudPlacement {
+            anchor: self.anchor,
+            sphere_margins: self.margins,
+            sphere: self.size,
+            output: self.output_size,
+        }
+    }
+
+    /// Recoloca el HUD tras mover, redimensionar o re-anclar la esfera.
+    fn sync_hud(&mut self) {
+        let placement = self.hud_placement();
+        if let Some(hud) = &mut self.hud {
+            if hud.placement == placement {
+                return;
+            }
+            hud.placement = placement;
+            hud.reposition();
+            if hud.visible {
+                hud.layer.commit();
+            }
+        }
     }
 
     /// Región de entrada circular: la esfera recibe los clics y las esquinas
@@ -259,6 +494,7 @@ impl LayerState {
         self.margins = margins_for(anchor, margin);
         self.layer.set_anchor(anchor_to_layer(anchor));
         self.apply_margins();
+        self.sync_hud();
     }
 
     fn apply_margins(&self) {
@@ -298,6 +534,7 @@ impl LayerState {
         self.layer.set_size(size.width, size.height);
         self.apply_sphere_input_region()?;
         self.clamp_margins();
+        self.sync_hud();
         Ok(())
     }
 
@@ -308,6 +545,7 @@ impl LayerState {
             self.margins = next;
             self.apply_margins();
             self.layer.commit();
+            self.sync_hud();
         }
     }
 
@@ -352,22 +590,39 @@ impl CompositorHandler for LayerState {
     ) {
     }
 
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
-        self.frame_pending = false;
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if self.is_hud(surface) {
+            if let Some(hud) = &mut self.hud {
+                hud.frame_pending = false;
+            }
+        } else {
+            self.frame_pending = false;
+        }
     }
 
     fn surface_enter(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
+        // Solo cuenta la salida de la esfera (el HUD la sigue).
+        if surface != self.layer.wl_surface() {
+            return;
+        }
         let info = self.output.info(output);
         self.output_size = info.as_ref().and_then(|info| info.logical_size);
         if let Some(name) = info.and_then(|info| info.name) {
             self.output_name = Some(name);
         }
+        self.sync_hud();
     }
 
     fn surface_leave(
@@ -381,7 +636,13 @@ impl CompositorHandler for LayerState {
 }
 
 impl LayerShellHandler for LayerState {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if self.is_hud(layer.wl_surface()) {
+            // Cerrar el HUD no cierra la esfera: se sigue sin burbujas.
+            eprintln!("[shell] el compositor cerró la capa del HUD");
+            self.hud = None;
+            return;
+        }
         self.closed = true;
     }
 
@@ -389,10 +650,18 @@ impl LayerShellHandler for LayerState {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _: u32,
     ) {
+        if self.is_hud(layer.wl_surface()) {
+            // El tamaño del HUD lo fija la app; solo se marca configurado.
+            if let Some(hud) = &mut self.hud {
+                hud.configured = true;
+                hud.frame_pending = false;
+            }
+            return;
+        }
         let (w, h) = configure.new_size;
         let proposed_other = w != 0 && h != 0 && (w, h) != (self.size.width, self.size.height);
         if proposed_other && !self.size_mismatch_logged {
@@ -544,6 +813,8 @@ pub struct WaylandLayerSurface {
     qh: QueueHandle<LayerState>,
     state: LayerState,
     options: OverlayOptions,
+    /// Para crear la capa del HUD bajo demanda (HU-36).
+    layer_shell: LayerShell,
 }
 
 impl WaylandLayerSurface {
@@ -610,6 +881,7 @@ impl WaylandLayerSurface {
             size_mismatch_logged: false,
             opacity: Opacity::OPAQUE,
             resize_timeout_logged: false,
+            hud: None,
         };
         state.apply_anchor(options.anchor, options.margin);
         state.apply_sphere_input_region()?;
@@ -623,7 +895,46 @@ impl WaylandLayerSurface {
             qh,
             state,
             options,
+            layer_shell,
         })
+    }
+
+    /// Crea la capa del HUD sin mapearla (se mapea en `set_visible(true)`).
+    fn create_hud(&mut self) -> Result<HudLayer, SurfaceError> {
+        let size = SurfaceSize {
+            width: 1,
+            height: 1,
+        };
+        let pool = SlotPool::new(size.pixel_count() * 4 * BUFFER_COUNT, &self.state.shm)
+            .map_err(backend_error)?;
+        let surface = self.state.compositor.create_surface(&self.qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &self.qh,
+            surface,
+            Layer::Overlay,
+            Some(HUD_NAMESPACE),
+            None,
+        );
+        layer.set_size(size.width, size.height);
+        layer.set_exclusive_zone(0);
+        layer.set_keyboard_interactivity(wlr_layer::KeyboardInteractivity::None);
+        // Región de entrada vacía: todos los clics pasan a la ventana de abajo.
+        let region = Region::new(&self.state.compositor).map_err(backend_error)?;
+        layer.set_input_region(Some(region.wl_region()));
+        let hud = HudLayer {
+            layer,
+            pool,
+            buffers: Vec::with_capacity(BUFFER_COUNT),
+            size,
+            placement: self.state.hud_placement(),
+            configured: false,
+            frame_pending: false,
+            visible: false,
+            conn: self.conn.clone(),
+            qh: self.qh.clone(),
+        };
+        hud.reposition();
+        Ok(hud)
     }
 
     /// Si ya se recibió el primer `configure`.
@@ -806,6 +1117,30 @@ impl OverlaySurface for WaylandLayerSurface {
     fn current_output(&self) -> Option<String> {
         self.state.output_name.clone()
     }
+
+    fn set_hud_enabled(&mut self, enabled: bool) {
+        if !enabled {
+            // Soltar la capa destruye la superficie y libera sus buffers.
+            if self.state.hud.take().is_some() {
+                let _ = self.conn.flush();
+            }
+            return;
+        }
+        if self.state.hud.is_some() {
+            return;
+        }
+        match self.create_hud() {
+            Ok(hud) => self.state.hud = Some(hud),
+            Err(e) => eprintln!("[shell] no se pudo crear la capa del HUD: {e}"),
+        }
+    }
+
+    fn hud(&mut self) -> Option<&mut dyn HudSurface> {
+        self.state
+            .hud
+            .as_mut()
+            .map(|hud| hud as &mut dyn HudSurface)
+    }
 }
 
 /// Comprueba que el compositor ofrece los globals necesarios sin crear la capa.
@@ -969,6 +1304,59 @@ mod tests {
             ),
             (0, 12, 12, 0)
         );
+    }
+
+    fn placement(anchor: Anchor, margins: Margins) -> HudPlacement {
+        HudPlacement {
+            anchor,
+            sphere_margins: margins,
+            sphere: SurfaceSize::new(220, 220).unwrap(),
+            output: Some((1920, 1080)),
+        }
+    }
+
+    #[test]
+    fn hud_sits_above_a_bottom_anchored_sphere() {
+        use wlr_layer::Anchor as L;
+        let hud = SurfaceSize::new(320, 100).unwrap();
+        let (anchor, margins) = hud_layout(&placement(Anchor::BottomRight, (0, 12, 12, 0)), hud);
+        assert_eq!(anchor, L::BOTTOM | L::RIGHT);
+        // 12 de margen + 220 de esfera + 8 de separación.
+        assert_eq!(margins, (0, 12, 240, 0));
+    }
+
+    #[test]
+    fn hud_sits_below_a_top_anchored_sphere() {
+        let hud = SurfaceSize::new(320, 100).unwrap();
+        let (_, margins) = hud_layout(&placement(Anchor::TopLeft, (8, 0, 0, 8)), hud);
+        assert_eq!(margins, (236, 0, 0, 8));
+    }
+
+    #[test]
+    fn hud_flips_side_when_it_does_not_fit() {
+        // Esfera arrastrada arriba del todo estando anclada abajo: no cabe
+        // encima, así que el HUD pasa debajo de la esfera.
+        let hud = SurfaceSize::new(320, 200).unwrap();
+        let (_, margins) = hud_layout(&placement(Anchor::BottomRight, (0, 12, 850, 0)), hud);
+        assert_eq!(margins.2, 850 - HUD_GAP - 200);
+    }
+
+    #[test]
+    fn hud_stays_inside_the_output_horizontally() {
+        // Esfera de 220 px pegada al borde izquierdo con anclaje derecho: el
+        // HUD de 320 px no puede usar el mismo margen derecho.
+        let hud = SurfaceSize::new(320, 100).unwrap();
+        let (_, margins) = hud_layout(&placement(Anchor::BottomRight, (0, 1700, 12, 0)), hud);
+        assert_eq!(margins.1, 1920 - 320);
+    }
+
+    #[test]
+    fn hud_over_a_centered_sphere_anchors_only_top() {
+        use wlr_layer::Anchor as L;
+        let hud = SurfaceSize::new(320, 100).unwrap();
+        let (anchor, margins) = hud_layout(&placement(Anchor::Center, (0, 0, 0, 0)), hud);
+        assert_eq!(anchor, L::TOP);
+        assert_eq!(margins, ((1080 - 220) / 2 - HUD_GAP - 100, 0, 0, 0));
     }
 
     #[test]

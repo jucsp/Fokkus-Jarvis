@@ -50,7 +50,7 @@ pub use dsp::{
     spawn_dsp_thread, ConnectorSignal, DspError, DspHandle, DspMetrics, DspMetricsSnapshot,
     DspThreadConfig, LatencyProbe, ProcessorConfig,
 };
-pub use events::{Segment, VoiceEvent};
+pub use events::{HudEvent, Segment, TurnId, VoiceEvent};
 pub use io::{
     AudioEngine, AudioError, AudioMetrics, AudioMetricsSnapshot, EngineConfig, EngineStatus,
     PlayOutcome, Player,

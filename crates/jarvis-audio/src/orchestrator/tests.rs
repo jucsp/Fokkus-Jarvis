@@ -213,6 +213,7 @@ struct Harness {
     activation: Arc<ActivationDetector>,
     playback: AudioPlayback,
     cache: PathBuf,
+    hud: Receiver<HudEvent>,
 }
 
 impl Drop for Harness {
@@ -294,6 +295,7 @@ fn harness_full(
     });
     let activation = Arc::new(ActivationDetector::new());
     let (events_tx, events_rx) = crossbeam_channel::unbounded();
+    let (hud_tx, hud_rx) = crossbeam_channel::bounded(64);
     let deps = VoiceDeps {
         core: core.clone(),
         playback: playback.clone(),
@@ -304,6 +306,7 @@ fn harness_full(
         brain: brain.map(|b| b as Arc<dyn TokenStream + Send + Sync>),
         activation: Arc::clone(&activation),
         factory,
+        hud: Some(hud_tx),
     };
     let orchestrator = VoiceOrchestrator::start(deps, config).expect("hilos");
     orchestrator.set_transcriber(Box::new(ScriptTranscriber));
@@ -316,6 +319,7 @@ fn harness_full(
         activation,
         playback,
         cache,
+        hud: hud_rx,
     };
     h.wait_state(JarvisState::Listening);
     h
@@ -1183,4 +1187,123 @@ fn local_command_recognizes_task_commands() {
         local_command("¿qué tareas tengo?"),
         Some(LocalCommand::ListTasks)
     );
+}
+
+// ------------------------------------------------------------- HUD (HU-36)
+
+impl Harness {
+    /// Eventos del HUD recibidos hasta que `last` devuelve `true` (o timeout).
+    fn hud_until(&self, mut last: impl FnMut(&HudEvent) -> bool) -> Vec<HudEvent> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut seen = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let event = self
+                .hud
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("timeout esperando evento del HUD; vistos: {seen:?}"));
+            let done = last(&event);
+            seen.push(event);
+            if done {
+                return seen;
+            }
+        }
+    }
+}
+
+#[test]
+fn hud_turn_emits_user_said_phrases_and_done_in_order() {
+    let brain = FakeBrain::new("Hoy está despejado. Máxima de veinte grados.");
+    let h = harness("hud-turno", Some(brain), fast());
+
+    h.say_line(1); // "Jarvis, ¿qué tal el clima?"
+    let events = h.hud_until(|e| matches!(e, HudEvent::JarvisDone { .. }));
+
+    let HudEvent::UserSaid { turn, text } = &events[0] else {
+        panic!("el primer evento debe ser UserSaid: {events:?}");
+    };
+    assert_eq!(text, "¿qué tal el clima?", "sin el vocativo (CA-36.1)");
+    let phrases: Vec<&str> = events[1..events.len() - 1]
+        .iter()
+        .map(|e| match e {
+            HudEvent::JarvisPhrase { turn: t, text } if t == turn => text.as_str(),
+            other => panic!("se esperaba JarvisPhrase del turno {turn}: {other:?}"),
+        })
+        .collect();
+    assert!(phrases.len() >= 2, "una frase por locución: {phrases:?}");
+    assert_eq!(events.last(), Some(&HudEvent::JarvisDone { turn: *turn }));
+}
+
+#[test]
+fn hud_local_command_is_captioned_as_the_turn_reply() {
+    let h = harness("hud-local", None, fast());
+    h.say_line(4); // "Jarvis, qué hora es"
+    let events = h.hud_until(|e| matches!(e, HudEvent::JarvisDone { .. }));
+    assert!(matches!(&events[0], HudEvent::UserSaid { text, .. } if text == "qué hora es"));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, HudEvent::JarvisPhrase { text, .. } if text.contains(':'))),
+        "la hora se subtitula como respuesta: {events:?}"
+    );
+}
+
+#[test]
+fn hud_barge_in_emits_jarvis_interrupted() {
+    let brain = FakeBrain::new("x");
+    brain.set_reply(
+        "Mañana llueve por la mañana. Luego despeja. Y por la noche hiela. Fin.",
+        Duration::from_millis(30),
+    );
+    let h = harness("hud-barge", Some(brain), fast());
+
+    h.say_line(1);
+    h.wait_state(JarvisState::Speaking);
+    h.capture.set_vad(0.9);
+    h.voice_start();
+    let events = h.hud_until(|e| matches!(e, HudEvent::JarvisInterrupted { .. }));
+    h.capture.set_vad(0.0);
+
+    let HudEvent::UserSaid { turn, .. } = &events[0] else {
+        panic!("primero UserSaid: {events:?}");
+    };
+    assert_eq!(
+        events.last(),
+        Some(&HudEvent::JarvisInterrupted { turn: *turn })
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, HudEvent::JarvisDone { .. })),
+        "un turno cortado no se cierra como terminado: {events:?}"
+    );
+}
+
+#[test]
+fn hud_ipc_speech_is_a_notice() {
+    let h = harness("hud-ipc", None, fast());
+    h.orchestrator.speaker().say("Tarea del swarm completada.");
+    let events = h.hud_until(|e| matches!(e, HudEvent::Notice { .. }));
+    assert_eq!(
+        events,
+        vec![HudEvent::Notice {
+            text: "Tarea del swarm completada.".into()
+        }]
+    );
+}
+
+#[test]
+fn hud_full_channel_never_blocks() {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let hud = HudTx(Some(tx));
+    let started = Instant::now();
+    for _ in 0..1_000 {
+        hud.emit(HudEvent::Clear);
+    }
+    assert!(started.elapsed() < Duration::from_millis(100));
+    assert_eq!(rx.len(), 1, "lo que no cabe se descarta");
+    // Sin receptor tampoco falla.
+    drop(rx);
+    hud.emit(HudEvent::Clear);
+    HudTx::default().emit(HudEvent::Clear);
 }

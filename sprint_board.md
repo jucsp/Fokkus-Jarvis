@@ -1,11 +1,53 @@
 # Sprint Board — Fokkus-Jarvis
 
-**Épica 7:** Agente Visual Multiplataforma y Automatización Generalista
-**Sprint:** HU-37 (tareas pesadas asíncronas con notificación secuencial)
+**Épica 6:** Experiencia Visual Adaptativa y Personalización de Interfaz
+**Sprint:** HU-36 (mensajes efímeros flotantes en burbujas transparentes - Speech Popups HUD) — ✅ cerrado en v0.2.18
 **Actualizado:** 2026-10-16 · **PM/QA:** Claude · **PO:** Antigravity
-**Contratos:** [HU-37](docs/specs/sdd-contracts/sdd-hu37-tareas-pesadas-asincronas-ipc.md) · [HU-36](docs/specs/sdd-contracts/sdd-hu36-burbujas-chat-efimeras-hud.md) · [HU-35](docs/specs/sdd-contracts/sdd-hu35-deteccion-pantalla-completa.md)
+**Contratos:** [HU-36](docs/specs/sdd-contracts/sdd-hu36-burbujas-chat-efimeras-hud.md) · [HU-37](docs/specs/sdd-contracts/sdd-hu37-tareas-pesadas-asincronas-ipc.md) · [HU-35](docs/specs/sdd-contracts/sdd-hu35-deteccion-pantalla-completa.md)
 
 Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere prueba manual
+
+---
+
+## ✅ DONE / COMPLETADAS
+
+| HU | Versión | Tests | Autoría | Pendiente |
+|----|---------|-------|---------|-----------|
+| HU-36 Speech Popups HUD | v0.2.18 | `make test` 512 passed / 0 failed · `make lint` OK · `make fmt-check` OK | DeepSeek (36.1–36.6: config, `hud` render, `TextRasterizer`) · Claude (36.7–36.14: `HudEvent`, `HudLayer`, `HudPipeline`, toggle, QA) | 🧪 36.15 prueba manual en KWin (PO) |
+| HU-37 Tareas pesadas en segundo plano | v0.2.17 | 474 passed / 0 failed | DeepSeek · Claude | 37.10b, 🧪 37.16, 37.17 |
+| HU-35 Pantalla completa Auto-Dim / Auto-Hide | v0.2.16 | 440 passed | DeepSeek · Claude | — |
+
+---
+
+## ✅ HU-36 — Mensajes efímeros flotantes en burbujas transparentes (Speech Popups HUD) · v0.2.18
+
+### jarvis-core
+- [x] 36.1 Campos en `JarvisConfig`: `hud_enabled` (bool, default `true`), `hud_max_bubbles` (1..=3, default 3) con getters y builders [Responsable: DeepSeek]
+- [x] 36.2 Tests unitarios de configuración y roundtrip TOML para HUD [Responsable: DeepSeek]
+
+### jarvis-render
+- [x] 36.3 `fontdue` en `Cargo.toml` y fuente Noto Sans embebida en `crates/jarvis-render/assets/` [Responsable: DeepSeek]
+- [x] 36.4 Módulo `hud`: `Speaker`, `Bubble`, `BubbleStack` puro con word-wrap, `bubble_ttl(chars) -> Duration` y animación [Responsable: DeepSeek]
+- [x] 36.5 `TextRasterizer` con caché de glifos y `HudRenderer::render_into` con rectángulos redondeados y elipsis [Responsable: DeepSeek]
+- [x] 36.6 Tests unitarios de `BubbleStack`, word wrap y TTL [Responsable: DeepSeek]
+
+### jarvis-audio
+- [x] 36.7 Enum `HudEvent` (`UserSaid`, `JarvisPhrase`, `JarvisDone`, `JarvisInterrupted`, `Notice`, `Clear`) en `events.rs` y `hud: Option<Sender<HudEvent>>` en `VoiceDeps` (`try_send`, nunca bloquea) [Responsable: Claude]
+- [x] 36.8 Emisión en `BrainLoop`: `UserSaid` en `on_turn` (sin vocativo), `JarvisPhrase` desde el hilo TTS al entrar la frase a sonar (descarta generaciones obsoletas), `JarvisDone`/`JarvisInterrupted` al cerrar la locución, `Notice` para IPC y cola de tareas [Responsable: Claude]
+- [x] 36.9 Tests de emisión en `orchestrator/tests.rs` (orden del turno, comando local, barge-in, aviso IPC, canal lleno) [Responsable: Claude]
+
+### jarvis-shell
+- [x] 36.10 Segunda capa `HudLayer` en `WaylandLayerSurface` con región de entrada vacía (click-through total), creada/destruida bajo demanda, colocada encima/debajo de la esfera según anclaje y arrastre (`hud_layout`, con tests) [Responsable: Claude]
+- [x] 36.11 Trait `HudSurface`, `OverlaySurface::{set_hud_enabled, hud}` y soporte en `HeadlessSurface` (`HeadlessHud`) [Responsable: Claude]
+
+### jarvis-app
+- [x] 36.12 `HudPipeline` (`src/hud.rs`) en `run_loop`: drena `HudEvent`, mide la altura, presenta solo con cambios o fundidos y oculta la capa sin globos; sin globos nuevos en silencio o con pantalla completa fuera de turno (CA-36.7) [Responsable: Claude]
+- [x] 36.13 Toggle "Mostrar burbujas de conversación (HUD)" en Ajustes → General (`unified_settings.py`), persiste `hud_enabled` [Responsable: Claude]
+- [x] 36.14 Verificación completa de QA `make test`, `make lint` y `make fmt-check` [Responsable: Claude]
+- [ ] 36.15 🧪 Prueba manual en KWin: conversación de 5 turnos, clic sobre un globo atraviesa, legibilidad sobre fondo blanco y negro, toggle en Ajustes [Responsable: PO]
+
+**QA HU-36 2026-10-16 (Claude):** `make test` → 512 passed / 0 failed (audio 246, ipc 67, core 64, app 51, shell 48, render 30, no_alloc 6) · `make lint` OK · `make fmt-check` OK. Fix en `BubbleStack::visible`: incluía solo globos con alfa > 0 y descartaba los recién nacidos.
+
 
 ---
 

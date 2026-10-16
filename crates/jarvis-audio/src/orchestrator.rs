@@ -51,7 +51,7 @@ use crate::activation::{Activation, ActivationDetector};
 use crate::brain::{BrainError, Completion};
 use crate::conversation::{barge_in, ConversationCoordinator, ConversationError, TokenStream};
 use crate::dsp::ConnectorSignal;
-use crate::events::VoiceEvent;
+use crate::events::{HudEvent, TurnId, VoiceEvent};
 use crate::io::{to_output_pcm, AudioEngine, EngineShared, PlayOutcome, Player};
 use crate::playback::AudioPlayback;
 use crate::speech_queue::{Delivery, DeliveryGate, SpeechPriority};
@@ -258,6 +258,22 @@ pub struct VoiceDeps {
     pub activation: Arc<ActivationDetector>,
     /// Fábrica de cerebros para tareas pesadas (HU-37). `None` = sin tareas.
     pub factory: Option<Arc<dyn BrainFactory>>,
+    /// Canal hacia el HUD de burbujas (HU-36). Debe ser acotado: se usa
+    /// `try_send` y, si está lleno, el evento se descarta. `None` = sin HUD.
+    pub hud: Option<Sender<HudEvent>>,
+}
+
+/// Emisor de eventos del HUD que nunca bloquea la voz (HU-36).
+#[derive(Clone, Default)]
+struct HudTx(Option<Sender<HudEvent>>);
+
+impl HudTx {
+    fn emit(&self, event: HudEvent) {
+        if let Some(tx) = &self.0 {
+            // Canal lleno o HUD cerrado: se descarta, la voz sigue.
+            let _ = tx.try_send(event);
+        }
+    }
 }
 
 /// Contadores del orquestador (diagnóstico; nunca contienen texto).
@@ -783,6 +799,8 @@ enum TtsJob {
     Audio {
         generation: u64,
         pcm: PcmAudio,
+        /// Subtítulo del HUD que se publica cuando la frase empieza a sonar.
+        caption: Option<HudEvent>,
     },
     /// Chime de confirmación de turno aceptado (HU-18), sin generación.
     Chime {
@@ -808,7 +826,9 @@ impl VoiceOrchestrator {
             brain,
             activation,
             factory,
+            hud,
         } = deps;
+        let hud = HudTx(hud);
         coordinator.set_deferred_finish(true);
         let brain = BrainSlot::new(brain);
         let barge_in = Arc::new(AtomicBool::new(config.barge_in_enabled));
@@ -856,9 +876,13 @@ impl VoiceOrchestrator {
         }
         {
             let tts_brain = brain_tx.clone();
+            let tts_hud = hud.clone();
+            let tts_playback = playback.clone();
             threads.push(spawn(
                 "jarvis-tts",
-                Box::new(move || tts_loop(&tts_rx, &tts_brain, sink.as_ref())),
+                Box::new(move || {
+                    tts_loop(&tts_rx, &tts_brain, sink.as_ref(), &tts_hud, &tts_playback);
+                }),
             )?);
         }
         {
@@ -880,6 +904,9 @@ impl VoiceOrchestrator {
                 gaming_mode: Arc::clone(&gaming_mode),
                 quiet_gap: config.tasks.clone().unwrap_or_default().quiet_gap,
                 held: false,
+                hud,
+                hud_turn: 0,
+                hud_open: None,
             };
             threads.push(spawn(
                 "jarvis-brain",
@@ -1482,7 +1509,13 @@ fn stt_loop(
 
 // ------------------------------------------------------------------ jarvis-tts
 
-fn tts_loop(jobs: &Receiver<TtsJob>, brain: &Sender<BrainJob>, sink: &dyn AudioSink) {
+fn tts_loop(
+    jobs: &Receiver<TtsJob>,
+    brain: &Sender<BrainJob>,
+    sink: &dyn AudioSink,
+    hud: &HudTx,
+    playback: &AudioPlayback,
+) {
     // Generación sin salida de audio: se avisa al cerebro igual.
     let mut no_output: Option<u64> = None;
     // Segundos encolados de la generación en curso (diagnóstico sin texto).
@@ -1497,7 +1530,18 @@ fn tts_loop(jobs: &Receiver<TtsJob>, brain: &Sender<BrainJob>, sink: &dyn AudioS
     };
     for job in jobs {
         match job {
-            TtsJob::Audio { generation, pcm } => {
+            TtsJob::Audio {
+                generation,
+                pcm,
+                caption,
+            } => {
+                // El subtítulo se publica cuando la frase entra a sonar (no
+                // al llegar el token), y nunca para una locución cancelada.
+                if let Some(caption) = caption {
+                    if !playback.is_stale(generation) {
+                        hud.emit(caption);
+                    }
+                }
                 let outcome = play(sink, generation, &pcm, &mut no_output);
                 account(&mut queued, generation, &pcm, outcome);
             }
@@ -1602,6 +1646,21 @@ struct BrainLoop {
     /// Hubo resultados retenidos por silencio/modo juego: al salir se
     /// anuncian antes de entregarlos (CA-37.8).
     held: bool,
+    /// Eventos hacia el HUD de burbujas (HU-36).
+    hud: HudTx,
+    /// Último turno numerado para el HUD.
+    hud_turn: TurnId,
+    /// Turno cuya respuesta aún no se cerró en el HUD.
+    hud_open: Option<TurnId>,
+}
+
+/// Cómo se subtitula una locución en el HUD (HU-36).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Caption {
+    /// Respuesta al turno abierto (si no hay turno abierto, se trata como aviso).
+    Reply,
+    /// Aviso fuera de turno: IPC y resultados de tareas.
+    Notice,
 }
 
 /// Cada cuánto el cerebro evalúa la cola hablada sin esperar otro evento.
@@ -1618,7 +1677,7 @@ impl BrainLoop {
                             // Otra locución suena: espera su turno en la cola.
                             self.queue.push(Delivery::new(text, SpeechPriority::Notice));
                         } else {
-                            self.say(&text, AfterSpeech::Listen);
+                            self.say_as(&text, AfterSpeech::Listen, Caption::Notice);
                         }
                     }
                     Ok(BrainJob::SetVoice(voice_id)) => self.set_voice(&voice_id),
@@ -1664,12 +1723,12 @@ impl BrainLoop {
             } else {
                 format!("Tienes {n} resultados pendientes.")
             };
-            self.say(&text, AfterSpeech::Listen);
+            self.say_as(&text, AfterSpeech::Listen, Caption::Notice);
             return;
         }
         let next = self.queue.lock().pop_ready(&gate, now);
         if let Some(delivery) = next {
-            self.say(&delivery.text, AfterSpeech::Listen);
+            self.say_as(&delivery.text, AfterSpeech::Listen, Caption::Notice);
         }
     }
 
@@ -1759,6 +1818,14 @@ impl BrainLoop {
     fn on_turn(&mut self, query: &str, _at: Instant) {
         // Lo que quedó de un turno cancelado (barge-in) no debe bloquear este.
         self.speaking = None;
+        // HUD (HU-36): si la respuesta anterior seguía abierta, se cortó.
+        self.close_hud(true);
+        self.hud_turn += 1;
+        self.hud.emit(HudEvent::UserSaid {
+            turn: self.hud_turn,
+            text: query.to_string(),
+        });
+        self.hud_open = Some(self.hud_turn);
         let _ = self
             .core
             .transition_from(JarvisState::Thinking, JarvisState::Listening);
@@ -1833,6 +1900,7 @@ impl BrainLoop {
             client.cancel();
         }
         self.speaking = None;
+        self.close_hud(true);
         let _ = self
             .core
             .transition_from(JarvisState::Speaking, JarvisState::Listening);
@@ -1840,6 +1908,31 @@ impl BrainLoop {
             .core
             .transition_from(JarvisState::Thinking, JarvisState::Listening);
         let _ = self.coordinator.finish_speech(false);
+    }
+
+    /// Cierra en el HUD la respuesta del turno abierto: `JarvisDone` (empieza
+    /// su TTL) o `JarvisInterrupted` (se cierra con "…").
+    fn close_hud(&mut self, interrupted: bool) {
+        if let Some(turn) = self.hud_open.take() {
+            self.hud.emit(if interrupted {
+                HudEvent::JarvisInterrupted { turn }
+            } else {
+                HudEvent::JarvisDone { turn }
+            });
+        }
+    }
+
+    /// Subtítulo del HUD para `text` según su tipo y el turno abierto.
+    fn caption(&self, text: &str, caption: Caption) -> HudEvent {
+        match (caption, self.hud_open) {
+            (Caption::Reply, Some(turn)) => HudEvent::JarvisPhrase {
+                turn,
+                text: text.to_string(),
+            },
+            _ => HudEvent::Notice {
+                text: text.to_string(),
+            },
+        }
     }
 
     /// Encola el chime de confirmación para que suene sin bloquear el turno.
@@ -1870,25 +1963,32 @@ impl BrainLoop {
         // Silenciado o en un estado que no admite turnos: se descarta.
         if let Err(e) = self.coordinator.handle_user_utterance(query) {
             eprintln!("[voz] turno descartado: {e}");
+            self.close_hud(false);
             return;
         }
         self.stats.turns.fetch_add(1, Ordering::Relaxed);
         let generation = self.coordinator.utterance_generation();
 
         let tts = self.tts.clone();
+        let hud_turn = self.hud_open;
         let result = self.coordinator.run_turn_streaming_with(
             client,
             query,
-            &mut |_phrase: &str, pcm: &PcmAudio| {
+            &mut |phrase: &str, pcm: &PcmAudio| {
                 let _ = tts.send(TtsJob::Audio {
                     generation,
                     pcm: pcm.clone(),
+                    caption: hud_turn.map(|turn| HudEvent::JarvisPhrase {
+                        turn,
+                        text: phrase.to_string(),
+                    }),
                 });
             },
         );
 
         if self.playback.is_stale(generation) {
             // Barge-in o silencio: el hilo de voz ya movió el estado.
+            self.close_hud(true);
             return;
         }
         match result {
@@ -1901,6 +2001,7 @@ impl BrainLoop {
                         .core
                         .transition_from(JarvisState::Thinking, JarvisState::Listening);
                     self.coordinator.finish_speech(false).ok();
+                    self.close_hud(false);
                 }
             }
             Err(ConversationError::Brain(BrainError::Cancelled)) => {
@@ -1914,6 +2015,7 @@ impl BrainLoop {
                     .core
                     .transition_from(JarvisState::Thinking, JarvisState::Listening);
                 self.coordinator.finish_speech(false).ok();
+                self.close_hud(true);
             }
             Err(ConversationError::Brain(e)) => {
                 self.stats.speech_errors.fetch_add(1, Ordering::Relaxed);
@@ -1923,12 +2025,19 @@ impl BrainLoop {
             Err(e) => {
                 // Transición rechazada: otro hilo cambió el estado (silencio).
                 eprintln!("[voz] turno interrumpido: {e}");
+                self.close_hud(true);
             }
         }
     }
 
-    /// Locución fuera de un turno con el LLM (hora, avisos, IPC).
+    /// Locución fuera de un turno con el LLM (hora, comandos locales): se
+    /// subtitula como respuesta al turno abierto.
     fn say(&mut self, text: &str, after: AfterSpeech) {
+        self.say_as(text, after, Caption::Reply);
+    }
+
+    /// Como [`say`](Self::say), indicando cómo se subtitula en el HUD.
+    fn say_as(&mut self, text: &str, after: AfterSpeech, caption: Caption) {
         {
             let mut core = self.core.lock();
             if core.state() == JarvisState::Idle {
@@ -1942,7 +2051,7 @@ impl BrainLoop {
                 return;
             }
         }
-        self.speak_now(text, after);
+        self.speak_now_as(text, after, caption);
     }
 
     /// Habla desde `Thinking` o continúa en `Speaking`.
@@ -1951,6 +2060,10 @@ impl BrainLoop {
     /// ven `Speaking` cuando hay audio listo para sonar, no durante el segundo
     /// que tarda la síntesis por red.
     fn speak_now(&mut self, text: &str, after: AfterSpeech) {
+        self.speak_now_as(text, after, Caption::Reply);
+    }
+
+    fn speak_now_as(&mut self, text: &str, after: AfterSpeech, caption: Caption) {
         let pcm = match self.coordinator.synthesize_phrase(text) {
             Ok(pcm) => Some(pcm),
             Err(e) => {
@@ -1980,7 +2093,12 @@ impl BrainLoop {
             _ => return,
         };
         if let Some(pcm) = pcm {
-            let _ = self.tts.send(TtsJob::Audio { generation, pcm });
+            let caption = Some(self.caption(text, caption));
+            let _ = self.tts.send(TtsJob::Audio {
+                generation,
+                pcm,
+                caption,
+            });
         }
         self.finish_after(generation, after);
     }
@@ -1998,6 +2116,8 @@ impl BrainLoop {
             return;
         }
         self.speaking = None;
+        let cut = outcome == PlayOutcome::Cancelled || self.playback.is_stale(generation);
+        self.close_hud(cut);
         if outcome == PlayOutcome::NoOutput {
             eprintln!("[voz] no hay altavoz: la respuesta no se pudo reproducir.");
         }

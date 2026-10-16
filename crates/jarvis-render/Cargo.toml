@@ -9,3 +9,4 @@ description = "Renderizado CPU de la esfera líquida de Jarvis con tiny-skia."
 [dependencies]
 jarvis-core = { path = "../jarvis-core" }
 tiny-skia.workspace = true
+fontdue.workspace = true

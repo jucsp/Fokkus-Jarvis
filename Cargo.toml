@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.17"
+version = "0.2.18"
 edition = "2021"
 rust-version = "1.99"
 # Los crates del workspace no se publican en crates.io (cargo-deny los trata
@@ -22,6 +22,9 @@ crossbeam-channel = "0.5"
 # Renderizado CPU sin GPU. Se desactivan los features por defecto para no
 # arrastrar la dependencia opcional `png` (y sus dependencias transitivas).
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+# Rasterizado de glifos en CPU para el HUD de burbujas efímeras (HU-36).
+# Rust puro; la fuente Noto Sans va embebida en crates/jarvis-render/assets/.
+fontdue = "0.9"
 # Persistencia de configuración (aprobado por el PO el 2026-10-14).
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"

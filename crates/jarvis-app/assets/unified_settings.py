@@ -98,6 +98,7 @@ DEFAULTS = {
     "sphere_scale_pct": 100,
     "sphere_opacity_pct": 100,
     "fullscreen_behavior": "dim",
+    "hud_enabled": True,
 }
 
 # Reacción a ventanas a pantalla completa (HU-35): (valor TOML, etiqueta).
@@ -591,6 +592,14 @@ class UnifiedSettings(QWidget):
         )
         layout.addWidget(self.fullscreen_card)
 
+        self.hud_card, self.hud_check = self._check_card(
+            "Mostrar burbujas de conversación (HUD)",
+            "Globos translúcidos con lo que dijiste y lo que responde Jarvis;"
+            " se desvanecen solos.",
+            bool(self.current.get("hud_enabled", True)),
+        )
+        layout.addWidget(self.hud_card)
+
         save = QPushButton("Guardar")
         save.setObjectName("primary")
         save.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -853,6 +862,7 @@ class UnifiedSettings(QWidget):
                 "sphere_opacity_pct": int(self.opacity_slider.value()),
                 "fullscreen_behavior": self.fullscreen_combo.currentData()
                 or DEFAULTS["fullscreen_behavior"],
+                "hud_enabled": bool(self.hud_check.isChecked()),
             }
         )
         try:

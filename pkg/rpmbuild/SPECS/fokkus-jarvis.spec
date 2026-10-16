@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.2.17
+Version:        0.2.18
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,6 +23,11 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.18-1
+- HU-36: HUD de globos de texto efímeros (Speech Popups) con capa Wayland transparente y click-through.
+- Rasterizado de texto en CPU con fontdue y Noto Sans embebida, TTL dinámico según longitud de texto.
+- Sincronización visual con los turnos de voz y toggle de activación en Ajustes Generales.
+
 * Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.17-1
 - HU-37: Tareas pesadas asíncronas en segundo plano sin bloqueo conversacional.
 - Acuse vocal inmediato (< 1s) y entrega secuencial en SpeechQueue con DeliveryGate.

@@ -36,3 +36,26 @@ pub enum VoiceEvent {
         segment: Segment,
     },
 }
+
+/// Identificador de turno de conversación para el HUD (HU-36).
+pub type TurnId = u64;
+
+/// Eventos del orquestador hacia el HUD de burbujas efímeras (HU-36).
+///
+/// Viajan por un canal acotado con `try_send`: si el HUD va atrasado el
+/// evento se descarta y la voz nunca se frena.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HudEvent {
+    /// Consulta aceptada del usuario, ya limpia del vocativo "Jarvis".
+    UserSaid { turn: TurnId, text: String },
+    /// Frase de Jarvis que empieza a sonar en el turno `turn`.
+    JarvisPhrase { turn: TurnId, text: String },
+    /// La respuesta del turno terminó de sonar: empieza su TTL.
+    JarvisDone { turn: TurnId },
+    /// La respuesta del turno se cortó (barge-in, nuevo turno).
+    JarvisInterrupted { turn: TurnId },
+    /// Aviso fuera de turno (IPC, resultados de tareas de HU-37).
+    Notice { text: String },
+    /// Vaciar el HUD.
+    Clear,
+}

@@ -16,8 +16,15 @@ use tiny_skia::{
     Stroke, Transform,
 };
 
+mod hud;
+
 /// Buffer RGBA premultiplicado reutilizable con [`SphereRenderer::render_into`].
 pub use tiny_skia::Pixmap;
+
+pub use hud::{
+    bubble_ttl, Bubble, BubbleStack, HudRenderer, Speaker, TextRasterizer, TurnId, FADE_IN,
+    FADE_OUT_EVICT, FADE_OUT_TTL,
+};
 
 /// Tamaño por defecto de la esfera, en píxeles.
 ///
@@ -48,6 +55,8 @@ pub enum RenderError {
         expected: (u32, u32),
         actual: (u32, u32),
     },
+    /// No se pudo cargar la fuente embebida del HUD (HU-36).
+    FontLoadFailed,
 }
 
 impl fmt::Display for RenderError {
@@ -60,6 +69,7 @@ impl fmt::Display for RenderError {
             RenderError::InvalidBuffer { expected, actual } => {
                 write!(f, "buffer de tamaño {actual:?}; se esperaba {expected:?}")
             }
+            RenderError::FontLoadFailed => write!(f, "no se pudo cargar la fuente del HUD"),
         }
     }
 }

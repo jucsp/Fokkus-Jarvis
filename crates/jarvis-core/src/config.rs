@@ -31,6 +31,9 @@ pub const SPHERE_OPACITY_RANGE: std::ops::RangeInclusive<u8> = 20..=100;
 /// `fullscreen_active_pct`.
 pub const FULLSCREEN_PCT_RANGE: std::ops::RangeInclusive<u8> = 5..=100;
 
+/// Número máximo de burbujas simultáneas del HUD (HU-36).
+pub const HUD_MAX_BUBBLES_RANGE: std::ops::RangeInclusive<u8> = 1..=3;
+
 /// Tareas pesadas simultáneas permitidas (HU-37).
 pub const TASKS_PARALLEL_RANGE: std::ops::RangeInclusive<u8> = 1..=4;
 
@@ -158,6 +161,12 @@ pub struct JarvisConfig {
     /// default 1500).
     #[serde(default = "default_tasks_quiet_gap_ms")]
     tasks_quiet_gap_ms: u32,
+    /// Mostrar burbujas de conversación efímeras (HUD) sobre la esfera (HU-36).
+    #[serde(default = "default_hud_enabled")]
+    hud_enabled: bool,
+    /// Máximo de burbujas simultáneas del HUD (1–3, default 3).
+    #[serde(default = "default_hud_max_bubbles")]
+    hud_max_bubbles: u8,
 }
 
 fn default_sphere_scale_pct() -> u16 {
@@ -188,6 +197,14 @@ fn default_tasks_quiet_gap_ms() -> u32 {
     1_500
 }
 
+fn default_hud_enabled() -> bool {
+    true
+}
+
+fn default_hud_max_bubbles() -> u8 {
+    3
+}
+
 impl Default for JarvisConfig {
     fn default() -> Self {
         Self {
@@ -208,6 +225,8 @@ impl Default for JarvisConfig {
             tasks_max_parallel: 2,
             tasks_timeout_secs: 900,
             tasks_quiet_gap_ms: 1_500,
+            hud_enabled: true,
+            hud_max_bubbles: 3,
         }
     }
 }
@@ -308,6 +327,16 @@ impl JarvisConfig {
         self
     }
 
+    pub fn with_hud_enabled(mut self, enabled: bool) -> Self {
+        self.hud_enabled = enabled;
+        self
+    }
+
+    pub fn with_hud_max_bubbles(mut self, value: u8) -> Self {
+        self.hud_max_bubbles = value;
+        self
+    }
+
     /// Comando CLI efectivo (el por defecto si quedó vacío).
     pub fn effective_cli_command(&self) -> &str {
         let command = self.cli_command.trim();
@@ -376,6 +405,17 @@ impl JarvisConfig {
             .clamp(*TASKS_QUIET_GAP_RANGE.start(), *TASKS_QUIET_GAP_RANGE.end())
     }
 
+    /// `true` si el HUD de burbujas de conversación está habilitado (HU-36).
+    pub fn hud_enabled(&self) -> bool {
+        self.hud_enabled
+    }
+
+    /// Máximo de burbujas simultáneas del HUD, saturado a 1–3.
+    pub fn hud_max_bubbles(&self) -> u8 {
+        self.hud_max_bubbles
+            .clamp(*HUD_MAX_BUBBLES_RANGE.start(), *HUD_MAX_BUBBLES_RANGE.end())
+    }
+
     /// Satura los valores fuera de rango al cargar (no es error de parseo).
     fn saturate(&mut self) {
         let scale = self.sphere_scale_pct();
@@ -437,6 +477,15 @@ impl JarvisConfig {
                 self.tasks_quiet_gap_ms
             );
             self.tasks_quiet_gap_ms = quiet_gap;
+        }
+
+        let hud_bubbles = self.hud_max_bubbles();
+        if hud_bubbles != self.hud_max_bubbles {
+            eprintln!(
+                "[config] hud_max_bubbles fuera de rango ({}): se satura a {hud_bubbles}",
+                self.hud_max_bubbles
+            );
+            self.hud_max_bubbles = hud_bubbles;
         }
     }
 
@@ -835,5 +884,56 @@ mod tests {
         assert_eq!(loaded.tasks_timeout_secs(), 60);
         assert_eq!(loaded.tasks_quiet_gap_ms(), 5_000);
         cleanup(&path);
+    }
+
+    #[test]
+    fn hud_defaults_and_builders() {
+        let config = JarvisConfig::default();
+        assert!(config.hud_enabled());
+        assert_eq!(config.hud_max_bubbles(), 3);
+
+        let config = config.with_hud_enabled(false).with_hud_max_bubbles(1);
+        assert!(!config.hud_enabled());
+        assert_eq!(config.hud_max_bubbles(), 1);
+    }
+
+    #[test]
+    fn hud_fields_roundtrip_through_toml() {
+        let path = temp_config_path("hud-roundtrip");
+        cleanup(&path);
+        let config = JarvisConfig {
+            hud_enabled: false,
+            hud_max_bubbles: 2,
+            ..JarvisConfig::default()
+        };
+        config.save_to(&path).unwrap();
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("hud_enabled = false"), "{toml}");
+        assert!(toml.contains("hud_max_bubbles = 2"), "{toml}");
+
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded, config);
+        assert!(!loaded.hud_enabled());
+        assert_eq!(loaded.hud_max_bubbles(), 2);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn out_of_range_hud_max_bubbles_saturates_on_load() {
+        let path = temp_config_path("hud-sat");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "hud_max_bubbles = 9\n").unwrap();
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.hud_max_bubbles(), 3);
+        cleanup(&path);
+
+        let path2 = temp_config_path("hud-sat2");
+        cleanup(&path2);
+        std::fs::create_dir_all(path2.parent().unwrap()).unwrap();
+        std::fs::write(&path2, "hud_max_bubbles = 0\n").unwrap();
+        let loaded2 = JarvisConfig::load_from(&path2).unwrap();
+        assert_eq!(loaded2.hud_max_bubbles(), 1);
+        cleanup(&path2);
     }
 }

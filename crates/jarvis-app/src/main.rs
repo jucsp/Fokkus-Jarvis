@@ -20,6 +20,7 @@
 //! persistente ([`logging`]); si falta el modelo whisper se descarga en
 //! segundo plano y la escucha arranca al quedar cargado.
 
+mod hud;
 mod logging;
 mod presence;
 mod runtime;
@@ -443,6 +444,11 @@ fn run() -> ExitCode {
     // Fábrica de cerebros aislados para las tareas de fondo (HU-37).
     let task_factory = Arc::new(settings::TaskBrainFactory::new(&config));
 
+    // HUD de burbujas (HU-36): canal acotado; si se llena, el orquestador
+    // descarta el evento y la voz nunca espera al render.
+    let (hud_tx, hud_rx) = crossbeam_channel::bounded(64);
+    let mut hud = hud::HudPipeline::new(hud_rx);
+
     // Orquestador de voz (HU-9).
     let mut orchestrator = engine.as_ref().and_then(|engine| {
         let deps = VoiceDeps {
@@ -457,6 +463,7 @@ fn run() -> ExitCode {
                 ActivationDetector::new().with_continuous(config.continuous_listening),
             ),
             factory: Some(Arc::clone(&task_factory) as Arc<dyn jarvis_audio::BrainFactory>),
+            hud: Some(hud_tx),
         };
         let gaming_mode = config.gaming_mode;
         let config = VoiceConfig {
@@ -653,6 +660,7 @@ fn run() -> ExitCode {
         &reset_position,
         None,
         Some(&mut fullscreen),
+        Some(&mut hud),
         &mut on_first_frame,
         &mut on_command,
     );

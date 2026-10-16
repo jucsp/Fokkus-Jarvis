@@ -64,11 +64,11 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
   - 📁 _Repositorio:_ `Fokkus-Jarvis`
   - 🎯 _Capa a trabajar:_ `crates/jarvis-shell` / integración de ventanas de SO.
   - 📌 _Objetivo técnico:_ Implementar un monitor agnóstico de estado de ventanas (KWin DBus / XDG toplevel / APIs nativas de OS) que active automáticamente atenuación de opacidad o minimizado temporal. Implementado con watcher D-Bus de KWin Scripting, máquina `FullscreenPolicy` con histéresis de 300 ms, override vocal temporal durante conversación y selector en Ajustes Generales (✅ 440 tests pasando).
-- [ ] **feat(ui): mensajes efímeros flotantes en burbujas transparentes (Speech Popups HUD)** (HU-36)
+- [x] **feat(ui): mensajes efímeros flotantes en burbujas transparentes (Speech Popups HUD)** (HU-36, v0.2.18)
   - _Contexto de negocio:_ Confirmación visual rápida de lo que el usuario dijo y lo que Jarvis responde, sin recurrir a una ventana pesada de chat permanente.
   - 📁 _Repositorio:_ `Fokkus-Jarvis`
   - 🎯 _Capa a trabajar:_ `crates/jarvis-render` / `crates/jarvis-shell`.
-  - 📌 _Objetivo técnico:_ Renderizar globos de texto translúcidos flotantes efímeros sobre la esfera (máximo 1-3 mensajes tipo HUD) que se desvanezcan tras unos segundos. Configurable (toggle On/Off) desde Ajustes Generales.
+  - 📌 _Objetivo técnico:_ Renderizar globos de texto translúcidos flotantes efímeros sobre la esfera (máximo 1-3 mensajes tipo HUD) que se desvanezcan tras unos segundos. Configurable (toggle On/Off) desde Ajustes Generales. Implementado con segunda capa Wayland click-through (`HudLayer`), rasterizado `fontdue` + Noto Sans embebida, `BubbleStack` con TTL dinámico y `HudEvent` sincronizado con los turnos de voz (✅ 512 tests pasando).
 
 ---
 
