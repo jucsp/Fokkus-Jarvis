@@ -166,6 +166,11 @@ pub type LocalClock = Arc<dyn Fn() -> (u32, u32) + Send + Sync>;
 /// para que los tests no abran programas reales.
 pub type AppLauncher = Arc<dyn Fn(&[String]) -> std::io::Result<()> + Send + Sync>;
 
+/// Kill switch de la automatización (HU-38): revoca el *lease* activo y
+/// devuelve `true` si había una automatización en curso. Lo inyecta el binario
+/// con `AutomationGuard::kill(KillReason::Voice)`.
+pub type AutomationKill = Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Parámetros del orquestador.
 #[derive(Clone)]
 pub struct VoiceConfig {
@@ -188,6 +193,9 @@ pub struct VoiceConfig {
     pub barge_in_enabled: bool,
     /// Gestión de tareas pesadas (HU-37). `None` = desactivada.
     pub tasks: Option<TaskConfig>,
+    /// Kill switch por voz de la automatización (HU-38). `None` = sin
+    /// automatización: "para" solo responde "Detenido.".
+    pub automation_kill: Option<AutomationKill>,
 }
 
 impl Default for VoiceConfig {
@@ -202,6 +210,7 @@ impl Default for VoiceConfig {
             vad_threshold: crate::vad::EndpointConfig::default().voice_open,
             barge_in_enabled: false,
             tasks: None,
+            automation_kill: None,
         }
     }
 }
@@ -387,6 +396,57 @@ pub enum LocalCommand {
     },
     /// Lista las tareas pesadas ("¿qué tareas tengo?").
     ListTasks,
+    /// Kill switch de la automatización ("para", "detente", "cancela"). Se
+    /// evalúa antes que cualquier otra orden (HU-38, CA-38.5).
+    StopAutomation,
+}
+
+/// Verbos del kill switch por voz (texto ya sin acentos).
+const STOP_AUTOMATION_VERBS: &[&str] = &[
+    "para",
+    "parale",
+    "detente",
+    "detenete",
+    "deten",
+    "cancela",
+    "cancelalo",
+    "alto",
+    "basta",
+    "stop",
+    "frena",
+];
+
+/// Palabras que pueden acompañar al verbo sin cambiar la orden: "para ya",
+/// "detente por favor", "cancela eso ahora mismo".
+const STOP_AUTOMATION_FILLERS: &[&str] = &[
+    "ya",
+    "por",
+    "favor",
+    "porfa",
+    "jarvis",
+    "oye",
+    "eso",
+    "ahora",
+    "mismo",
+    "ahi",
+    "inmediatamente",
+    "todo",
+    "ahorita",
+];
+
+/// La orden es SOLO el kill switch: un verbo de parada y, como mucho,
+/// muletillas. "Para qué sirve esto" o "cancela la tarea de los correos" no
+/// cuentan.
+fn is_stop_automation(words: &[&str]) -> bool {
+    let mut rest = words
+        .iter()
+        .skip_while(|w| STOP_AUTOMATION_FILLERS.contains(w));
+    match rest.next() {
+        Some(verb) if STOP_AUTOMATION_VERBS.contains(verb) => {
+            rest.all(|w| STOP_AUTOMATION_FILLERS.contains(w) || STOP_AUTOMATION_VERBS.contains(w))
+        }
+        _ => false,
+    }
 }
 
 /// Frases que cierran la sesión por voz (HU-17). No son un mute duro: el
@@ -641,6 +701,16 @@ pub fn local_command(query: &str) -> Option<LocalCommand> {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
     );
     let has = |phrases: &[&str]| phrases.iter().any(|p| text.contains(&format!(" {p} ")));
+    // Prioridad absoluta: el kill switch se reconoce antes que nada (CA-38.5).
+    {
+        let folded = fold_accents(&text);
+        let words: Vec<&str> = folded.split_whitespace().collect();
+        // "cancela todo" sigue siendo cancelar todas las tareas (HU-37).
+        let cancels_tasks = words.first() == Some(&"cancela") && words.contains(&"todo");
+        if !cancels_tasks && is_stop_automation(&words) {
+            return Some(LocalCommand::StopAutomation);
+        }
+    }
     // La palabra aislada "silencio" solo cierra la sesión cuando abre la
     // consulta ("silencio", "silencio por favor"); nunca en preguntas como
     // "¿qué es el silencio?" o "el silencio" (HU-23).
@@ -932,6 +1002,7 @@ impl VoiceOrchestrator {
                 tts: tts_tx.clone(),
                 clock: Arc::clone(&config.clock),
                 launcher: Arc::clone(&config.launcher),
+                automation_kill: config.automation_kill.clone(),
                 stats: Arc::clone(&stats),
                 ready: Arc::clone(&ready),
                 speaking: None,
@@ -1701,6 +1772,8 @@ struct BrainLoop {
     tts: Sender<TtsJob>,
     clock: LocalClock,
     launcher: AppLauncher,
+    /// Kill switch de la automatización (HU-38).
+    automation_kill: Option<AutomationKill>,
     stats: Arc<VoiceStats>,
     ready: Arc<AtomicBool>,
     /// Locución en curso: (generación, qué hacer al terminar).
@@ -1973,11 +2046,28 @@ impl BrainLoop {
                 self.cancel_tasks(spoken_target.as_deref());
             }
             Some(LocalCommand::ListTasks) => self.list_tasks(),
+            Some(LocalCommand::StopAutomation) => self.stop_automation(),
             None if classify_workload(query) == Workload::Heavy && self.dispatch_task(query) => {}
             None => match self.client.get() {
                 Some(client) => self.converse(client.as_ref(), query),
                 None => self.say(NO_API_KEY_PHRASE, AfterSpeech::Listen),
             },
+        }
+    }
+
+    /// Kill switch por voz (HU-38): revoca la automatización en curso antes de
+    /// cualquier otra cosa y confirma de palabra.
+    fn stop_automation(&mut self) {
+        self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+        let aborted = self.automation_kill.as_ref().is_some_and(|kill| kill());
+        if aborted {
+            println!("[voz] kill switch: automatización detenida por voz");
+            self.say(
+                "Detenido. Dejé de controlar el equipo.",
+                AfterSpeech::Listen,
+            );
+        } else {
+            self.say("Detenido.", AfterSpeech::Listen);
         }
     }
 

@@ -7,10 +7,11 @@ members = [
     "crates/jarvis-app",
     "crates/jarvis-audio",
     "crates/jarvis-ipc",
+    "crates/jarvis-automation",
 ]
 
 [workspace.package]
-version = "0.2.21"
+version = "0.2.22"
 edition = "2021"
 rust-version = "1.99"
 # Los crates del workspace no se publican en crates.io (cargo-deny los trata
@@ -74,6 +75,9 @@ ureq = { version = "3.4.2", default-features = false, features = ["rustls", "jso
 keyring = "4.2.0"
 # Verificación SHA-256 de los modelos descargados.
 sha2 = "0.11.1"
+# Compresión zlib de los PNG de captura (HU-38). Ya estaba en el árbol vía
+# ureq con el mismo backend en Rust puro (miniz_oxide): no suma crates.
+flate2 = "1.1.10"
 
 [patch.crates-io]
 # SEC-03: msedge-tts 0.4.1 fija aws-lc-rs en código y en las features de

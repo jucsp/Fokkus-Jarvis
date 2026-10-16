@@ -40,6 +40,7 @@ use jarvis_audio::{
     TaskConfig, TaskManager, TaskOrigin, TaskStatus, TtsBackend, VoiceConfig, VoiceDeps,
     VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
 };
+use jarvis_automation::{AutomationGuard, Capabilities, KillReason, ProbeOptions};
 use jarvis_core::single_instance::{self, InstanceError};
 use jarvis_core::{
     sphere_size_for_pct, FullscreenBehavior, JarvisConfig, JarvisCore, Opacity, SharedCore,
@@ -449,6 +450,16 @@ fn run() -> ExitCode {
     let (hud_tx, hud_rx) = crossbeam_channel::bounded(64);
     let mut hud = hud::HudPipeline::new(hud_rx);
 
+    // Ojos y manos (HU-38): el guard existe siempre para que el kill switch
+    // por voz funcione; con `[automation] enabled = false` no concede leases.
+    let automation = Arc::new(AutomationGuard::from_config(&config.automation));
+    if config.automation.enabled {
+        println!(
+            "[automatización] habilitada (lease {} s, {} acciones/s)",
+            config.automation.lease_secs, config.automation.max_actions_per_sec
+        );
+    }
+
     // Orquestador de voz (HU-9).
     let mut orchestrator = engine.as_ref().and_then(|engine| {
         let deps = VoiceDeps {
@@ -471,6 +482,10 @@ fn run() -> ExitCode {
             clock: Arc::new(runtime::local_time),
             barge_in_enabled: config.barge_in_enabled,
             tasks: Some(task_config(&config)),
+            automation_kill: Some({
+                let automation = Arc::clone(&automation);
+                Arc::new(move || automation.kill(KillReason::Voice))
+            }),
             ..VoiceConfig::default()
         };
         match VoiceOrchestrator::start(deps, config) {
@@ -643,8 +658,19 @@ fn run() -> ExitCode {
                     settings::QuickPanel::open(&config_path, Some((x, y)), server_state.is_muted());
             }
         }
-        ShellCommand::Quit => {}
+        ShellCommand::QuickPanelDefault => {
+            let mut panel = quick_panel.borrow_mut();
+            if panel.is_none() {
+                *panel = settings::QuickPanel::open(&config_path, None, server_state.is_muted());
+            }
+        }
+        // Los resuelve el propio bucle.
+        ShellCommand::ToggleVisibility | ShellCommand::Quit => {}
     };
+    // Icono en la bandeja del sistema: sin bandeja (o fuera de Linux) Jarvis
+    // sigue funcionando con el menú contextual de la esfera.
+    let mut tray = start_tray();
+    let tray_commands = tray.as_ref().map(|tray| tray.commands());
     // Detección de pantalla completa (HU-35): con `ignore` no carga nada.
     let mut fullscreen = presence::FullscreenMonitor::start(
         std::process::id(),
@@ -661,14 +687,23 @@ fn run() -> ExitCode {
         None,
         Some(&mut fullscreen),
         Some(&mut hud),
+        tray_commands.as_ref(),
         &mut on_first_frame,
         &mut on_command,
     );
 
-    // Apagado ordenado: script de KWin → superficie → orquestador (y
-    // coordinador) → streams y DSP → IPC (borra el socket) → lock.
+    // Apagado ordenado: automatización en curso → script de KWin →
+    // superficie → orquestador (y coordinador) → streams y DSP → IPC (borra
+    // el socket) → lock.
+    if automation.is_acting() {
+        automation.kill(KillReason::Shutdown);
+    }
     fullscreen.shutdown();
     drop(fullscreen);
+    if let Some(tray) = tray.as_mut() {
+        tray.shutdown();
+    }
+    drop(tray);
     surface.set_visible(false);
     drop(surface);
     if let Some(orchestrator) = orchestrator.as_mut() {
@@ -695,6 +730,21 @@ fn run() -> ExitCode {
         LoopExit::MaxFrames => {}
     }
     ExitCode::SUCCESS
+}
+
+/// Publica el icono de la bandeja (StatusNotifierItem). `None` si no hay bus
+/// de sesión o la plataforma no lo soporta.
+fn start_tray() -> Option<jarvis_shell::tray::TrayIcon> {
+    match jarvis_shell::tray::TrayIcon::start() {
+        Ok(tray) => {
+            println!("[tray] icono publicado en la bandeja del sistema");
+            Some(tray)
+        }
+        Err(e) => {
+            eprintln!("[tray] sin icono en la bandeja: {e}");
+            None
+        }
+    }
 }
 
 /// Comprueba la salud de los subsistemas y sale.
@@ -868,6 +918,9 @@ fn run_health_check() -> ExitCode {
     };
     checks.push(("detección de pantalla completa", fullscreen.0, fullscreen.1));
 
+    // 10. Ojos y manos (HU-38): backends elegidos y descartados con motivo.
+    checks.extend(automation_checks(&config.automation));
+
     // Informe.
     for (name, health, detail) in &checks {
         let status = health.label();
@@ -881,6 +934,46 @@ fn run_health_check() -> ExitCode {
         println!("Diagnóstico: todos los subsistemas operativos.");
         ExitCode::SUCCESS
     }
+}
+
+/// Sondea los backends de captura y entrada (CA-38.1). Con la automatización
+/// apagada solo informa (`Ok`); encendida y sin backend, avisa (`Warn`).
+fn automation_checks(cfg: &jarvis_core::AutomationConfig) -> Vec<(&'static str, Health, String)> {
+    let caps = jarvis_automation::probe_with(&ProbeOptions::from(cfg));
+    let status = if cfg.enabled {
+        "habilitada"
+    } else {
+        "deshabilitada ([automation] enabled = false)"
+    };
+    let health = |chosen: bool| {
+        if chosen || !cfg.enabled {
+            Health::Ok
+        } else {
+            Health::Warn
+        }
+    };
+    let detail = |lines: Vec<String>| {
+        if lines.is_empty() {
+            "sin backends para esta plataforma".to_string()
+        } else {
+            lines.join("; ")
+        }
+    };
+    let capture_chosen = caps.chosen_capture();
+    let input_chosen = caps.chosen_input();
+    vec![
+        ("automatización", Health::Ok, status.to_string()),
+        (
+            "captura de pantalla",
+            health(capture_chosen.is_some()),
+            detail(Capabilities::report_lines(&caps.capture, capture_chosen)),
+        ),
+        (
+            "entrada sintética",
+            health(input_chosen.is_some()),
+            detail(Capabilities::report_lines(&caps.input, input_chosen)),
+        ),
+    ]
 }
 
 /// Abre los streams reales de entrada y salida, corre el DSP medio segundo y

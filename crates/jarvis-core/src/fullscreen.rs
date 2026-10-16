@@ -29,19 +29,6 @@ pub struct Rect {
     pub h: u32,
 }
 
-impl Rect {
-    /// Borde derecho (exclusivo), en `i64` para comparar con tolerancia sin
-    /// desbordar.
-    fn right(&self) -> i64 {
-        i64::from(self.x) + i64::from(self.w)
-    }
-
-    /// Borde inferior (exclusivo), en `i64` por el mismo motivo.
-    fn bottom(&self) -> i64 {
-        i64::from(self.y) + i64::from(self.h)
-    }
-}
-
 /// Instantánea de la ventana activa reportada por el backend de detección.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowSnapshot {
@@ -66,59 +53,36 @@ pub struct OutputGeometry {
     pub rect: Rect,
 }
 
-/// Umbral mínimo de cobertura de área para considerar "borderless fullscreen".
-const FULLSCREEN_COVERAGE_PCT: u128 = 98;
+/// `app_id` de las superficies del propio escritorio (fondo, paneles,
+/// docks). Nunca son pantalla completa aunque cubran el output sin bordes.
+const DESKTOP_SHELL_APP_IDS: &[&str] = &["plasmashell", "org.kde.plasmashell"];
 
-/// Tolerancia en píxeles por borde al comparar la geometría con el output.
-const EDGE_TOLERANCE_PX: i64 = 2;
-
-/// `true` si los dos bordes están a una distancia máxima de ±2 px.
-fn edge_within_tolerance(edge: i64, output_edge: i64) -> bool {
-    (edge - output_edge).abs() <= EDGE_TOLERANCE_PX
-}
-
-/// Decide si `win` cubre el output como una ventana borderless a pantalla completa.
-fn covers_output(win: &Rect, out: &Rect) -> bool {
-    // Cada borde debe quedar dentro de la tolerancia de ±2 px del borde del
-    // output (admite un pequeño margen interior o exterior).
-    let left_ok = edge_within_tolerance(i64::from(win.x), i64::from(out.x));
-    let top_ok = edge_within_tolerance(i64::from(win.y), i64::from(out.y));
-    let right_ok = edge_within_tolerance(win.right(), out.right());
-    let bottom_ok = edge_within_tolerance(win.bottom(), out.bottom());
-    if !(left_ok && top_ok && right_ok && bottom_ok) {
-        return false;
-    }
-
-    // Y el área debe cubrir al menos el 98 % del área del output.
-    let win_area = u128::from(win.w) * u128::from(win.h);
-    let out_area = u128::from(out.w) * u128::from(out.h);
-    win_area * 100 >= out_area * FULLSCREEN_COVERAGE_PCT
+/// `true` si `app_id` pertenece al shell del escritorio.
+fn is_desktop_shell(app_id: &str) -> bool {
+    DESKTOP_SHELL_APP_IDS
+        .iter()
+        .any(|id| app_id.eq_ignore_ascii_case(id))
 }
 
 /// Decide si la ventana activa es "efectivamente pantalla completa" en `out`.
 ///
-/// Reglas (contrato HU-35, §1.2):
+/// Reglas (contrato HU-35, §1.2, revisado en v0.2.22):
 /// 1. `own == true` → `false` (las ventanas de Jarvis se ignoran).
-/// 2. `out.name != w.output` → `false` (multimonitor: solo afecta al monitor
+/// 2. Shell del escritorio (`plasmashell`) → `false`.
+/// 3. `out.name != w.output` → `false` (multimonitor: solo afecta al monitor
 ///    donde está la esfera).
-/// 3. `w.fullscreen == true` → `true`.
-/// 4. Sin decoraciones y geometría que cubre ≥ 98 % del área del output con
-///    tolerancia de ±2 px por borde → `true`.
-/// 5. Cualquier otro caso → `false`.
+/// 4. Solo cuenta el estado fullscreen explícito del compositor
+///    (`w.fullscreen`: F11, `mpv --fs`, juegos). Una ventana sin bordes que
+///    cubre el output (maximizada con CSD: Chrome, VS Code, Flatpaks) **no** es
+///    pantalla completa.
 pub fn is_effectively_fullscreen(w: &WindowSnapshot, out: &OutputGeometry) -> bool {
-    if w.own {
+    if w.own || is_desktop_shell(&w.app_id) {
         return false;
     }
     if out.name != w.output {
         return false;
     }
-    if w.fullscreen {
-        return true;
-    }
-    if w.decorated {
-        return false;
-    }
-    covers_output(&w.geometry, &out.rect)
+    w.fullscreen
 }
 
 #[cfg(test)]
@@ -189,16 +153,17 @@ mod tests {
     }
 
     #[test]
-    fn borderless_exact_match_is_fullscreen() {
-        let w = snap("game", false, false, FULL_HD, "DP-1", false);
-        assert!(is_effectively_fullscreen(&w, &out("DP-1", FULL_HD)));
+    fn borderless_covering_output_is_not_fullscreen() {
+        // Ventana maximizada con CSD (Chrome, VS Code, Flatpak): sin bordes y
+        // cubriendo el output, pero sin estado fullscreen del compositor.
+        let w = snap("google-chrome", false, false, FULL_HD, "DP-1", false);
+        assert!(!is_effectively_fullscreen(&w, &out("DP-1", FULL_HD)));
     }
 
     #[test]
-    fn borderless_with_two_px_inset_is_fullscreen() {
-        // 2 px más pequeña en cada borde: sigue dentro de la tolerancia.
+    fn borderless_with_small_inset_is_not_fullscreen() {
         let w = snap(
-            "game",
+            "code",
             false,
             false,
             Rect {
@@ -210,44 +175,30 @@ mod tests {
             "DP-1",
             false,
         );
-        assert!(is_effectively_fullscreen(&w, &out("DP-1", FULL_HD)));
+        assert!(!is_effectively_fullscreen(&w, &out("DP-1", FULL_HD)));
     }
 
     #[test]
-    fn borderless_with_two_px_overshoot_is_fullscreen() {
-        // 2 px más grande en cada borde: también se acepta.
-        let w = snap(
-            "game",
-            false,
-            false,
-            Rect {
-                x: -2,
-                y: -2,
-                w: 1924,
-                h: 1084,
-            },
-            "DP-1",
-            false,
-        );
-        assert!(is_effectively_fullscreen(&w, &out("DP-1", FULL_HD)));
+    fn desktop_shell_is_never_fullscreen() {
+        // Escritorio de Plasma: `noBorder` y 1920×1080 al minimizarlo todo.
+        for app in ["plasmashell", "org.kde.plasmashell", "PlasmaShell"] {
+            let w = snap(app, false, false, FULL_HD, "DP-1", false);
+            assert!(
+                !is_effectively_fullscreen(&w, &out("DP-1", FULL_HD)),
+                "{app}"
+            );
+            let w = snap(app, true, false, FULL_HD, "DP-1", false);
+            assert!(
+                !is_effectively_fullscreen(&w, &out("DP-1", FULL_HD)),
+                "{app}"
+            );
+        }
     }
 
     #[test]
-    fn borderless_1919_wide_counts_via_98pct_coverage() {
-        // 1919×1080 cubre ~99,95 % del output: debe contar.
-        let w = snap(
-            "game",
-            false,
-            false,
-            Rect {
-                x: 0,
-                y: 0,
-                w: 1919,
-                h: 1080,
-            },
-            "DP-1",
-            false,
-        );
+    fn declared_fullscreen_borderless_is_fullscreen() {
+        // F11 en el navegador o un juego en pantalla completa.
+        let w = snap("firefox", true, false, FULL_HD, "DP-1", false);
         assert!(is_effectively_fullscreen(&w, &out("DP-1", FULL_HD)));
     }
 
@@ -259,7 +210,6 @@ mod tests {
 
     #[test]
     fn borderless_but_much_smaller_is_not_fullscreen() {
-        // No cubre el área ni llega a los bordes.
         let w = snap(
             "video",
             false,
@@ -269,25 +219,6 @@ mod tests {
                 y: 0,
                 w: 1920,
                 h: 500,
-            },
-            "DP-1",
-            false,
-        );
-        assert!(!is_effectively_fullscreen(&w, &out("DP-1", FULL_HD)));
-    }
-
-    #[test]
-    fn borderless_off_by_more_than_two_px_is_not_fullscreen() {
-        // El borde izquierdo queda a 3 px del output: fuera de tolerancia.
-        let w = snap(
-            "game",
-            false,
-            false,
-            Rect {
-                x: 3,
-                y: 0,
-                w: 1917,
-                h: 1080,
             },
             "DP-1",
             false,

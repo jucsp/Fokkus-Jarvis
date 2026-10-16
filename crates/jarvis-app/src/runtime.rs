@@ -207,9 +207,10 @@ impl ErrorOnce {
 /// de pantalla completa u oculta la superficie tras fundirla a transparente.
 /// `hud` (HU-36) drena los eventos del orquestador y presenta las burbujas en
 /// su propia capa solo cuando cambian o animan.
-/// `on_first_frame` se invoca una vez tras presentar el primer frame. "Salir"
-/// en el menú contextual termina el bucle; el resto de acciones se entregan a
-/// `on_command`.
+/// `on_first_frame` se invoca una vez tras presentar el primer frame. Los
+/// comandos llegan del menú contextual de la superficie y de `tray` (icono de
+/// la bandeja). "Salir" termina el bucle y "mostrar/ocultar" lo resuelve el
+/// propio bucle ([`Visibility`]); el resto se entrega a `on_command`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     surface: &mut dyn OverlaySurface,
@@ -221,6 +222,7 @@ pub fn run_loop(
     max_frames: Option<u64>,
     mut presence: Option<&mut FullscreenMonitor>,
     mut hud: Option<&mut HudPipeline>,
+    tray: Option<&Receiver<ShellCommand>>,
     on_first_frame: &mut dyn FnMut(),
     on_command: &mut CommandHandler<'_>,
 ) -> LoopExit {
@@ -230,8 +232,9 @@ pub fn run_loop(
     let mut opacity_target = look.get().opacity;
     let mut fade = OpacityFade::new(opacity_target, OPACITY_FADE);
     surface.set_opacity(opacity_target);
-    // La superficie está mapeada (la oculta solo la directiva `Hidden`).
+    // La superficie está mapeada (la oculta la directiva `Hidden`).
     let mut shown = true;
+    let mut visibility = Visibility::default();
     // Último tamaño rechazado: no se reintenta en cada frame.
     let mut rejected_size: Option<u32> = None;
 
@@ -254,9 +257,11 @@ pub fn run_loop(
         if shutdown.load(Ordering::SeqCst) {
             return LoopExit::Signal;
         }
-        while let Some(command) = surface.poll_command() {
+        let from_tray = tray.into_iter().flat_map(|rx| rx.try_iter());
+        for command in std::iter::from_fn(|| surface.poll_command()).chain(from_tray) {
             match command {
                 ShellCommand::Quit => return LoopExit::UserQuit,
+                ShellCommand::ToggleVisibility => visibility.toggle(shown),
                 other => on_command(other),
             }
         }
@@ -289,6 +294,7 @@ pub fn run_loop(
             ),
             None => PresenceDirective::Normal,
         };
+        let directive = visibility.apply(directive);
         let (show, auto) = match directive {
             PresenceDirective::Normal => (true, Opacity::OPAQUE),
             PresenceDirective::Dimmed(factor) => (true, factor),
@@ -333,6 +339,50 @@ pub fn run_loop(
             hud.frame(surface, frame, now);
         }
         clock.advance(now, state);
+    }
+}
+
+/// Visibilidad pedida por el usuario (clic en el icono de la bandeja), que
+/// prevalece sobre la directiva automática de pantalla completa.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Visibility {
+    /// El usuario ocultó la esfera.
+    hidden: bool,
+    /// El usuario la restauró mientras la pantalla completa la atenuaba u
+    /// ocultaba: se muestra normal hasta que esa situación termine.
+    forced: bool,
+}
+
+impl Visibility {
+    /// Alterna: si la esfera se ve, la oculta; si está oculta por cualquier
+    /// motivo (usuario o pantalla completa), la restaura.
+    pub fn toggle(&mut self, shown: bool) {
+        if shown && !self.hidden {
+            *self = Self {
+                hidden: true,
+                forced: false,
+            };
+        } else {
+            *self = Self {
+                hidden: false,
+                forced: true,
+            };
+        }
+    }
+
+    /// Combina la elección del usuario con la directiva automática.
+    pub fn apply(&mut self, directive: PresenceDirective) -> PresenceDirective {
+        if self.hidden {
+            return PresenceDirective::Hidden;
+        }
+        if directive == PresenceDirective::Normal {
+            self.forced = false;
+        }
+        if self.forced {
+            PresenceDirective::Normal
+        } else {
+            directive
+        }
     }
 }
 
@@ -623,6 +673,7 @@ mod tests {
             Some(5),
             None,
             None,
+            None,
             &mut || first += 1,
             &mut |_| {},
         );
@@ -652,6 +703,7 @@ mod tests {
             &mut || (JarvisState::Idle, 0.0),
             &shutdown,
             &AtomicBool::new(false),
+            None,
             None,
             None,
             None,
@@ -687,6 +739,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut || {},
             &mut |command| handled.push(command),
         );
@@ -707,6 +760,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(1),
+            None,
             None,
             None,
             &mut || {},
@@ -756,6 +810,7 @@ mod tests {
             Some(3),
             None,
             None,
+            None,
             &mut || {},
             &mut |_| {},
         );
@@ -802,6 +857,7 @@ mod tests {
             &shutdown,
             &AtomicBool::new(false),
             Some(2),
+            None,
             None,
             None,
             &mut || {},
@@ -876,6 +932,7 @@ mod tests {
             Some(frames),
             Some(&mut monitor),
             None,
+            None,
             &mut || {},
             &mut |_| {},
         );
@@ -900,6 +957,7 @@ mod tests {
             Some(5),
             None,
             Some(&mut hud),
+            None,
             &mut || {},
             &mut |_| {},
         );
@@ -921,6 +979,7 @@ mod tests {
             Some(3),
             None,
             Some(&mut hud),
+            None,
             &mut || {},
             &mut |_| {},
         );
@@ -940,6 +999,122 @@ mod tests {
     fn loop_hides_the_sphere_on_fullscreen() {
         let surface = run_with_presence(FullscreenBehavior::Hide, 36);
         assert!(!surface.is_visible());
+    }
+
+    #[test]
+    fn visibility_toggle_hides_and_restores() {
+        let mut v = Visibility::default();
+        assert_eq!(
+            v.apply(PresenceDirective::Normal),
+            PresenceDirective::Normal
+        );
+        v.toggle(true);
+        assert_eq!(
+            v.apply(PresenceDirective::Normal),
+            PresenceDirective::Hidden
+        );
+        v.toggle(false);
+        assert_eq!(
+            v.apply(PresenceDirective::Normal),
+            PresenceDirective::Normal
+        );
+    }
+
+    #[test]
+    fn visibility_toggle_overrides_fullscreen_until_it_ends() {
+        let mut v = Visibility::default();
+        // Oculta por pantalla completa: el clic la restaura.
+        v.toggle(false);
+        assert_eq!(
+            v.apply(PresenceDirective::Hidden),
+            PresenceDirective::Normal
+        );
+        assert_eq!(
+            v.apply(PresenceDirective::Dimmed(Opacity::from_pct(30))),
+            PresenceDirective::Normal
+        );
+        // Termina la pantalla completa: la próxima vuelve a aplicar.
+        assert_eq!(
+            v.apply(PresenceDirective::Normal),
+            PresenceDirective::Normal
+        );
+        assert_eq!(
+            v.apply(PresenceDirective::Hidden),
+            PresenceDirective::Hidden
+        );
+    }
+
+    #[test]
+    fn tray_commands_toggle_visibility_and_quit() {
+        let mut view = SphereView::new(32).unwrap();
+        let mut surface = headless(&view);
+        surface.set_visible(true);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        tx.send(ShellCommand::ToggleVisibility).unwrap();
+        tx.send(ShellCommand::QuickPanelDefault).unwrap();
+        let shutdown = AtomicBool::new(false);
+        let mut handled = Vec::new();
+        // ~0,6 s: suficiente para el fundido de 150 ms.
+        let exit = run_loop(
+            &mut surface,
+            &mut view,
+            &look(32),
+            &mut || (JarvisState::Idle, 0.0),
+            &shutdown,
+            &AtomicBool::new(false),
+            Some(36),
+            None,
+            None,
+            Some(&rx),
+            &mut || {},
+            &mut |command| handled.push(command),
+        );
+        assert_eq!(exit, LoopExit::MaxFrames);
+        assert!(!surface.is_visible(), "el clic en la bandeja la oculta");
+        assert_eq!(handled, vec![ShellCommand::QuickPanelDefault]);
+
+        // Dos clics en el mismo bucle: oculta y, tras el fundido, restaura.
+        let mut surface = headless(&view);
+        surface.set_visible(true);
+        tx.send(ShellCommand::ToggleVisibility).unwrap();
+        let second = tx.clone();
+        let clicker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            second.send(ShellCommand::ToggleVisibility).unwrap();
+        });
+        run_loop(
+            &mut surface,
+            &mut view,
+            &look(32),
+            &mut || (JarvisState::Idle, 0.0),
+            &shutdown,
+            &AtomicBool::new(false),
+            Some(48),
+            None,
+            None,
+            Some(&rx),
+            &mut || {},
+            &mut |_| {},
+        );
+        clicker.join().unwrap();
+        assert!(surface.is_visible(), "el segundo clic la restaura");
+
+        tx.send(ShellCommand::Quit).unwrap();
+        let exit = run_loop(
+            &mut surface,
+            &mut view,
+            &look(32),
+            &mut || (JarvisState::Idle, 0.0),
+            &shutdown,
+            &AtomicBool::new(false),
+            None,
+            None,
+            None,
+            Some(&rx),
+            &mut || {},
+            &mut |_| {},
+        );
+        assert_eq!(exit, LoopExit::UserQuit);
     }
 
     #[test]

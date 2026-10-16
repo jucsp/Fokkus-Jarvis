@@ -18,10 +18,13 @@
 //! - [`models`]: descarga y verificación segura de modelos whisper (HU-7).
 //! - [`brain`]: cliente de la API de Mensajes de Anthropic con streaming SSE y
 //!   memoria de turnos (HU-6).
+//! - [`agent`]: matriz de riesgo y confirmación vocal del agente visual
+//!   (HU-39).
 //! - [`orchestrator`]: cableado de punta a punta `VoiceEvent` → STT → Claude →
 //!   TTS con barge-in y silencio real (HU-9).
 
 pub mod activation;
+pub mod agent;
 pub mod brain;
 pub mod conversation;
 pub mod dsp;
@@ -60,8 +63,8 @@ pub use models::{
     ModelSource, ModelSpec, ModelStatus, VerifiedModel, MODELS, WHISPER_BASE_Q5_1, WHISPER_TINY,
 };
 pub use orchestrator::{
-    AppLauncher, AudioSink, CaptureControl, EngineControl, LocalClock, VoiceConfig, VoiceDeps,
-    VoiceOrchestrator, VoiceSpeaker, VoiceStatsSnapshot,
+    AppLauncher, AudioSink, AutomationKill, CaptureControl, EngineControl, LocalClock, VoiceConfig,
+    VoiceDeps, VoiceOrchestrator, VoiceSpeaker, VoiceStatsSnapshot,
 };
 pub use playback::AudioPlayback;
 pub use speech_queue::{

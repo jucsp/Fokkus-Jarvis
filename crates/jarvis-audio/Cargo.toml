@@ -8,6 +8,7 @@ description = "Motor de audio full-duplex de Fokkus-Jarvis: voces, TTS con cach√
 
 [dependencies]
 jarvis-core = { path = "../jarvis-core" }
+jarvis-automation = { path = "../jarvis-automation" }
 crossbeam-channel.workspace = true
 serde.workspace = true
 cpal.workspace = true

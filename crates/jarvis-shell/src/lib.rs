@@ -6,7 +6,8 @@
 //!   `zwlr_layer_shell_v1` (KWin, Hyprland, Sway…).
 //! - [`HeadlessSurface`]: sin ventana; valida frames y regula el ritmo del bucle.
 //!
-//! [`window_watch`] detecta ventanas a pantalla completa (HU-35).
+//! [`window_watch`] detecta ventanas a pantalla completa (HU-35) y [`tray`]
+//! publica el icono de la bandeja del sistema (StatusNotifierItem).
 //!
 //! El backend `winit` (X11, Windows, macOS, GNOME) llega en otra tarea.
 
@@ -17,6 +18,9 @@ pub use jarvis_core::Opacity;
 
 mod headless;
 pub mod menu;
+#[cfg(all(test, target_os = "linux"))]
+mod test_bus;
+pub mod tray;
 #[cfg(target_os = "linux")]
 mod wayland_layer;
 pub mod window_watch;
@@ -205,6 +209,12 @@ pub enum ShellCommand {
     ChangeVoice,
     /// Abrir el Panel Rápido (QuickPanel PyQt6) en las coordenadas del clic.
     QuickPanel { x: i32, y: i32 },
+    /// Abrir el Panel Rápido sin coordenadas (menú de la bandeja): la
+    /// posición la decide el propio panel.
+    QuickPanelDefault,
+    /// Mostrar u ocultar la esfera (clic en el icono de la bandeja). Si está
+    /// oculta por cualquier motivo, la vuelve a mostrar.
+    ToggleVisibility,
     /// Cerrar Fokkus-Jarvis.
     Quit,
 }

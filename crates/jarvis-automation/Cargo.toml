@@ -1,0 +1,17 @@
+[package]
+name = "jarvis-automation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Ojos y manos multiplataforma (HU-38): captura de pantalla, entrada sintética y AutomationGuard."
+
+[dependencies]
+jarvis-core = { path = "../jarvis-core" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+flate2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true

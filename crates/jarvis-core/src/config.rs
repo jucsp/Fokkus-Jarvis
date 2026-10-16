@@ -167,6 +167,43 @@ pub struct JarvisConfig {
     /// Máximo de burbujas simultáneas del HUD (1–3, default 3).
     #[serde(default = "default_hud_max_bubbles")]
     hud_max_bubbles: u8,
+    /// Automatización de escritorio (HU-38, tabla `[automation]`). Va al final:
+    /// en TOML las tablas se emiten después de los valores simples.
+    pub automation: AutomationConfig,
+}
+
+/// Configuración de la capa "ojos y manos" (HU-38). Apagada por defecto:
+/// ninguna captura ni acción de entrada ocurre sin `enabled = true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutomationConfig {
+    /// Interruptor general de la automatización.
+    pub enabled: bool,
+    /// Permite el respaldo `ydotool` (requiere `ydotoold` y `/dev/uinput`).
+    pub allow_uinput: bool,
+    /// Tope del *token bucket* de acciones de entrada por segundo.
+    pub max_actions_per_sec: u32,
+    /// Duración de un *lease* de automatización en segundos.
+    pub lease_secs: u64,
+    /// Aplicaciones (id o fragmento del nombre) que nunca se capturan ni
+    /// controlan, además de la lista fija (gestores de contraseñas, polkit…).
+    pub excluded_apps: Vec<String>,
+    /// Registrar el texto tecleado en la auditoría. Con `false` solo se guarda
+    /// su longitud y su hash SHA-256.
+    pub audit_log_text: bool,
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_uinput: false,
+            max_actions_per_sec: 10,
+            lease_secs: 120,
+            excluded_apps: Vec::new(),
+            audit_log_text: false,
+        }
+    }
 }
 
 fn default_sphere_scale_pct() -> u16 {
@@ -227,6 +264,7 @@ impl Default for JarvisConfig {
             tasks_quiet_gap_ms: 1_500,
             hud_enabled: true,
             hud_max_bubbles: 3,
+            automation: AutomationConfig::default(),
         }
     }
 }
@@ -738,6 +776,42 @@ mod tests {
         let loaded = JarvisConfig::load_from(&path).unwrap();
         assert_eq!(loaded.sphere_opacity(), Opacity::from_pct(20));
         cleanup(&path);
+    }
+
+    #[test]
+    fn automation_is_disabled_by_default() {
+        let a = JarvisConfig::default().automation;
+        assert!(!a.enabled);
+        assert!(!a.allow_uinput);
+        assert_eq!(a.max_actions_per_sec, 10);
+        assert_eq!(a.lease_secs, 120);
+        assert!(a.excluded_apps.is_empty());
+        assert!(!a.audit_log_text);
+    }
+
+    #[test]
+    fn automation_table_roundtrips_and_partial_table_fills_defaults() {
+        let path = temp_config_path("automation-roundtrip");
+        cleanup(&path);
+        let mut config = JarvisConfig::default();
+        config.automation.enabled = true;
+        config.automation.excluded_apps = vec!["org.kde.kwalletmanager".into()];
+        config.save_to(&path).unwrap();
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("[automation]"), "{toml}");
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.automation, config.automation);
+        cleanup(&path);
+
+        let path2 = temp_config_path("automation-partial");
+        cleanup(&path2);
+        std::fs::create_dir_all(path2.parent().unwrap()).unwrap();
+        std::fs::write(&path2, "voice_id = \"x\"\n[automation]\nenabled = true\n").unwrap();
+        let loaded = JarvisConfig::load_from(&path2).unwrap();
+        assert!(loaded.automation.enabled);
+        assert_eq!(loaded.automation.max_actions_per_sec, 10);
+        assert_eq!(loaded.automation.lease_secs, 120);
+        cleanup(&path2);
     }
 
     #[test]

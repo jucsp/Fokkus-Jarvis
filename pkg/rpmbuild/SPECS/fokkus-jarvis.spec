@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.2.21
+Version:        0.2.22
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,6 +23,12 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.22-1
+- Fix UI: eliminar falso auto-ocultamiento en ventanas maximizadas CSD y desktop plasmashell (regla estricta de fullscreen).
+- Fix UI: soporte StatusNotifierItem (bandeja del sistema) vía D-Bus evitando aparición en la barra de tareas.
+- HU-38: crate jarvis-automation (geometría, captura multiplataforma, entrada, guard con kill switch y auditoría).
+- HU-39: matriz de riesgo dual (LowRisk autónomo vs HighRisk con autoverificación y confirmación vocal).
+
 * Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.21-1
 - Fix orquestador: restringir 'is_sounding' exclusivamente a 'Speaking' evitando falsos barge-ins en 'Thinking'.
 - Inferencia protegida: procesos largos de LLM/CLI en silencio no son cancelados por ruido ambiente.

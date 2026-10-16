@@ -347,6 +347,15 @@ mod tests {
         );
         assert_eq!(out.name, "DP-1");
         assert_eq!(out.rect, w.geometry);
+        // Sin bordes y cubriendo el output, pero sin estado fullscreen: no
+        // cuenta (ventanas maximizadas con CSD).
+        assert!(!jarvis_core::is_effectively_fullscreen(&w, &out));
+
+        let mut f = full_report();
+        f.insert("fullscreen".into(), ReportField::Bool(true));
+        let WindowEvent::Active(w, out) = parse_report(&f, &never_own).unwrap() else {
+            panic!("se esperaba Active");
+        };
         assert!(jarvis_core::is_effectively_fullscreen(&w, &out));
     }
 

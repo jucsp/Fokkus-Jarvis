@@ -16,6 +16,7 @@ crossbeam-channel.workspace = true
 serde_json.workspace = true
 ringbuf.workspace = true
 jarvis-audio = { path = "../jarvis-audio" }
+jarvis-automation = { path = "../jarvis-automation" }
 jarvis-core = { path = "../jarvis-core" }
 jarvis-ipc = { path = "../jarvis-ipc" }
 jarvis-render = { path = "../jarvis-render" }

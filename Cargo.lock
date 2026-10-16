@@ -1276,11 +1276,12 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jarvis-app"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "cpal",
  "crossbeam-channel",
  "jarvis-audio",
+ "jarvis-automation",
  "jarvis-core",
  "jarvis-ipc",
  "jarvis-render",
@@ -1293,11 +1294,12 @@ dependencies = [
 
 [[package]]
 name = "jarvis-audio"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "cpal",
  "crossbeam-channel",
  "earshot",
+ "jarvis-automation",
  "jarvis-core",
  "keyring",
  "libc",
@@ -1315,8 +1317,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jarvis-automation"
+version = "0.2.22"
+dependencies = [
+ "flate2",
+ "jarvis-core",
+ "serde",
+ "serde_json",
+ "sha2",
+ "zbus",
+]
+
+[[package]]
 name = "jarvis-core"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "crossbeam-channel",
  "serde",
@@ -1325,7 +1339,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-ipc"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "jarvis-core",
  "serde",
@@ -1334,7 +1348,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-render"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "fontdue",
  "jarvis-core",
@@ -1343,7 +1357,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-shell"
-version = "0.2.21"
+version = "0.2.22"
 dependencies = [
  "crossbeam-channel",
  "jarvis-core",

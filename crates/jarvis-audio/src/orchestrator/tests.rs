@@ -1,7 +1,7 @@
 //! Integración del orquestador con dobles de captura, salida, STT y LLM.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -125,6 +125,7 @@ const SCRIPT: &[&str] = &[
     "Jarvis, revisa mis correos y dime si hay algo urgente", // 13: tarea pesada
     "Jarvis, cancela todas las tareas",                      // 14
     "Jarvis, qué tareas tengo",                              // 15
+    "Jarvis, detente",                                       // 16: kill switch
 ];
 
 struct ScriptTranscriber;
@@ -1364,4 +1365,68 @@ fn hud_full_channel_never_blocks() {
     drop(rx);
     hud.emit(HudEvent::Clear);
     HudTx::default().emit(HudEvent::Clear);
+}
+
+#[test]
+fn stop_automation_is_recognized_with_priority() {
+    for query in [
+        "para",
+        "Para.",
+        "¡Detente!",
+        "detente por favor",
+        "cancela",
+        "cancela eso ya",
+        "para ya",
+        "alto",
+        "basta",
+        "jarvis para",
+    ] {
+        assert_eq!(
+            local_command(query),
+            Some(LocalCommand::StopAutomation),
+            "{query}"
+        );
+    }
+    // "para" como preposición o "cancela" con objeto no son el kill switch.
+    assert_eq!(local_command("para qué sirve esto"), None);
+    assert_eq!(local_command("busca vuelos para mañana"), None);
+    assert_eq!(
+        local_command("cancela todas las tareas"),
+        Some(LocalCommand::CancelTask {
+            spoken_target: None
+        })
+    );
+    assert_eq!(
+        local_command("cancela todo"),
+        Some(LocalCommand::CancelTask {
+            spoken_target: None
+        })
+    );
+    assert!(matches!(
+        local_command("cancela la tarea de los correos"),
+        Some(LocalCommand::CancelTask { .. })
+    ));
+}
+
+#[test]
+fn stop_automation_by_voice_fires_the_kill_switch_without_llm() {
+    let kills = Arc::new(AtomicUsize::new(0));
+    let config = VoiceConfig {
+        automation_kill: Some({
+            let kills = Arc::clone(&kills);
+            Arc::new(move || {
+                kills.fetch_add(1, Ordering::SeqCst);
+                true
+            })
+        }),
+        ..fast()
+    };
+    let brain = FakeBrain::new("No debería hablar.");
+    let h = harness("stop-automation", Some(brain.clone()), config);
+
+    h.say_line(16); // "Jarvis, detente"
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(kills.load(Ordering::SeqCst), 1);
+    assert_eq!(h.stats().local_commands, 1);
+    assert!(brain.queries().is_empty(), "no pasa por el LLM");
 }

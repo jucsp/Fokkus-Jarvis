@@ -15,9 +15,15 @@ function send(payload) {
     callDBus(SERVICE, "/WindowWatch", SERVICE, "Report", payload);
 }
 
+// El escritorio (plasmashell) y los paneles/docks cubren el output sin
+// bordes: nunca son pantalla completa, se reportan como "sin ventana activa".
+function isShellWindow(w) {
+    return !!(w.desktopWindow || w.dock);
+}
+
 function report() {
     const w = current;
-    if (!w) {
+    if (!w || isShellWindow(w)) {
         send({ active: false });
         return;
     }

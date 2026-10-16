@@ -383,8 +383,7 @@ impl Drop for KwinScriptWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader};
-    use std::process::{Child, Command, Stdio};
+    use crate::test_bus::PrivateBus;
 
     #[test]
     fn values_lose_their_dbus_type() {
@@ -436,36 +435,6 @@ mod tests {
         emitter.emit(WindowEvent::SourceLost("x".into()));
         emitter.emit(WindowEvent::None);
         assert_eq!(rx.try_iter().count(), 3);
-    }
-
-    /// Bus de sesión privado (`dbus-daemon`), se mata al soltarlo.
-    struct PrivateBus {
-        child: Child,
-        address: String,
-    }
-
-    impl PrivateBus {
-        fn spawn() -> Option<Self> {
-            let mut child = Command::new("dbus-daemon")
-                .args(["--session", "--nofork", "--print-address"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
-            let mut line = String::new();
-            BufReader::new(child.stdout.take()?)
-                .read_line(&mut line)
-                .ok()?;
-            let address = line.trim().to_string();
-            (!address.is_empty()).then_some(Self { child, address })
-        }
-    }
-
-    impl Drop for PrivateBus {
-        fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
     }
 
     /// KWin falso: registra las llamadas de scripting.

@@ -9,3 +9,4 @@ Terminal=false
 Categories=Utility;AudioVideo;Audio;
 Keywords=jarvis;fokkus;asistente;voz;voice;ai;
 StartupNotify=false
+X-KDE-autostart-phase=2
