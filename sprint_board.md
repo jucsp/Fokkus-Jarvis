@@ -13,10 +13,21 @@ Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere 
 
 | HU | Versión | Tests | Autoría | Pendiente |
 |----|---------|-------|---------|-----------|
+| Fix Thinking Barge-In | v0.2.21 | 516 passed / 0 failed · clippy OK · fmt OK | DeepSeek Dev · Antigravity PO | — |
 | HU-AUDIO-CONTINUITY | v0.2.20 | 515 passed / 0 failed · clippy OK · fmt OK | DeepSeek (histéresis VAD, concatenación Thinking, merge HUD) · Antigravity PO | 🧪 Prueba con usuario en vivo |
 | HU-36 Speech Popups HUD | v0.2.18 | `make test` 512 passed / 0 failed · `make lint` OK · `make fmt-check` OK | DeepSeek (36.1–36.6: config, `hud` render, `TextRasterizer`) · Claude (36.7–36.14: `HudEvent`, `HudLayer`, `HudPipeline`, toggle, QA) | 🧪 36.15 prueba manual en KWin (PO) |
 | HU-37 Tareas pesadas en segundo plano | v0.2.17 | 474 passed / 0 failed | DeepSeek · Claude | 37.10b, 🧪 37.16, 37.17 |
 | HU-35 Pantalla completa Auto-Dim / Auto-Hide | v0.2.16 | 440 passed | DeepSeek · Claude | — |
+
+---
+
+## ✅ Fix Thinking Barge-In — Protección de inferencias largas y eliminación de falsos barge-ins · v0.2.21
+
+- `is_sounding()` restringido exclusivamente a `Speaking`: durante `Thinking` Jarvis no emite audio, eliminando candidatos de barge-in por ruido ambiental en silencios de razonamiento.
+- Preservación íntegra de contexto: el LLM/CLI puede pensar sin que micro-sonidos o respiraciones aborten la consulta ni disparen alucinaciones de seguimiento.
+- Test unitario `ambient_noise_during_thinking_does_not_abort_reasoning` en `orchestrator/tests.rs`.
+
+**QA Fix Thinking Barge-In 2026-10-16:** `make test` → 516 passed / 0 failed · clippy OK · fmt OK.
 
 ---
 

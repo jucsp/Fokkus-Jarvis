@@ -35,6 +35,8 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
   - _Alcance:_ Detección de voz en paralelo con cancelación de eco mientras Jarvis habla. Corte instantáneo de audio (< 50 ms) y transición inmediata a `listening` al hablar el usuario. Si hay tareas técnicas del Swarm en segundo plano (Claude/DeepSeek trabajando), la interrupción de voz NO mata el proceso a menos que el usuario lo ordene explícitamente.
 - [x] **feat(audio): continuidad de audio y conversación (histéresis VAD de dos niveles, concatenación de turnos en `Thinking` y fusión de globos HUD)** (HU-AUDIO-CONTINUITY) ✅ Cerrada en v0.2.20
   - _Alcance:_ Histéresis VAD de dos niveles (open 0.45, hold 0.25) y silencio extendido a 1200 ms / conector a 2000 ms para no cortar frases largas ni pausas naturales. `PendingUserTurn` y concatenación de continuaciones durante estado `Thinking`, de modo que una pausa de 1–2 s no pierda el contexto de la pregunta. Fusión y renovación de TTL de los globos de usuario en el HUD sin duplicación (✅ 515 tests pasando).
+- [x] **fix(audio): protección de inferencias largas y eliminación de falsos barge-ins en `Thinking`** (v0.2.21)
+  - _Alcance:_ `is_sounding()` restringido exclusivamente a `Speaking`, de modo que el ruido ambiental durante el razonamiento silencioso del LLM/CLI no dispara candidatos de barge-in ni aborta la consulta en vuelo. Test `ambient_noise_during_thinking_does_not_abort_reasoning` (✅ 516 tests pasando).
 
 ---
 

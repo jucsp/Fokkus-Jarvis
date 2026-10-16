@@ -730,6 +730,35 @@ fn noise_during_synthesis_does_not_cancel_the_locution() {
 }
 
 #[test]
+fn ambient_noise_during_thinking_does_not_abort_reasoning() {
+    let brain = FakeBrain::new("Voy con eso. Ya terminé.");
+    brain.set_reply("Voy con eso. Ya terminé.", Duration::from_millis(300));
+    let h = harness("ruido-thinking", Some(brain.clone()), fast());
+    h.say_line(1); // "Jarvis, ¿qué tal el clima?"
+    h.wait_state(JarvisState::Thinking);
+
+    // Ruido ambiente (voz sin palabra clave) mientras Jarvis razona en
+    // silencio: no hay audio sonando, así que no debe abrirse barge-in.
+    h.capture.set_vad(1.0);
+    h.voice_start();
+    std::thread::sleep(Duration::from_millis(300));
+
+    assert_eq!(
+        h.core.state(),
+        JarvisState::Thinking,
+        "el razonamiento sigue"
+    );
+    assert_eq!(h.stats().barge_ins, 0, "el ruido no es barge-in");
+
+    // El turno original completa su respuesta intacta.
+    h.capture.set_vad(0.0);
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(brain.queries(), vec!["¿qué tal el clima?".to_string()]);
+    assert_eq!(h.stats().turns, 1);
+    assert_eq!(h.stats().speech_errors, 0);
+}
+
+#[test]
 fn own_echo_pauses_briefly_then_resumes_and_is_not_transcribed() {
     let brain = FakeBrain::new("Uno. Dos. Tres. Cuatro.");
     brain.set_reply("Uno. Dos. Tres. Cuatro.", Duration::from_millis(20));

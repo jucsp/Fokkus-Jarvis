@@ -1447,14 +1447,7 @@ impl ControlLoop {
         };
         let interrupted = match self.core.state() {
             JarvisState::Speaking => barge_in(&self.core, &self.playback, client),
-            JarvisState::Thinking => {
-                // Habla encima del filler: se calla y el turno nuevo (al
-                // cerrar el segmento) reemplaza al que está pensando.
-                self.playback.stop();
-                true
-            }
             _ => {
-                // La locución terminó durante la confirmación.
                 self.playback.resume();
                 false
             }
@@ -1483,12 +1476,9 @@ impl ControlLoop {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(at);
     }
 
-    /// `true` si Jarvis está hablando o diciendo un filler.
+    /// `true` si Jarvis está emitiendo audio por los altavoces.
     fn is_sounding(&self) -> bool {
-        matches!(
-            self.core.state(),
-            JarvisState::Speaking | JarvisState::Thinking
-        )
+        self.core.state() == JarvisState::Speaking
     }
 
     /// Entrega un turno al cerebro, cancelando el que esté en curso.
