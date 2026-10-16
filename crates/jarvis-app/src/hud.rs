@@ -384,4 +384,48 @@ mod tests {
         assert!(two.height > one.height, "{one:?} → {two:?}");
         assert!(two.height <= 260);
     }
+
+    #[test]
+    fn the_layer_reappears_after_every_hide_cycle() {
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        let mut hud = HudPipeline::new(rx);
+        let mut surface = surface();
+        let mut now = Instant::now();
+
+        for turn in 1..=4u64 {
+            let before = surface.hud_presented_frames();
+            tx.send(HudEvent::UserSaid {
+                turn,
+                text: format!("frase {turn}"),
+            })
+            .unwrap();
+            assert!(
+                hud.frame(&mut surface, ctx(true), now),
+                "turno {turn}: usuario"
+            );
+            assert!(surface.hud_layer().unwrap().is_visible());
+
+            // La respuesta llega con la capa ya visible y cambia su alto.
+            now += Duration::from_millis(500);
+            tx.send(HudEvent::JarvisPhrase {
+                turn,
+                text: format!("Respuesta número {turn}."),
+            })
+            .unwrap();
+            tx.send(HudEvent::JarvisDone { turn }).unwrap();
+            assert!(
+                hud.frame(&mut surface, ctx(true), now),
+                "turno {turn}: Jarvis"
+            );
+            assert_eq!(hud.bubbles(), 2);
+            assert!(surface.hud_presented_frames() >= before + 2);
+
+            // Expiran los dos globos: la capa se oculta.
+            now += Duration::from_secs(10);
+            assert!(!hud.frame(&mut surface, ctx(true), now));
+            assert_eq!(hud.bubbles(), 0);
+            assert!(!surface.hud_layer().unwrap().is_visible());
+            now += Duration::from_millis(16);
+        }
+    }
 }

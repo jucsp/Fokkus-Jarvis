@@ -4,7 +4,7 @@
 //! Funciona sobre frames de 256 muestras a 16 kHz (16 ms). Mantiene:
 //! * **Hangover de apertura** (`open_frames`): cuántos frames de voz seguidos se
 //!   necesitan para declarar inicio de voz.
-//! * **Silencio de cierre** (`silence_ms`, 450 ms por defecto): cuánto silencio
+//! * **Silencio de cierre** (`silence_ms`, 750 ms por defecto): cuánto silencio
 //!   continuo cierra el turno. Si el STT informa un conector ("y…", "pero…"),
 //!   [`signal_connector`](Endpointer::signal_connector) extiende la espera a
 //!   `extended_silence_ms` (1,2 s).
@@ -44,7 +44,7 @@ impl Default for EndpointConfig {
         Self {
             threshold: 0.5,
             open_frames: 2,
-            silence_ms: 450,
+            silence_ms: 750,
             extended_silence_ms: 1_200,
             pre_roll_ms: 300,
             max_segment_ms: 30_000,
@@ -59,7 +59,7 @@ impl EndpointConfig {
     }
 
     fn frames_for(ms: u32, frame_ms: u32) -> usize {
-        // Redondeo hacia arriba: un silencio de 450 ms son ceil(450/16) = 29 frames.
+        // Redondeo hacia arriba: un silencio de 750 ms son ceil(750/16) = 47 frames.
         (ms as usize).div_ceil(frame_ms as usize)
     }
 
@@ -301,7 +301,7 @@ mod tests {
     fn frame_ms_and_close_frames_are_consistent() {
         let cfg = EndpointConfig::default();
         assert_eq!(cfg.frame_ms(), 16);
-        assert_eq!(cfg.close_frames(), 29); // 450 / 16 = 28.125 → 29
+        assert_eq!(cfg.close_frames(), 47); // 750 / 16 = 46.875 → 47
         assert_eq!(cfg.extended_close_frames(), 75); // 1200 / 16
         assert_eq!(cfg.pre_roll_frames(), 19); // 300 / 16 = 18.75 → 19
         assert_eq!(cfg.max_speech_frames(), 1875); // 30000 / 16 (pre-roll incluido)
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn pause_shorter_than_endpoint_does_not_close() {
-        let cfg = EndpointConfig::default(); // 450 ms = 29 frames
+        let cfg = EndpointConfig::default(); // 750 ms = 47 frames
         let mut ep = Endpointer::new(cfg);
         let mut now = Instant::now();
 
@@ -350,8 +350,8 @@ mod tests {
         now += std::time::Duration::from_millis(16);
         assert!(ep.process(&voice_frame(), 0.9, now).is_none());
 
-        // 28 frames de silencio no cierran; el frame 29 sí.
-        feed_silence(&mut ep, 28, &mut now);
+        // 46 frames de silencio no cierran; el frame 47 sí.
+        feed_silence(&mut ep, 46, &mut now);
         assert!(ep.is_speaking());
         now += std::time::Duration::from_millis(16);
         assert!(matches!(
@@ -362,7 +362,7 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_silence_of_450ms_closes() {
+    fn endpoint_silence_of_750ms_closes() {
         let cfg = EndpointConfig::default();
         let mut ep = Endpointer::new(cfg);
         let mut now = Instant::now();
@@ -371,10 +371,10 @@ mod tests {
         now += std::time::Duration::from_millis(16);
         ep.process(&voice_frame(), 0.9, now);
 
-        // 28 frames de silencio (448 ms): aún abierto.
-        feed_silence(&mut ep, 28, &mut now);
+        // 46 frames de silencio (736 ms): aún abierto.
+        feed_silence(&mut ep, 46, &mut now);
         assert!(ep.is_speaking());
-        // El frame 29 cierra (464 ms).
+        // El frame 47 cierra (752 ms).
         now += std::time::Duration::from_millis(16);
         assert!(matches!(
             ep.process(&frame(0.0), 0.0, now),
@@ -431,17 +431,17 @@ mod tests {
             Some(VoiceEvent::VoiceStart { .. })
         ));
 
-        // 28 frames de silencio no cierran; el 29.º cierra.
-        feed_silence(&mut ep, 28, &mut now);
+        // 46 frames de silencio no cierran; el 47.º cierra.
+        feed_silence(&mut ep, 46, &mut now);
         assert!(ep.is_speaking());
         now += std::time::Duration::from_millis(16);
         match ep.process(&frame(0.0), 0.0, now) {
             Some(VoiceEvent::EndOfTurn { segment, .. }) => {
-                // pre-roll (19) + 1 voz + 29 silencio = 49 frames.
-                assert_eq!(segment.pcm.len(), 49 * FRAME_SAMPLES);
+                // pre-roll (19) + 1 voz + 47 silencio = 67 frames.
+                assert_eq!(segment.pcm.len(), 67 * FRAME_SAMPLES);
                 // Los primeros 19 frames (304 ms) son el pre-roll de silencio.
                 assert!(segment.pcm[..19 * FRAME_SAMPLES].iter().all(|s| *s == 0.0));
-                assert_eq!(segment.duration_ms, 49 * 16);
+                assert_eq!(segment.duration_ms, 67 * 16);
             }
             other => panic!("esperaba EndOfTurn, obtuve {other:?}"),
         }
@@ -493,10 +493,10 @@ mod tests {
         now += std::time::Duration::from_millis(16);
         assert!(ep.process(&frame(0.0), 0.0, now).is_some());
 
-        // Nuevo turno sin conector: vuelve a cerrar a los 450 ms.
+        // Nuevo turno sin conector: vuelve a cerrar a los 750 ms.
         now += std::time::Duration::from_millis(16);
         ep.process(&voice_frame(), 0.9, now);
-        feed_silence(&mut ep, 28, &mut now);
+        feed_silence(&mut ep, 46, &mut now);
         now += std::time::Duration::from_millis(16);
         assert!(ep.process(&frame(0.0), 0.0, now).is_some());
     }

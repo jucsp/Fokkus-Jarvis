@@ -272,8 +272,8 @@ impl HudLayer {
 }
 
 impl HudSurface for HudLayer {
-    /// Cambia el tamaño sin esperar al compositor: mientras llega el
-    /// `configure` los frames se descartan ([`HudSurface::wants_frame`]).
+    /// Cambia el tamaño sin esperar al compositor: el tamaño lo fija la app
+    /// y el buffer del siguiente frame ya lo respeta.
     fn set_size(&mut self, size: SurfaceSize) -> Result<(), SurfaceError> {
         if size == self.size {
             return Ok(());
@@ -286,9 +286,10 @@ impl HudSurface for HudLayer {
         }
         self.layer.set_size(size.width, size.height);
         self.reposition();
-        if self.visible {
-            self.configured = false;
-            self.frame_pending = false;
+        // No se espera un `configure` nuevo: KWin no lo emite si la geometría
+        // la fija la app, y el siguiente `present` adjunta un buffer de este
+        // tamaño exacto.
+        if self.visible && self.configured {
             self.layer.commit();
             self.conn.flush().map_err(backend_error)?;
         }
@@ -344,16 +345,52 @@ impl HudSurface for HudLayer {
         }
         self.visible = visible;
         if visible {
-            // Mapear exige un commit sin buffer y esperar el `configure`.
-            self.configured = false;
+            // Un frame callback pedido antes de ocultar puede no llegar nunca;
+            // si no hay buffer libre, `present` descarta el frame sin error.
             self.frame_pending = false;
+            if self.configured {
+                // Sigue mapeada (oculta con un buffer transparente): el
+                // siguiente `present` adjunta el buffer. KWin no reenvía
+                // `configure` a una capa ya configurada del mismo tamaño.
+                return;
+            }
+            // Primer mapeo (o remapeo tras un unmap real): commit sin buffer
+            // y se espera el `configure`.
             self.layer.set_size(self.size.width, self.size.height);
             self.reposition();
-        } else {
+        } else if let Err(e) = self.clear() {
+            // Sin buffer libre: unmap real; al volver hay que remapear.
+            eprintln!("[shell] HUD oculto con unmap ({e})");
             self.layer.wl_surface().attach(None, 0, 0);
+            self.configured = false;
+            self.frame_pending = false;
         }
         self.layer.commit();
         let _ = self.conn.flush();
+    }
+}
+
+impl HudLayer {
+    /// Adjunta un buffer totalmente transparente sin desmapear la capa (la
+    /// capa es click-through, así que oculta no estorba). Sin commit.
+    fn clear(&mut self) -> Result<(), SurfaceError> {
+        if !self.configured {
+            return Err(SurfaceError::Backend("capa sin configurar".to_string()));
+        }
+        let index = self
+            .free_buffer()?
+            .ok_or_else(|| SurfaceError::Backend("buffers del HUD ocupados".to_string()))?;
+        let buffer = &self.buffers[index];
+        let canvas = buffer
+            .canvas(&mut self.pool)
+            .ok_or_else(|| SurfaceError::Backend("buffer wl_shm del HUD ocupado".to_string()))?;
+        canvas.fill(0);
+        let surface = self.layer.wl_surface().clone();
+        let width = i32::try_from(self.size.width).map_err(backend_error)?;
+        let height = i32::try_from(self.size.height).map_err(backend_error)?;
+        buffer.attach_to(&surface).map_err(backend_error)?;
+        surface.damage_buffer(0, 0, width, height);
+        Ok(())
     }
 }
 
