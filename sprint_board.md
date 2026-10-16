@@ -13,9 +13,21 @@ Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere 
 
 | HU | Versión | Tests | Autoría | Pendiente |
 |----|---------|-------|---------|-----------|
+| HU-AUDIO-CONTINUITY | v0.2.20 | 515 passed / 0 failed · clippy OK · fmt OK | DeepSeek (histéresis VAD, concatenación Thinking, merge HUD) · Antigravity PO | 🧪 Prueba con usuario en vivo |
 | HU-36 Speech Popups HUD | v0.2.18 | `make test` 512 passed / 0 failed · `make lint` OK · `make fmt-check` OK | DeepSeek (36.1–36.6: config, `hud` render, `TextRasterizer`) · Claude (36.7–36.14: `HudEvent`, `HudLayer`, `HudPipeline`, toggle, QA) | 🧪 36.15 prueba manual en KWin (PO) |
 | HU-37 Tareas pesadas en segundo plano | v0.2.17 | 474 passed / 0 failed | DeepSeek · Claude | 37.10b, 🧪 37.16, 37.17 |
 | HU-35 Pantalla completa Auto-Dim / Auto-Hide | v0.2.16 | 440 passed | DeepSeek · Claude | — |
+
+---
+
+## ✅ HU-AUDIO-CONTINUITY — Continuidad de audio y conversación · v0.2.20
+
+- [x] Histéresis VAD de dos niveles (open 0.45, hold 0.25), silencio extendido 1200 ms / conector 2000 ms.
+- [x] `PendingUserTurn` y concatenación de continuaciones durante estado `Thinking`.
+- [x] Fusión y renovación de TTL de globos de usuario en HUD sin duplicación (`BubbleStack::push_user`).
+- [x] Tests unitarios en `jarvis-audio` y `jarvis-render` (515 passing).
+
+**QA HU-AUDIO-CONTINUITY 2026-10-16 (Claude):** `make test` → 515 passed / 0 failed · clippy OK · fmt OK. Pendiente 🧪 prueba con usuario en vivo.
 
 ---
 

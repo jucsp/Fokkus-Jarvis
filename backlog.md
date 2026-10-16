@@ -33,6 +33,8 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
   - _Alcance:_ Emisión inmediata (< 300 ms) de frases de confirmación contextuales (*"Entendido, déjame revisar..."*, *"Dame un segundo..."*) al entrar en estado `thinking`, eliminando el silencio incómodo mientras el LLM genera la respuesta completa. Transición fluida y natural al flujo de la respuesta principal.
 - [x] [#4](https://github.com/jucsp/Fokkus-Jarvis/issues/4) **feat(conversation): interrupción humana en tiempo real (Barge-In < 50 ms) vía AudioPlayback con preservación incondicional de procesos BackgroundTasks del Swarm**
   - _Alcance:_ Detección de voz en paralelo con cancelación de eco mientras Jarvis habla. Corte instantáneo de audio (< 50 ms) y transición inmediata a `listening` al hablar el usuario. Si hay tareas técnicas del Swarm en segundo plano (Claude/DeepSeek trabajando), la interrupción de voz NO mata el proceso a menos que el usuario lo ordene explícitamente.
+- [x] **feat(audio): continuidad de audio y conversación (histéresis VAD de dos niveles, concatenación de turnos en `Thinking` y fusión de globos HUD)** (HU-AUDIO-CONTINUITY) ✅ Cerrada en v0.2.20
+  - _Alcance:_ Histéresis VAD de dos niveles (open 0.45, hold 0.25) y silencio extendido a 1200 ms / conector a 2000 ms para no cortar frases largas ni pausas naturales. `PendingUserTurn` y concatenación de continuaciones durante estado `Thinking`, de modo que una pausa de 1–2 s no pierda el contexto de la pregunta. Fusión y renovación de TTL de los globos de usuario en el HUD sin duplicación (✅ 515 tests pasando).
 
 ---
 
