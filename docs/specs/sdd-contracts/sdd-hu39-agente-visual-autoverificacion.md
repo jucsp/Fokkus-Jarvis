@@ -87,15 +87,17 @@ Cada intención se traduce a un `ActionPlan`: lista de `Step` con **precondicion
 
 ### 2.3. Confirmación vocal para acciones críticas
 
-**Clasificación de riesgo** (`ActionRisk`), decidida por reglas locales —**no** por el modelo—:
+**Matriz de Criterio de Riesgo** (`ActionRiskLevel`), decidida por reglas locales —**no** por el modelo—. La clave operativa es distinguir entre acciones de **bajo riesgo** (flujo autónomo, sin confirmaciones repetitivas que rompan la experiencia) y acciones **críticas/laborales/personales/financieras** (verificación estricta + confirmación vocal obligatoria).
 
-| Riesgo | Ejemplos | Confirmación |
-|---|---|---|
-| `ReadOnly` | leer, buscar, navegar, desplazarse | No |
-| `Reversible` | escribir un borrador, abrir una pestaña, reproducir | No |
-| `Critical` | **enviar** mensajes/correos, publicar, comentar, comprar, pagar, borrar, aceptar invitaciones, cambiar ajustes de cuenta, subir archivos | **Sí, siempre** |
+| Riesgo | Ejemplos | Verificación | Confirmación vocal |
+|---|---|---|---|
+| `LowRisk` (Trivial / Multimedia / Gaming) | Play/pause en YouTube/Spotify, mover personaje en videojuegos, controles de cámara, scroll, navegación pasiva, reproducir/adelantar contenido | **Post-acción**: confirmar que el efecto esperado ocurrió (estado del reproductor, posición de la cámara, scroll). Sin precondiciones pesadas repetitivas. | **No** (sin confirmaciones repetitivas cada 5 s; el kill switch "para" sigue activo). |
+| `MediumRisk` (Reversible) | Escribir un borrador, abrir una pestaña, buscar, rellenar un formulario sin enviar | Pre-acción ligera (elemento correcto) + post-acción (valor escrito). | No, salvo que el borrador se vaya a enviar (entonces sube a `HighRisk`). |
+| `HighRisk` / `Critical` (Laboral / Personal / Financiera) | **Enviar** mensajes (WhatsApp, Telegram, Slack, email), publicar, comentar, **borrar archivos**, **ejecutar comandos en terminal**, compras, pagos, credenciales, manipulación de datos sensibles, aceptar invitaciones, subir archivos | **a) Autoverificación Pre-Acción estricta:** validar elemento exacto, destinatario correcto en el encabezado y foco en la caja de texto antes de escribir. **b) Post-acción** del efecto irreversible. | **Sí, siempre**, y específica: *"Voy a enviar este mensaje a X por WhatsApp que dice Y. ¿Procedo?"* |
 
-Las reglas marcan `Critical` toda acción final cuya tecla/botón sea Enter en un compositor de mensajería, o cuyo botón tenga nombre accesible en la lista {Enviar, Send, Publicar, Post, Comprar, Pagar, Eliminar, Delete, Confirmar…}. Si el planificador clasifica algo como `Reversible` pero las reglas dicen `Critical`, **gana `Critical`**.
+Las reglas marcan `HighRisk` toda acción final cuya tecla/botón sea Enter en un compositor de mensajería, o cuyo botón tenga nombre accesible en la lista {Enviar, Send, Publicar, Post, Comprar, Pagar, Eliminar, Delete, Confirmar, Borrar, `rm`, `sudo`…}. Si el planificador clasifica algo como `LowRisk`/`MediumRisk` pero las reglas dicen `HighRisk`, **gana `HighRisk`**. A la inversa, las reglas jamás rebajan un `HighRisk` marcado por el planificador.
+
+**Regla de no-bloqueo en acciones de bajo riesgo:** play/pause, scroll, navegación y controles de juego/cámara se ejecutan de forma **autónoma y fluida**, con verificación post-acción y sin confirmación vocal bloqueante. Solo se interrumpe con el kill switch explícito ("para", "detente", `Esc`×2) o ante fallo de la postcondición.
 
 **Protocolo de confirmación:**
 1. Jarvis lee en voz alta **destinatario + contenido exacto** (o resumen si > 25 palabras): *"Voy a enviarle a Mamá por WhatsApp: 'Llego a las 8'. ¿Lo envío?"*. El HUD (HU-36) muestra el borrador y el destinatario.
@@ -125,8 +127,9 @@ Si el planificador tiene visión, ambos roles los cumple el mismo proveedor. Si 
 | `BrainMode::Api` + `api_base_url` no oficial (proxy/compatible) | `GET /v1/models` si existe; si no, sondeo funcional | Desconocida → sondeo | Nativa si el sondeo pasa; si no, delegar. |
 | CLI `claude` | `argv[0]` resuelto == `claude` | **Nativa** | `claude -p --output-format json --allowedTools Read "<pregunta> Imagen: /run/user/…/frame-XXXX.png"` (la imagen se pasa como ruta legible solo por el usuario, `0600`, borrada tras la respuesta). |
 | CLI `codex` | `argv[0]` == `codex`; `codex exec --help` contiene `--image`/`-i` | **Nativa si el flag existe** | `codex exec -i <png> "<pregunta>"`. Sin flag → delegar. |
-| CLI `agy` (Antigravity) | `argv[0]` == `agy`; `--help` buscando flag de imagen/adjunto | **Desconocida** | Sondeo funcional (§2.4.2). Pasa → nativa con el mecanismo detectado; falla → delegar. |
-| CLI/API DeepSeek u otro modelo solo-texto | nombre del programa/modelo (`deepseek*`) o sondeo fallido | **No** | **Delegar** siempre. |
+| CLI `agy` (Antigravity) | `argv[0]` == `agy`; `--help` buscando flag de imagen/adjunto | **Desconocida** | Sondeo funcional (§2.4.2). Pasa → nativa con el mecanismo detectado; falla → delegar por AGI CLI. |
+| CLI/API DeepSeek con endpoint de visión | `api_base_url`/modelo `deepseek-vl*` o sondeo funcional positivo | **Nativa si el endpoint expone visión** | `POST /v1/chat/completions` con bloques `image_url` (data-URL base64). Sin endpoint de visión → delegar. |
+| CLI/API DeepSeek u otro modelo solo-texto | nombre del programa/modelo (`deepseek*` sin endpoint de visión) o sondeo fallido | **No** | **Delegar** siempre (preferentemente Claude o AGI CLI). |
 | CLI desconocido | — | Desconocida | Sondeo; por defecto delegar. |
 
 #### 2.4.2. Sondeo funcional de visión (`probe_vision`)
@@ -245,10 +248,10 @@ Con `prefer_local_vision = true` el paso 4 se adelanta al 2.
 ```rust
 // ── jarvis-audio/src/agent/risk.rs ───────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ActionRisk { ReadOnly, Reversible, Critical }
+pub enum ActionRiskLevel { Low, Medium, High }
 
 /// Reglas locales; el valor del planificador solo puede SUBIR el riesgo.
-pub fn classify_risk(step: &Step, target: &ElementInfo, planner_hint: ActionRisk) -> ActionRisk;
+pub fn classify_risk(step: &Step, target: &ElementInfo, planner_hint: ActionRiskLevel) -> ActionRiskLevel;
 
 // ── plan ─────────────────────────────────────────────────────────────────
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,7 +293,7 @@ pub struct Step {
     pub action: StepAction,
     pub pre: Vec<Precondition>,
     pub post: Vec<Postcondition>,
-    pub risk_hint: ActionRisk,
+    pub risk_hint: ActionRiskLevel,
     pub summary_for_user: String, // "enviar a Mamá: 'Llego a las 8'"
 }
 
@@ -438,7 +441,7 @@ impl VisualAgent {
 ## 8. Plan de tests
 
 **Unitarios**
-- `classify_risk`: Enter en compositor de mensajería → `Critical` aunque el hint sea `Reversible`; buscar → `Reversible`; botón "Eliminar" → `Critical`.
+- `classify_risk`: Enter en compositor de mensajería → `High` aunque el hint sea `Low`/`Medium`; buscar → `Low`; botón "Eliminar" → `High`; play/pause y scroll → `Low`.
 - `parse_confirmation`: 40 frases (sí/no/edición/ambiguas, con y sin wake-word, "sí pero cámbialo…").
 - `DualKeyVerifier`: Pass+Pass → Pass; Pass+Fail → Fail; DOM "Mamá" + visión "Mamá Pili" → Conflict.
 - `CapabilityMatrix::resolve`: tabla con todas las filas de §2.4.1 × presencia/ausencia de API key, `claude`, endpoint local, `prefer_local_vision`, `vision_cloud_allowed`.

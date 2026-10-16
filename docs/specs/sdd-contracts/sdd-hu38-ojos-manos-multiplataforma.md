@@ -94,6 +94,19 @@ jarvis-automation/
 └── probe.rs      (Capabilities)
 ```
 
+### 3.1.1. Arquitectura multiplataforma agnóstica (Patrón Strategy)
+
+La capa es **agnóstica del sistema operativo y del compositor**: `ScreenCapture` e `InputSynth` son los contratos de estrategia y los backends concretos se seleccionan en tiempo de ejecución con `probe_capture_backend()` / `probe_input_backend()`. El código de negocio (HU-39, `AutomationGuard`) solo conoce los traits, nunca una implementación concreta.
+
+| Plataforma | Sesión / compositor | Captura (ojos) | Entrada (manos) | Notas |
+|---|---|---|---|---|
+| **Linux** | KWin Wayland (KDE Plasma) | XDG Desktop Portal `Screenshot` (preferente) → `spectacle` (cliente privilegiado `ScreenShot2`); `grim` queda descartado (KWin no expone `wlr-screencopy`) | XDG Portal `RemoteDesktop` + `libei`/`reis` (preferente); `ydotool` solo con `allow_uinput = true` | Fedora, openSUSE, Arch, KDE Neon |
+| **Linux** | GNOME Wayland (Mutter) | XDG Desktop Portal `Screenshot` | XDG Portal `RemoteDesktop` (soportado por Mutter); `ydotool` como respaldo explícito | Fedora, Ubuntu, Debian |
+| **Linux** | wlroots (Sway, Hyprland, etc.) | `grim` (`zwlr_screencopy_manager_v1`) | `wtype` (teclado, `virtual-keyboard-unstable-v1`) + `ydotool` para puntero (o `wtype`/`ydotool` combinados según capacidad) | Arch, Linux Mint (con Sway/Hyprland) |
+| **Linux** | X11 nativo (GNOME/KDE/Xfce en sesión Xorg) | `x11rb` `XGetImage` | X11 XTest (`XTEST`) | Fedora, Ubuntu, Debian, Arch, Linux Mint |
+| **Windows** | Escritorio Windows 11/10 | `Windows.Graphics.Capture` (preferente) → GDI `BitBlt` (respaldo) | Win32 `SendInput` | UAC/UIPI: procesos elevados y escritorios seguros quedan excluidos por diseño del SO |
+| **macOS** | Aqua (macOS 12.3+) | `ScreenCaptureKit` (preferente, macOS 12.3+) → `CGWindowListCreateImage` (respaldo) | `CGEventPost` (CoreGraphics Event Services) con verificación del permiso de Accesibilidad | Requiere `TCC` de Accesibilidad y (si aplica) Grabación de pantalla |
+
 **Orden de selección de captura (Linux):** Portal `Screenshot` (no interactivo si hay permiso) → `spectacle` (si `XDG_CURRENT_DESKTOP=KDE`) → `grim` (si el global `zwlr_screencopy_manager_v1` existe) → X11 `GetImage` (`x11rb`).
 **Orden de selección de entrada (Linux):** Portal `RemoteDesktop` + libei → X11 XTest (solo sesión X11) → `ydotool` (solo si el usuario lo habilita explícitamente con `allow_uinput = true`).
 
@@ -156,6 +169,12 @@ pub trait ScreenCapture: Send {
     fn capture(&mut self, target: &CaptureTarget) -> Result<CapturedFrame, CaptureError>;
 }
 
+/// Selecciona e instancia el mejor backend de captura disponible para la
+/// plataforma/sesión actual (KWin Wayland, GNOME Wayland, wlroots, X11,
+/// WindowsGraphicsCapture/GDI o ScreenCaptureKit/CGWindowListCreateImage).
+/// `--check` usa el mismo selector para listar elegidos y descartados con motivo.
+pub fn probe_capture_backend() -> Result<Box<dyn ScreenCapture>, CaptureError>;
+
 // input
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MouseButton { Left, Right, Middle }
@@ -180,12 +199,32 @@ pub trait InputSynth: Send {
     fn perform(&mut self, action: &InputAction) -> Result<(), InputError>;
 }
 
+/// Selecciona e instancia el mejor backend de entrada disponible para la
+/// plataforma/sesión actual (Portal RemoteDesktop+libei, X11 XTest, ydotool,
+/// Win32 SendInput o CGEventPost).
+pub fn probe_input_backend() -> Result<Box<dyn InputSynth>, InputError>;
+
 // guard
 pub struct LeaseId(pub u64);
+
+/// Clasificación de riesgo de la acción (la define el planificador HU-39 y la
+/// consume el guard para decidir niveles de auditoría, límites de tasa y
+/// revocación). Es un espejo del `ActionRiskLevel` de HU-39, sin dependencia.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ActionRiskLevel {
+    /// Navegación pasiva, lectura, scroll, reproducción multimedia, controles de
+    /// cámara en juegos: ejecución autónoma sin confirmación bloqueante.
+    Low,
+    /// Redacción de borradores, apertura de pestañas, acciones reversibles.
+    Medium,
+    /// Envío de mensajes/correos, borrado, compras, pagos, terminal, credenciales.
+    High,
+}
 
 pub struct AutomationGuard { /* cfg, active lease, token bucket, kill flag, audit */ }
 impl AutomationGuard {
     pub fn acquire(&self, purpose: &str, target_app: &str) -> Result<Lease, GuardError>;
+    pub fn acquire_with_risk(&self, purpose: &str, target_app: &str, risk: ActionRiskLevel) -> Result<Lease, GuardError>;
     pub fn kill(&self, reason: KillReason);            // idempotente, desde cualquier hilo
     pub fn is_killed(&self) -> bool;
 }
