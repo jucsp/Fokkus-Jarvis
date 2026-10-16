@@ -12,6 +12,9 @@ use std::sync::Arc;
 #[derive(Debug, Default)]
 struct PlaybackInner {
     stop_requested: AtomicBool,
+    /// Pausa provisional (barge-in sin confirmar): el callback emite silencio
+    /// sin consumir la cola, así la locución puede reanudarse intacta.
+    paused: AtomicBool,
     generation: AtomicU64,
 }
 
@@ -32,6 +35,7 @@ impl AudioPlayback {
     /// generación actual, que el productor debe adjuntar a sus segmentos.
     pub fn begin_utterance(&self) -> u64 {
         self.inner.stop_requested.store(false, Ordering::Relaxed);
+        self.inner.paused.store(false, Ordering::Relaxed);
         self.inner.generation.load(Ordering::Acquire)
     }
 
@@ -39,6 +43,21 @@ impl AudioPlayback {
     pub fn stop(&self) {
         self.inner.stop_requested.store(true, Ordering::Relaxed);
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Silencia la salida sin descartar la cola (barge-in por confirmar).
+    pub fn pause(&self) {
+        self.inner.paused.store(true, Ordering::Relaxed);
+    }
+
+    /// Reanuda la locución pausada (la voz detectada era eco).
+    pub fn resume(&self) {
+        self.inner.paused.store(false, Ordering::Relaxed);
+    }
+
+    /// `true` mientras la salida está en pausa provisional.
+    pub fn is_paused(&self) -> bool {
+        self.inner.paused.load(Ordering::Relaxed)
     }
 
     /// `true` si se ha solicitado parada desde el último `begin_utterance`.
@@ -93,6 +112,20 @@ mod tests {
         assert!(pb.is_stop_requested());
         assert!(pb.is_stale(gen));
         assert_eq!(pb.generation(), gen + 1);
+    }
+
+    #[test]
+    fn pause_survives_stop_and_is_cleared_by_the_next_utterance() {
+        let pb = AudioPlayback::new();
+        pb.pause();
+        assert!(pb.is_paused());
+        pb.resume();
+        assert!(!pb.is_paused());
+        pb.pause();
+        pb.stop();
+        assert!(pb.is_paused(), "la pausa sigue hasta la próxima locución");
+        pb.begin_utterance();
+        assert!(!pb.is_paused());
     }
 
     #[test]

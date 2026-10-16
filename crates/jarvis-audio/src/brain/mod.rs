@@ -1,12 +1,15 @@
 //! Cerebro conversacional (HU-6).
 //!
-//! Reúne el cliente síncrono de la API de Mensajes de Anthropic ([`client`]) y
-//! el parser SSE incremental ([`sse`]) que alimenta el streaming de texto para
+//! Reúne el cerebro por CLI local ([`cli`], p. ej. `agy --effort low --dangerously-skip-permissions -p`, sin API key), el
+//! cliente síncrono de la API de Mensajes de Anthropic ([`client`]) y el
+//! parser SSE incremental ([`sse`]) que alimenta el streaming de texto para
 //! que el TTS pueda empezar a hablar antes de que termine la respuesta.
 
+pub mod cli;
 pub mod client;
 pub mod sse;
 
+pub use cli::{split_command, CliBrain, DEFAULT_CLI_COMMAND, DEFAULT_CLI_TIMEOUT};
 pub use client::{
     resolve_api_key, store_api_key, BrainError, CancellationToken, ClaudeClient, Completion,
     Message, ANTHROPIC_BETA, ANTHROPIC_ENDPOINT, ANTHROPIC_VERSION, API_KEY_ENV, DEFAULT_EFFORT,

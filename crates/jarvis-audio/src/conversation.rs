@@ -21,9 +21,9 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use jarvis_core::{JarvisConfig, JarvisCore, JarvisState, TransitionError};
+use jarvis_core::{JarvisConfig, JarvisCore, JarvisState, SharedCore, TransitionError};
 
-use crate::brain::{BrainError, ClaudeClient, Completion};
+use crate::brain::{BrainError, ClaudeClient, CliBrain, Completion};
 use crate::playback::AudioPlayback;
 use crate::tts::{EdgeTtsEngine, FillerCategory, PcmAudio, PhraseSplitter, TtsError};
 
@@ -169,16 +169,35 @@ impl BackgroundTasks {
     }
 }
 
-/// Fuente de tokens de streaming. Permite probar el coordinador sin red
-/// inyectando un cliente falso.
-trait TokenStream {
+/// Fuente de tokens de streaming ([`ClaudeClient`] en producción). Permite
+/// probar el coordinador y el orquestador sin red inyectando un cliente falso.
+pub trait TokenStream {
+    /// Envía el turno y llama `on_token` con cada fragmento de texto.
     fn stream_tokens(
         &self,
         user_text: &str,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion, BrainError>;
 
+    /// Cancela la petición en curso (barge-in). Idempotente.
     fn cancel(&self);
+}
+
+/// Síntesis de una frase a PCM en memoria, inyectable (tests y orquestador).
+pub type SynthesizeFn = dyn Fn(&str) -> Result<PcmAudio, TtsError> + Send;
+
+impl TokenStream for CliBrain {
+    fn stream_tokens(
+        &self,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError> {
+        self.stream(user_text, on_token)
+    }
+
+    fn cancel(&self) {
+        CliBrain::cancel(self);
+    }
 }
 
 impl TokenStream for ClaudeClient {
@@ -195,9 +214,35 @@ impl TokenStream for ClaudeClient {
     }
 }
 
+/// Barge-in sin acceso exclusivo al coordinador.
+///
+/// Lo usa el orquestador desde el hilo de eventos de voz mientras el hilo del
+/// cerebro está dentro de [`ConversationCoordinator::run_turn_streaming_with`]:
+/// basta con la señal de reproducción (compartida), el cliente (cancelación
+/// atómica) y el núcleo compartido. Comprobar `Speaking` y pasar a `Listening`
+/// ocurre bajo el mismo lock, así que no compite con el fin natural de la
+/// locución. Las tareas del Swarm no se tocan (CA-9.4).
+///
+/// Devuelve `true` solo si hubo una interrupción efectiva.
+pub fn barge_in(core: &SharedCore, playback: &AudioPlayback, client: &dyn TokenStream) -> bool {
+    let mut core = core.lock();
+    if core.state() != JarvisState::Speaking {
+        // No hay locución que interrumpir: operación nula.
+        return false;
+    }
+    // Corte acústico instantáneo: señal de parada + invalidación de generación.
+    playback.stop();
+    // Cancela la inferencia en curso (idempotente si ya terminó).
+    client.cancel();
+    // La transición es válida por tabla, pero ante cualquier fallo no debe
+    // abortar la interrupción: el audio ya está detenido.
+    let _ = core.transition(JarvisState::Listening);
+    true
+}
+
 /// Coordinador del flujo conversacional (fillers + barge-in + streaming HU-9).
 pub struct ConversationCoordinator {
-    core: JarvisCore,
+    core: SharedCore,
     playback: AudioPlayback,
     tts: EdgeTtsEngine,
     background_tasks: BackgroundTasks,
@@ -206,10 +251,12 @@ pub struct ConversationCoordinator {
     utterance_generation: u64,
     /// `true` si el turno en curso fue interrumpido por barge-in.
     interrupted: bool,
-    /// Motor de síntesis inyectable, solo en tests.
-    #[cfg(test)]
-    #[allow(clippy::type_complexity)]
-    synth_override: Option<Box<dyn Fn(&str) -> Result<PcmAudio, TtsError>>>,
+    /// Si es `true`, el turno termina en `Speaking` y quien reproduce el
+    /// audio llama a [`finish_speech`](Self::finish_speech) cuando la cola de
+    /// reproducción se vacía (el stream del LLM acaba antes que la voz).
+    defer_finish: bool,
+    /// Motor de síntesis alternativo (dobles de prueba).
+    synth_override: Option<Box<SynthesizeFn>>,
 }
 
 impl ConversationCoordinator {
@@ -220,18 +267,43 @@ impl ConversationCoordinator {
 
     /// Crea el coordinador con una configuración de núcleo explícita.
     pub fn with_config(tts: EdgeTtsEngine, config: JarvisConfig) -> Self {
+        Self::with_shared_core(
+            tts,
+            SharedCore::new(JarvisCore::new(config)),
+            AudioPlayback::new(),
+        )
+    }
+
+    /// Crea el coordinador sobre el núcleo compartido con la esfera y el IPC
+    /// y sobre la señal de reproducción del motor de audio real.
+    pub fn with_shared_core(tts: EdgeTtsEngine, core: SharedCore, playback: AudioPlayback) -> Self {
         Self {
-            core: JarvisCore::new(config),
-            playback: AudioPlayback::new(),
+            core,
+            playback,
             tts,
             background_tasks: BackgroundTasks::new(),
             last_category: None,
             last_filler: None,
             utterance_generation: 0,
             interrupted: false,
-            #[cfg(test)]
+            defer_finish: false,
             synth_override: None,
         }
+    }
+
+    /// Sustituye la síntesis de frases (p. ej. por un doble de prueba).
+    pub fn with_synthesizer(
+        mut self,
+        synth: impl Fn(&str) -> Result<PcmAudio, TtsError> + Send + 'static,
+    ) -> Self {
+        self.synth_override = Some(Box::new(synth));
+        self
+    }
+
+    /// Ver el campo `defer_finish`: con reproducción asíncrona real, el turno
+    /// se cierra cuando el audio termina de sonar, no cuando acaba el stream.
+    pub fn set_deferred_finish(&mut self, deferred: bool) {
+        self.defer_finish = deferred;
     }
 
     /// Estado actual de la máquina de estados.
@@ -239,8 +311,8 @@ impl ConversationCoordinator {
         self.core.state()
     }
 
-    /// Referencia al núcleo (máquina de estados + bus de eventos).
-    pub fn core(&self) -> &JarvisCore {
+    /// Núcleo compartido (máquina de estados + bus de eventos).
+    pub fn core(&self) -> &SharedCore {
         &self.core
     }
 
@@ -252,6 +324,14 @@ impl ConversationCoordinator {
     /// Referencia al motor TTS.
     pub fn tts(&self) -> &EdgeTtsEngine {
         &self.tts
+    }
+
+    /// Cambia la voz activa en caliente (misma caché y binarios TTS).
+    ///
+    /// La caché de fillers es por voz, así que los de la voz nueva se
+    /// pre-sintetizan en segundo plano desde el orquestador.
+    pub fn set_voice(&mut self, voice_id: &str) {
+        self.tts = self.tts.for_voice(voice_id);
     }
 
     /// Categoría del último turno clasificado.
@@ -286,10 +366,11 @@ impl ConversationCoordinator {
 
     /// Pasa a `Listening` (arranque de captura tras wake-word / atajo).
     pub fn start_listening(&mut self) -> Result<(), ConversationError> {
-        match self.core.state() {
+        let mut core = self.core.lock();
+        match core.state() {
             JarvisState::Listening => Ok(()),
             JarvisState::Idle => {
-                self.core.transition(JarvisState::Listening)?;
+                core.transition(JarvisState::Listening)?;
                 Ok(())
             }
             other => Err(TransitionError::InvalidTransition {
@@ -317,12 +398,16 @@ impl ConversationCoordinator {
         // Nuevo turno: se limpia cualquier marca de interrupción anterior.
         self.interrupted = false;
 
-        // Se garantiza el paso por Listening antes de razonar.
-        if self.core.state() == JarvisState::Idle {
-            self.core.transition(JarvisState::Listening)?;
+        // Se garantiza el paso por Listening antes de razonar; ambas
+        // transiciones bajo el mismo lock (otro hilo puede mutear entre medio).
+        {
+            let mut core = self.core.lock();
+            if core.state() == JarvisState::Idle {
+                core.transition(JarvisState::Listening)?;
+            }
+            // Listening -> Thinking.
+            core.transition(JarvisState::Thinking)?;
         }
-        // Listening -> Thinking.
-        self.core.transition(JarvisState::Thinking)?;
 
         let category = classify_intent(text);
         self.last_category = Some(category);
@@ -356,22 +441,11 @@ impl ConversationCoordinator {
     ///
     /// Devuelve `true` solo si hubo una interrupción efectiva.
     pub fn handle_barge_in(&mut self, client: &ClaudeClient) -> bool {
-        if self.core.state() != JarvisState::Speaking {
-            // No hay locución que interrumpir: operación nula.
-            return false;
+        let interrupted = barge_in(&self.core, &self.playback, client);
+        if interrupted {
+            self.interrupted = true;
         }
-
-        // Corte acústico instantáneo: señal de parada + invalidación de generación.
-        self.playback.stop();
-        self.interrupted = true;
-        // Cancela la inferencia en curso (idempotente si ya terminó).
-        client.cancel();
-
-        // Speaking -> Listening de forma inmediata.
-        // La transición es válida por tabla, pero ante cualquier fallo no debe
-        // abortar la interrupción: el audio ya está detenido.
-        let _ = self.core.transition(JarvisState::Listening);
-        true
+        interrupted
     }
 
     /// Cierra el turno de locución.
@@ -382,8 +456,13 @@ impl ConversationCoordinator {
     ///   comando ya está en curso).
     pub fn finish_speech(&mut self, completed_naturally: bool) -> Result<(), ConversationError> {
         let was_interrupted = self.interrupted;
-        if completed_naturally && !was_interrupted && self.core.state() == JarvisState::Speaking {
-            self.core.transition(JarvisState::Idle)?;
+        if completed_naturally && !was_interrupted {
+            if let Some(result) = self
+                .core
+                .transition_from(JarvisState::Speaking, JarvisState::Idle)
+            {
+                result?;
+            }
         }
         self.interrupted = false;
         Ok(())
@@ -418,14 +497,16 @@ impl ConversationCoordinator {
         self.run_turn_streaming_with(client, user_text, &mut on_phrase_audio)
     }
 
-    fn run_turn_streaming_with<C, F>(
+    /// Igual que [`run_turn_streaming`](Self::run_turn_streaming) con
+    /// cualquier [`TokenStream`] (el orquestador y los tests inyectan dobles).
+    pub fn run_turn_streaming_with<C, F>(
         &mut self,
         client: &C,
         user_text: &str,
         on_phrase_audio: &mut F,
     ) -> Result<Completion, ConversationError>
     where
-        C: TokenStream,
+        C: TokenStream + ?Sized,
         F: FnMut(&str, &PcmAudio),
     {
         let generation = self.utterance_generation;
@@ -438,9 +519,9 @@ impl ConversationCoordinator {
             if self.interrupted || self.playback.is_stop_requested() {
                 client.cancel();
                 aborted = true;
-                if self.core.state() == JarvisState::Speaking {
-                    let _ = self.core.transition(JarvisState::Listening);
-                }
+                let _ = self
+                    .core
+                    .transition_from(JarvisState::Speaking, JarvisState::Listening);
                 return;
             }
 
@@ -449,20 +530,27 @@ impl ConversationCoordinator {
                 if self.interrupted || self.playback.is_stop_requested() {
                     client.cancel();
                     aborted = true;
-                    if self.core.state() == JarvisState::Speaking {
-                        let _ = self.core.transition(JarvisState::Listening);
-                    }
+                    let _ = self
+                        .core
+                        .transition_from(JarvisState::Speaking, JarvisState::Listening);
                     return;
                 }
 
                 // Primera frase de respuesta real: `Thinking → Speaking`.
-                if !saw_phrase && self.core.state() == JarvisState::Thinking {
-                    if self.core.transition(JarvisState::Speaking).is_err() {
-                        client.cancel();
-                        aborted = true;
-                        return;
+                if !saw_phrase {
+                    match self
+                        .core
+                        .transition_from(JarvisState::Thinking, JarvisState::Speaking)
+                    {
+                        Some(Ok(_)) => saw_phrase = true,
+                        // Otro hilo cambió el estado (barge-in, silencio):
+                        // la respuesta ya no debe sonar.
+                        Some(Err(_)) | None => {
+                            client.cancel();
+                            aborted = true;
+                            return;
+                        }
                     }
-                    saw_phrase = true;
                 }
 
                 if let Ok(pcm) = self.synthesize_phrase(&phrase) {
@@ -470,9 +558,9 @@ impl ConversationCoordinator {
                     if self.is_stale(generation) {
                         client.cancel();
                         aborted = true;
-                        if self.core.state() == JarvisState::Speaking {
-                            let _ = self.core.transition(JarvisState::Listening);
-                        }
+                        let _ = self
+                            .core
+                            .transition_from(JarvisState::Speaking, JarvisState::Listening);
                         return;
                     }
                     on_phrase_audio(&phrase, &pcm);
@@ -484,10 +572,23 @@ impl ConversationCoordinator {
         if !aborted {
             if let Some(remaining) = splitter.finish() {
                 if !self.interrupted && !self.playback.is_stop_requested() {
-                    if !saw_phrase && self.core.state() == JarvisState::Thinking {
-                        self.core.transition(JarvisState::Speaking)?;
+                    if !saw_phrase {
+                        match self
+                            .core
+                            .transition_from(JarvisState::Thinking, JarvisState::Speaking)
+                        {
+                            Some(result) => {
+                                result?;
+                            }
+                            None => aborted = true,
+                        }
                     }
-                    if let Ok(pcm) = self.synthesize_phrase(&remaining) {
+                    let pcm = if aborted {
+                        None
+                    } else {
+                        self.synthesize_phrase(&remaining).ok()
+                    };
+                    if let Some(pcm) = pcm {
                         if !self.is_stale(generation) {
                             on_phrase_audio(&remaining, &pcm);
                         }
@@ -498,18 +599,25 @@ impl ConversationCoordinator {
 
         match stream_result {
             Ok(completion) => {
-                if !aborted && !self.interrupted && !self.playback.is_stop_requested() {
+                if !aborted
+                    && !self.defer_finish
+                    && !self.interrupted
+                    && !self.playback.is_stop_requested()
+                {
                     self.finish_speech(true)?;
                 }
                 Ok(completion)
             }
-            Err(BrainError::Cancelled) if aborted => Ok(Completion::default()),
+            // Cualquier cancelación del cerebro es limpia (barge-in, hablar
+            // antes del primer token…): jamás debe escalarse como fallo de red
+            // (HU-32).
+            Err(BrainError::Cancelled) => Ok(Completion::default()),
             Err(e) => Err(ConversationError::Brain(e)),
         }
     }
 
-    fn synthesize_phrase(&self, text: &str) -> Result<PcmAudio, TtsError> {
-        #[cfg(test)]
+    /// Sintetiza una frase con el motor configurado (o el doble inyectado).
+    pub fn synthesize_phrase(&self, text: &str) -> Result<PcmAudio, TtsError> {
         if let Some(synth) = &self.synth_override {
             return synth(text);
         }
@@ -726,6 +834,23 @@ mod tests {
         assert_eq!(coord.state(), JarvisState::Thinking);
         assert_eq!(coord.last_category(), Some(FillerCategory::General));
         assert_eq!(filler, None);
+
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn set_voice_swaps_engine_without_losing_backend() {
+        let dir = temp_dir("voice-swap");
+        cleanup(&dir);
+        let engine = empty_engine(&dir);
+        let mut coord = ConversationCoordinator::new(engine);
+
+        assert_eq!(coord.tts().voice_id(), "es-CL-LorenzoNeural");
+        coord.set_voice("es-ES-ElviraNeural");
+        assert_eq!(coord.tts().voice_id(), "es-ES-ElviraNeural");
+        assert_eq!(coord.tts().voice_lang(), "es-ES");
+        // El backend y la caché se conservan (solo cambia la voz).
+        assert_eq!(coord.tts().cache_dir(), &dir);
 
         cleanup(&dir);
     }

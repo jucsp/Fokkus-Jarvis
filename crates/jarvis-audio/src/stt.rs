@@ -26,7 +26,7 @@ pub const MIN_SAMPLES: usize = SAMPLE_RATE * 11 / 10;
 pub const DEFAULT_LANGUAGE: &str = "es";
 
 /// Máximo de hilos de CPU para la inferencia.
-pub const MAX_THREADS: usize = 4;
+pub const MAX_THREADS: usize = 8;
 
 /// Etiqueta del backend para `--check` (CA-5.4).
 pub const BACKEND_LABEL: &str = "whisper-rs (whisper.cpp 1.9.x)";

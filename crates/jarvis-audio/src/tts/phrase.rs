@@ -3,6 +3,11 @@
 //! Acumula texto token a token y emite frases completas en cuanto detecta un
 //! delimitador de fin de frase, de modo que la síntesis de voz puede arrancar
 //! mientras el resto de la respuesta sigue generándose.
+//!
+//! Antes de segmentar, [`SpeechFilter`] descarta lo que nunca debe decirse en
+//! voz alta: bloques de razonamiento (`<thought>…</thought>`,
+//! `<thinking>…</thinking>`) y líneas de diagnóstico de la CLI (`jetski:`,
+//! `[INFO]`), aunque lleguen partidos entre varios tokens.
 
 /// Abreviaturas comunes en español que no deben partir la frase.
 const ABBREVIATIONS: &[&str] = &[
@@ -10,11 +15,198 @@ const ABBREVIATIONS: &[&str] = &[
     "vol", "aprox",
 ];
 
+/// Etiquetas de razonamiento (apertura sin `>`, cierre completo).
+const THOUGHT_TAGS: &[(&str, &str)] = &[("<thinking", "</thinking>"), ("<thought", "</thought>")];
+
+/// Prefijos de línea que delatan salida de diagnóstico, no respuesta.
+const NOISE_PREFIXES: &[&str] = &["jetski:", "[info]"];
+
+/// Filtro incremental de lo que no debe vocalizarse.
+///
+/// Retiene solo lo indispensable para decidir (un `<th` que puede ser el
+/// inicio de `<thought>`, un `jets` al inicio de línea) y deja pasar el resto
+/// en cuanto llega, para no frenar la síntesis.
+#[derive(Debug, Default)]
+struct SpeechFilter {
+    /// Texto recibido y aún sin decidir.
+    pending: String,
+    /// Etiqueta de cierre esperada mientras se está dentro de un bloque.
+    in_thought: Option<&'static str>,
+    /// Descartando hasta el próximo salto de línea.
+    skip_line: bool,
+    /// `false` al inicio de una línea (ahí se evalúan los prefijos de ruido).
+    mid_line: bool,
+}
+
+impl SpeechFilter {
+    fn push(&mut self, text: &str, out: &mut String) {
+        self.pending.push_str(text);
+        self.process(out, false);
+    }
+
+    /// Vuelca lo retenido: un bloque sin cerrar o una línea de ruido se
+    /// descartan; un prefijo indeciso era texto normal.
+    fn finish(&mut self, out: &mut String) {
+        self.process(out, true);
+        *self = Self::default();
+    }
+
+    fn process(&mut self, out: &mut String, eof: bool) {
+        while !self.pending.is_empty() {
+            if let Some(close) = self.in_thought {
+                match find_ignore_case(&self.pending, close) {
+                    Some(i) => {
+                        self.pending.drain(..i + close.len());
+                        self.in_thought = None;
+                        continue;
+                    }
+                    None => {
+                        // Solo se conserva una posible etiqueta de cierre partida.
+                        let keep = self
+                            .pending
+                            .rfind('<')
+                            .filter(|&i| starts_with_ignore_case(close, &self.pending[i..]))
+                            .unwrap_or(self.pending.len());
+                        self.pending.drain(..keep);
+                        return;
+                    }
+                }
+            }
+
+            if self.skip_line {
+                match self.pending.find('\n') {
+                    Some(i) => {
+                        self.pending.drain(..=i);
+                        self.skip_line = false;
+                        self.mid_line = false;
+                        continue;
+                    }
+                    None => {
+                        self.pending.clear();
+                        return;
+                    }
+                }
+            }
+
+            if !self.mid_line {
+                let line = self
+                    .pending
+                    .trim_start_matches(|c: char| c.is_whitespace() && c != '\n');
+                if line.starts_with('\n') {
+                    let lead = self.pending.len() - line.len() + 1;
+                    out.push_str(&self.pending[..lead]);
+                    self.pending.drain(..lead);
+                    continue;
+                }
+                if line.is_empty() {
+                    if eof {
+                        out.push_str(&self.pending);
+                        self.pending.clear();
+                    }
+                    return;
+                }
+                if NOISE_PREFIXES
+                    .iter()
+                    .any(|p| starts_with_ignore_case(line, p))
+                {
+                    self.skip_line = true;
+                    continue;
+                }
+                if !eof
+                    && NOISE_PREFIXES
+                        .iter()
+                        .any(|p| starts_with_ignore_case(p, line))
+                {
+                    return;
+                }
+                self.mid_line = true;
+            }
+
+            let Some(i) = self.pending.find(['<', '\n']) else {
+                out.push_str(&self.pending);
+                self.pending.clear();
+                return;
+            };
+            out.push_str(&self.pending[..i]);
+            self.pending.drain(..i);
+            if self.pending.starts_with('\n') {
+                out.push('\n');
+                self.pending.drain(..1);
+                self.mid_line = false;
+                continue;
+            }
+
+            // `pending` empieza con '<'.
+            if let Some(&(open, close)) = THOUGHT_TAGS.iter().find(|(open, _)| {
+                starts_with_ignore_case(&self.pending, open)
+                    && self.pending[open.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == '>' || c.is_whitespace())
+            }) {
+                match self.pending[open.len()..].find('>') {
+                    Some(end) => {
+                        self.pending.drain(..open.len() + end + 1);
+                        self.in_thought = Some(close);
+                        continue;
+                    }
+                    None if eof => {
+                        self.pending.clear();
+                        return;
+                    }
+                    None => return,
+                }
+            }
+            // Cierre huérfano: se descarta sin más.
+            if let Some(&(_, close)) = THOUGHT_TAGS
+                .iter()
+                .find(|(_, close)| starts_with_ignore_case(&self.pending, close))
+            {
+                self.pending.drain(..close.len());
+                continue;
+            }
+            // Etiqueta aún incompleta: esperar al siguiente token. Al cerrar el
+            // stream, un fragmento ya inequívoco (`<thin`, `</thou`) se
+            // descarta; uno ambiguo (`<th`) era texto.
+            let partial = THOUGHT_TAGS.iter().any(|(open, close)| {
+                starts_with_ignore_case(open, &self.pending)
+                    || starts_with_ignore_case(close, &self.pending)
+                    || self.pending.len() == open.len()
+                        && starts_with_ignore_case(&self.pending, open)
+            });
+            if partial && !eof {
+                return;
+            }
+            if partial && self.pending.trim_start_matches(['<', '/']).len() >= 4 {
+                self.pending.clear();
+                return;
+            }
+            out.push('<');
+            self.pending.drain(..1);
+        }
+    }
+}
+
+/// `haystack` empieza con `prefix` (ASCII sin distinguir mayúsculas).
+fn starts_with_ignore_case(haystack: &str, prefix: &str) -> bool {
+    haystack.len() >= prefix.len()
+        && haystack.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
+/// Posición de `needle` (ASCII, empieza con `<`) sin distinguir mayúsculas.
+fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|w| w.eq_ignore_ascii_case(needle.as_bytes()))
+}
+
 /// Segmentador incremental de frases para streaming LLM.
 #[derive(Debug)]
 pub struct PhraseSplitter {
     buffer: String,
     max_chars: usize,
+    filter: SpeechFilter,
 }
 
 impl PhraseSplitter {
@@ -22,6 +214,7 @@ impl PhraseSplitter {
         Self {
             buffer: String::new(),
             max_chars: 160,
+            filter: SpeechFilter::default(),
         }
     }
 
@@ -31,7 +224,7 @@ impl PhraseSplitter {
     }
 
     pub fn push(&mut self, text: &str) {
-        self.buffer.push_str(text);
+        self.filter.push(text, &mut self.buffer);
     }
 
     /// Devuelve las frases completas disponibles y las retira del buffer.
@@ -114,6 +307,7 @@ impl PhraseSplitter {
 
     /// Vacía y retorna el remanente pendiente, si lo hay.
     pub fn finish(&mut self) -> Option<String> {
+        self.filter.finish(&mut self.buffer);
         let trimmed = self.buffer.trim();
         let out = if trimmed.is_empty() {
             None
@@ -277,5 +471,84 @@ mod tests {
         splitter.push("hola mundo");
         assert_eq!(splitter.finish(), Some("hola mundo".to_string()));
         assert_eq!(splitter.finish(), None);
+    }
+
+    /// Empuja `text` de a un carácter (peor caso de streaming) y devuelve
+    /// todas las frases, incluido el remanente de `finish()`.
+    fn speak_streamed(text: &str) -> Vec<String> {
+        let mut splitter = PhraseSplitter::new();
+        let mut out = Vec::new();
+        for c in text.chars() {
+            splitter.push(&c.to_string());
+            out.extend(splitter.drain_available());
+        }
+        out.extend(splitter.finish());
+        out
+    }
+
+    #[test]
+    fn strips_thought_blocks_at_once() {
+        let mut splitter = PhraseSplitter::new();
+        splitter
+            .push("<thought>The user wants Spotify. I should answer.</thought>Abriendo Spotify. ");
+        splitter.push("<THINKING>\nmore reasoning.\n</THINKING>Listo.");
+        assert_eq!(
+            splitter.drain_available(),
+            vec!["Abriendo Spotify.", "Listo."]
+        );
+        assert_eq!(splitter.finish(), None);
+    }
+
+    #[test]
+    fn strips_thought_blocks_token_by_token() {
+        let text = "Hola. <thinking>Let me think. The user asked.</thinking>Son las tres. \
+                    <thought type=\"x\">Hidden.</thought>Chao.";
+        assert_eq!(
+            speak_streamed(text),
+            vec!["Hola.", "Son las tres.", "Chao."]
+        );
+    }
+
+    #[test]
+    fn unclosed_thought_is_dropped_on_finish() {
+        let mut splitter = PhraseSplitter::new();
+        splitter.push("Claro. <thought>I need to");
+        assert_eq!(splitter.drain_available(), vec!["Claro."]);
+        splitter.push(" open the app");
+        assert!(splitter.drain_available().is_empty());
+        assert_eq!(splitter.finish(), None);
+
+        assert_eq!(speak_streamed("Bueno <thinki"), vec!["Bueno"]);
+    }
+
+    #[test]
+    fn keeps_angle_brackets_that_are_not_tags() {
+        assert_eq!(
+            speak_streamed("Si a <b y b> c, listo."),
+            vec!["Si a <b y b> c, listo."]
+        );
+        assert_eq!(speak_streamed("tres <th"), vec!["tres <th"]);
+        assert_eq!(
+            speak_streamed("Cierre </thought>suelto."),
+            vec!["Cierre suelto."]
+        );
+    }
+
+    #[test]
+    fn drops_cli_noise_lines() {
+        let text = "[INFO] Loading model. Done.\njetski: no output produced\nHola, aquí estoy.";
+        assert_eq!(speak_streamed(text), vec!["Hola, aquí estoy."]);
+
+        let mut splitter = PhraseSplitter::new();
+        splitter.push("jetski: no output produced");
+        assert!(splitter.drain_available().is_empty());
+        assert_eq!(splitter.finish(), None);
+
+        // Solo al inicio de línea: en medio de una frase es texto normal.
+        assert_eq!(
+            speak_streamed("El log dice jetski: ok."),
+            vec!["El log dice jetski: ok."]
+        );
+        assert_eq!(speak_streamed("jets"), vec!["jets"]);
     }
 }

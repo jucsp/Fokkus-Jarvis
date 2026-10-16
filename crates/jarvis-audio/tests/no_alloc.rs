@@ -9,7 +9,12 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
 use jarvis_audio::dsp::{MonoResampler, Reframer};
-use jarvis_audio::io::{process_input_frame, process_output_frame, Fader};
+use std::sync::Arc;
+
+use jarvis_audio::io::{
+    process_input_frame, process_output_frame, Fader, InputPort, OutputPort, PortShared,
+};
+use jarvis_audio::AudioPlayback;
 use ringbuf::traits::{Producer, Split};
 use ringbuf::HeapRb;
 
@@ -134,4 +139,62 @@ fn reframer_and_resampler_do_not_allocate_per_frame() {
     });
     assert_eq!(n, 0, "el re-encuadre/remuestreo asignó {n} veces");
     assert!(frames > 0);
+}
+
+#[test]
+fn engine_input_port_does_not_allocate_for_f32_or_i16() {
+    let shared = Arc::new(PortShared::new(AudioPlayback::new()));
+    let (producer, _consumer) = HeapRb::<f32>::new(4_096).split();
+    let mut port = InputPort::new(producer, 2, Arc::clone(&shared));
+    // Más grande que el tramo interno: obliga a procesar por partes.
+    let f32_block: Vec<f32> = (0..10_000).map(|i| (i as f32 * 0.01).sin()).collect();
+    let i16_block: Vec<i16> = (0..10_000).map(|i| (i * 7 % 30_000) as i16).collect();
+    let n = allocations_in(|| {
+        for _ in 0..4 {
+            port.on_f32(&f32_block);
+            port.on_i16(&i16_block);
+            port.on_latency(std::time::Duration::from_millis(3));
+        }
+    });
+    assert_eq!(n, 0, "el puerto de entrada asignó {n} veces");
+    assert!(
+        shared.metrics.snapshot().input_dropped > 0,
+        "el ring debía llenarse"
+    );
+}
+
+#[test]
+fn engine_output_port_does_not_allocate_including_barge_in() {
+    let playback = AudioPlayback::new();
+    let shared = Arc::new(PortShared::new(playback.clone()));
+    shared
+        .render_tap
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let (mut tts, tts_cons) = HeapRb::<f32>::new(48_000).split();
+    let (render, _render_cons) = HeapRb::<f32>::new(2_048).split();
+    let mut port = OutputPort::new(tts_cons, render, 48_000, 2, Arc::clone(&shared));
+    tts.push_slice(&vec![0.5f32; 40_000]);
+    let mut out_f32 = vec![0.0f32; 6_000];
+    let mut out_i16 = vec![0i16; 6_000];
+
+    let n = allocations_in(|| {
+        for cb in 0..12 {
+            if cb == 2 {
+                playback.pause();
+            }
+            if cb == 3 {
+                playback.resume();
+            }
+            if cb == 4 {
+                playback.pause();
+                playback.stop();
+            }
+            port.fill_f32(&mut out_f32);
+            port.fill_i16(&mut out_i16);
+            port.on_latency(std::time::Duration::from_millis(20));
+        }
+    });
+    assert_eq!(n, 0, "el puerto de salida asignó {n} veces");
+    assert!(out_f32.iter().all(|s| *s == 0.0), "silencio tras la parada");
+    assert!(out_i16.iter().all(|s| *s == 0));
 }

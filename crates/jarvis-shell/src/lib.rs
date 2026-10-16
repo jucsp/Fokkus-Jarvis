@@ -11,11 +11,15 @@
 use std::fmt;
 use std::time::Duration;
 
+pub use jarvis_core::Opacity;
+
 mod headless;
+pub mod menu;
 #[cfg(target_os = "linux")]
 mod wayland_layer;
 
 pub use headless::HeadlessSurface;
+pub use menu::{ContextMenu, MenuItem};
 #[cfg(target_os = "linux")]
 pub use wayland_layer::{anchor_to_layer, WaylandLayerSurface};
 
@@ -184,6 +188,24 @@ pub enum SurfaceStatus {
     Closed,
 }
 
+/// Acción que el usuario pide desde la propia superficie (menú contextual).
+///
+/// Las acciones que solo afectan a la superficie (volver a la posición
+/// inicial) las resuelve el backend; estas las ejecuta la aplicación.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellCommand {
+    /// Silenciar o reactivar el micrófono.
+    ToggleMute,
+    /// Abrir el formulario de configuración.
+    Configure,
+    /// Abrir el selector de voces.
+    ChangeVoice,
+    /// Abrir el Panel Rápido (QuickPanel PyQt6) en las coordenadas del clic.
+    QuickPanel { x: i32, y: i32 },
+    /// Cerrar Fokkus-Jarvis.
+    Quit,
+}
+
 /// Contrato que debe cumplir cualquier backend de ventana flotante.
 pub trait OverlaySurface {
     /// Backend efectivo de la superficie (para el log y `--check`).
@@ -211,27 +233,77 @@ pub trait OverlaySurface {
 
     /// Re-ancla la superficie (drag de la esfera, tarea 1.4).
     fn set_anchor(&mut self, anchor: Anchor);
+
+    /// Devuelve la capa a su anclaje y margen originales (botón del panel).
+    fn reset_position(&mut self) {}
+
+    /// Siguiente acción pedida por el usuario desde la superficie, si la hay.
+    fn poll_command(&mut self) -> Option<ShellCommand> {
+        None
+    }
+
+    /// Informa si el micrófono está silenciado (etiqueta del menú contextual).
+    fn sync_muted(&mut self, _muted: bool) {}
+
+    /// Cambia el tamaño lógico de la superficie (HU-33).
+    ///
+    /// Los backends que no lo soportan devuelven
+    /// [`SurfaceError::BackendUnavailable`]: la app lo registra y aplica el
+    /// tamaño en el próximo arranque.
+    fn set_size(&mut self, size: SurfaceSize) -> Result<(), SurfaceError> {
+        let _ = size;
+        Err(SurfaceError::BackendUnavailable("resize"))
+    }
+
+    /// Opacidad global con la que se presentan los frames siguientes (HU-34).
+    ///
+    /// Es solo visual: la región de entrada no cambia.
+    fn set_opacity(&mut self, _opacity: Opacity) {}
 }
 
 /// Convierte píxeles RGBA premultiplicados (tiny-skia) a `Argb8888` de
 /// `wl_shm`, que en little-endian se guarda en memoria como BGRA.
 ///
 /// Solo intercambia R↔B y conserva el alfa: ambos formatos son
-/// premultiplicados, así que no se despremultiplica.
+/// premultiplicados, así que no se despremultiplica. Equivale a
+/// [`rgba_premul_to_argb8888_with_alpha`] con [`Opacity::OPAQUE`].
 pub fn rgba_premul_to_argb8888(src: &[u8], dst: &mut [u8]) -> Result<(), SurfaceError> {
+    rgba_premul_to_argb8888_with_alpha(src, dst, Opacity::OPAQUE)
+}
+
+/// Igual que [`rgba_premul_to_argb8888`], pero modula los cuatro canales por
+/// `opacity` en el mismo recorrido (HU-34).
+///
+/// Con premultiplicado, escalar los cuatro canales por `α` equivale a componer
+/// la capa con opacidad `α`. Usa `(c * a + 127) / 255`, igual que
+/// `jarvis_render::apply_opacity`, así que ambas rutas son bit a bit
+/// equivalentes. Con [`Opacity::OPAQUE`] no multiplica (atajo de coste cero).
+pub fn rgba_premul_to_argb8888_with_alpha(
+    src: &[u8],
+    dst: &mut [u8],
+    opacity: Opacity,
+) -> Result<(), SurfaceError> {
     if src.len() != dst.len() || !src.len().is_multiple_of(4) {
         return Err(SurfaceError::InvalidFrame {
             expected: src.len(),
             actual: dst.len(),
         });
     }
-    for (&[r, g, b, a], d) in src
+    let pixels = src
         .as_chunks::<4>()
         .0
         .iter()
-        .zip(dst.as_chunks_mut::<4>().0)
-    {
-        *d = [b, g, r, a];
+        .zip(dst.as_chunks_mut::<4>().0);
+    if opacity.is_opaque() {
+        for (&[r, g, b, a], d) in pixels {
+            *d = [b, g, r, a];
+        }
+    } else {
+        let alpha = u32::from(opacity.as_u8());
+        let scale = |c: u8| ((u32::from(c) * alpha + 127) / 255) as u8;
+        for (&[r, g, b, a], d) in pixels {
+            *d = [scale(b), scale(g), scale(r), scale(a)];
+        }
     }
     Ok(())
 }
@@ -339,5 +411,59 @@ mod tests {
         );
         let mut odd = [0u8; 6];
         assert!(rgba_premul_to_argb8888(&[0u8; 6], &mut odd).is_err());
+    }
+
+    #[test]
+    fn with_alpha_opaque_matches_plain_conversion() {
+        let src = [10, 20, 30, 40, 255, 0, 128, 255];
+        let mut plain = [0u8; 8];
+        let mut alpha = [0u8; 8];
+        rgba_premul_to_argb8888(&src, &mut plain).unwrap();
+        rgba_premul_to_argb8888_with_alpha(&src, &mut alpha, Opacity::OPAQUE).unwrap();
+        assert_eq!(plain, alpha);
+    }
+
+    #[test]
+    fn with_alpha_scales_all_channels() {
+        // Blanco opaco a 50 % → (128,128,128,128), como `apply_opacity`.
+        let src = [255, 255, 255, 255, 200, 100, 0, 200];
+        let mut dst = [0u8; 8];
+        rgba_premul_to_argb8888_with_alpha(&src, &mut dst, Opacity::from_pct(50)).unwrap();
+        assert_eq!(&dst[..4], &[128, 128, 128, 128]);
+        // BGRA: (0,100,200,200) × 128/255.
+        assert_eq!(&dst[4..], &[0, 50, 100, 100]);
+    }
+
+    #[test]
+    fn with_alpha_keeps_premultiplied_invariant() {
+        // Generador determinista: r,g,b ≤ a antes y después de modular.
+        let mut seed = 0x2545_f491_u32;
+        let mut src = vec![0u8; 4 * 10_000];
+        for px in src.as_chunks_mut::<4>().0 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let a = (seed >> 24) as u8;
+            let bytes = seed.to_le_bytes();
+            px[0] = bytes[0].min(a);
+            px[1] = bytes[1].min(a);
+            px[2] = bytes[2].min(a);
+            px[3] = a;
+        }
+        let mut dst = vec![0u8; src.len()];
+        for pct in [20, 33, 50, 70, 99] {
+            rgba_premul_to_argb8888_with_alpha(&src, &mut dst, Opacity::from_pct(pct)).unwrap();
+            for d in dst.as_chunks::<4>().0 {
+                assert!(d[0] <= d[3] && d[1] <= d[3] && d[2] <= d[3]);
+            }
+        }
+    }
+
+    #[test]
+    fn with_alpha_rejects_mismatched_lengths() {
+        let mut dst = [0u8; 4];
+        assert!(
+            rgba_premul_to_argb8888_with_alpha(&[0u8; 8], &mut dst, Opacity::from_pct(50)).is_err()
+        );
     }
 }

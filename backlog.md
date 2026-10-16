@@ -48,10 +48,63 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
+## 🎨 Épica 6: Experiencia Visual Adaptativa y Personalización de Interfaz
+- [x] **feat(ui): ajuste dinámico de tamaño de la burbuja en tiempo real** (HU-33)
+  - _Contexto de negocio:_ El usuario necesita redimensionar la presencia visual de Jarvis en su pantalla según su monitor o preferencia de trabajo, viendo el cambio en vivo sin reiniciar.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa a trabajar:_ `crates/jarvis-app` (Ajustes Generales PyQt6) y `crates/jarvis-shell` (Wayland layer-shell / winit resize).
+  - 📌 _Objetivo técnico:_ Proveer un control deslizante (50% a 200%) en Ajustes Generales que emita eventos reactivos inmediatos para escalar dinámicamente el canvas de renderizado y el ancho/alto de la superficie flotante. Implementado con canal stdout piped a 30 Hz y redimensionado O(1) de capa y región de entrada (✅ 398 tests pasando).
+- [x] **feat(ui): control de opacidad y transparencia variable de la esfera líquida** (HU-34)
+  - _Contexto de negocio:_ Permitir que Jarvis sea más o menos translúcido para trabajar cómodamente sobre código o ventanas sin tapar información crítica.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa a trabajar:_ `crates/jarvis-render` y `crates/jarvis-app`.
+  - 📌 _Objetivo técnico:_ Añadir parámetro de opacidad global en la configuración y modular el canal alfa durante la composición en `tiny-skia` con interpolador temporal lineal `OpacityFade` de 150 ms (✅ 398 tests pasando).
+- [ ] **feat(ui): detección universal de pantalla completa y modo ventana sin bordes (Auto-Dim / Auto-Hide)** (HU-35)
+  - _Contexto de negocio:_ Si el usuario entra a pantalla completa (video en YouTube, juego en modo frameless o Steam), Jarvis debe detectarlo genéricamente para no entorpecer la vista.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa a trabajar:_ `crates/jarvis-shell` / integración de ventanas de SO.
+  - 📌 _Objetivo técnico:_ Implementar un monitor agnóstico de estado de ventanas (KWin DBus / XDG toplevel / APIs nativas de OS) que active automáticamente atenuación de opacidad o minimizado temporal.
+- [ ] **feat(ui): mensajes efímeros flotantes en burbujas transparentes (Speech Popups HUD)** (HU-36)
+  - _Contexto de negocio:_ Confirmación visual rápida de lo que el usuario dijo y lo que Jarvis responde, sin recurrir a una ventana pesada de chat permanente.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa a trabajar:_ `crates/jarvis-render` / `crates/jarvis-shell`.
+  - 📌 _Objetivo técnico:_ Renderizar globos de texto translúcidos flotantes efímeros sobre la esfera (máximo 1-3 mensajes tipo HUD) que se desvanezcan tras unos segundos. Configurable (toggle On/Off) desde Ajustes Generales.
+
+---
+
+## 👁️ Épica 7: Agente Visual Multiplataforma y Automatización Generalista (Computer Use)
+- [ ] **feat(automation): tareas pesadas en segundo plano con notificación vocal secuencial vía IPC** (HU-37)
+  - _Contexto de negocio:_ Las tareas de larga duración (revisión de correos, Slack, análisis de datos) no deben bloquear la voz ni ser canceladas accidentalmente si el usuario sigue conversando.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa a trabajar:_ `crates/jarvis-audio` (orquestador de tareas) y `crates/jarvis-ipc`.
+  - 📌 _Objetivo técnico:_ Acuse de recibo vocal inmediato (< 1s), despacho a worker desacoplado que no se aborte por turnos posteriores, y encolamiento FIFO garantizado en `deferred` de `jarvis.speak` para entregar resultados completos sin colisiones de audio.
+- [ ] **feat(automation): ojos y manos multiplataforma (Screen Inspector & Input Synthesizer)** (HU-38)
+  - _Contexto de negocio:_ Dotar a Jarvis de capacidad genérica para ver la pantalla y enviar entradas de mouse/teclado de forma consistente en Linux (Wayland/X11) y Windows.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa a trabajar:_ `crates/jarvis-core` y nuevo módulo de automatización.
+  - 📌 _Objetivo técnico:_ Abstraer captura visual (XDG Portal / `grim` / WinAPI) e inyección de eventos de teclado/mouse (`enigo` / `wtype` / `ydotool`), con salvaguardas de seguridad.
+- [ ] **feat(automation): agente visual y de navegación web generalista (Computer Use / Visual Action Loop)** (HU-39)
+  - _Contexto de negocio:_ Permitir que la IA interactúe con cualquier aplicación web o de escritorio (WhatsApp Web, Instagram, portales internos) reconociendo elementos visuales y el DOM, en vez de crear integraciones rígidas una a una.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa a trabajar:_ `crates/jarvis-audio` / herramientas del cerebro CLI.
+  - 📌 _Objetivo técnico:_ Implementar un bucle de acción visual asistido (Playwright para navegación web desacoplada o Set-of-Marks para escritorio), con solicitud de confirmación vocal antes de acciones críticas o de envío.
+
+---
+
+## 🎙️ Épica 8: Personalización de Identidad y Activador Vocal Adaptativo
+- [ ] **feat(audio): nombre personalizable y entrenador fonético local de wake-word** (HU-40)
+  - _Contexto de negocio:_ El usuario puede renombrar al asistente y calibrar localmente las variantes acústicas con su propia voz para maximizar la tasa de acierto de activación.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa a trabajar:_ `crates/jarvis-audio` (detección de activación) y `crates/jarvis-app` (UI de entrenamiento).
+  - 📌 _Objetivo técnico:_ Permitir configurar el nombre en `config.toml`, con una herramienta de grabación guiada (3 muestras de voz) que transcriba y almacene las variantes fonéticas del usuario en el detector de wake-word. Prioridad baja.
+
+---
+
 ## 🧾 Deuda técnica
 
-- [ ] **Cablear el pipeline de voz en el binario** (hallazgo QA v0.2.1, bloqueante para "escucha y habla"): `jarvis-app` nunca abre streams `cpal` ni lanza `spawn_dsp_thread`/VAD/`WhisperEngine`/`ClaudeClient`/salida TTS. `start_listening()` solo cambia la máquina de estados. Los componentes existen y están testeados en `jarvis-audio`; falta el orquestador captura → DSP → VAD/endpointing → STT → activación → `run_turn_streaming` → playback. Delegar a DeepSeek V4 Pro con brief HU.
-- [ ] **Unificar `JarvisCore`** (hallazgo QA, HU-4 de `docs/specs/brief-hu-overlay-event-loop.md`): `ConversationCoordinator` y `ServerState` mantienen núcleos independientes. La esfera ya lee el estado de `ServerState::state()` (fuente de verdad del IPC) y el nivel de audio del coordinador, pero un `start_listening()` del coordinador no se refleja en el color de la esfera. Requiere compartir un único núcleo (`Arc<Mutex<JarvisCore>>` o eventos) cambiando APIs de `jarvis-ipc`/`jarvis-audio`.
+- [ ] **Cablear el pipeline de voz en el binario** (hallazgo QA v0.2.1, bloqueante para "escucha y habla"): `jarvis-app` nunca abre streams `cpal` ni lanza `spawn_dsp_thread`/VAD/`WhisperEngine`/`ClaudeClient`/salida TTS. `start_listening()` solo cambia la máquina de estados. Los componentes existen y están testeados en `jarvis-audio`; falta el orquestador captura → DSP → VAD/endpointing → STT → activación → `run_turn_streaming` → playback. Brief listo para DeepSeek V4 Pro: [`docs/specs/brief-hu9-orquestador-voz.md`](docs/specs/brief-hu9-orquestador-voz.md) (HU-ORQ-1 a HU-ORQ-5).
+- [x] **Clic derecho cerraba la app sin aviso** (feedback v0.2.1): ahora abre un menú contextual `xdg_popup` con *grab* (Silenciar/Activar micrófono, Posición inicial, Salir); clic fuera lo cierra. "Silenciar" hoy solo cambia el estado: liberar el micrófono queda en HU-ORQ-4.
+- [ ] **Unificar `JarvisCore`** (cubierto por HU-ORQ-4; hallazgo QA, HU-4 de `docs/specs/brief-hu-overlay-event-loop.md`): `ConversationCoordinator` y `ServerState` mantienen núcleos independientes. La esfera ya lee el estado de `ServerState::state()` (fuente de verdad del IPC) y el nivel de audio del coordinador, pero un `start_listening()` del coordinador no se refleja en el color de la esfera. Requiere compartir un único núcleo (`Arc<Mutex<JarvisCore>>` o eventos) cambiando APIs de `jarvis-ipc`/`jarvis-audio`.
 - [ ] **CPU en reposo de la esfera** (~6 % de un núcleo en release a 30 FPS): `SphereRenderer::render_into` cuesta ~1,6 ms por frame a 220×220. Objetivo M5 < 5 %: cachear el halo estático o bajar a 20 FPS en `Idle`.
 - [ ] **Clippy en Windows** (`--target x86_64-pc-windows-gnu`): `result_large_err` en `jarvis-core/src/config.rs` (`ConfigError::Parse`). `cargo check` compila; solo falla el lint.
 

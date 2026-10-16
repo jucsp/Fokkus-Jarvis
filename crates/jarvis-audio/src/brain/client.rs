@@ -48,7 +48,21 @@ pub const API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// admite markdown, listas ni bloques de código.
 pub const SYSTEM_PROMPT: &str = concat!(
     "Eres Jarvis, el asistente de desarrollo de Fokkus. ",
-    "Respondes en español de Chile, de forma breve, directa y conversacional. ",
+    "Respondes SIEMPRE en español de Chile, de forma breve, directa y conversacional; ",
+    "NUNCA respondas en inglés, aunque la pregunta o el contexto estén en inglés. ",
+    "Entrega solo la respuesta final: NUNCA incluyas etiquetas <thought> ni <thinking>, ",
+    "ni expliques tu razonamiento, tus pasos ni tus reflexiones internas. ",
+    "Puedes ejecutar comandos en el equipo del usuario para abrir o cerrar aplicaciones ",
+    "y realizar acciones del sistema; solo di que lo hiciste si de verdad lo ejecutaste. ",
+    "Al abrir aplicaciones gráficas, lánzalas SIEMPRE en segundo plano y desacopladas ",
+    "(systemd-run --user --collect <app>, gtk-launch <app> o nohup <cmd> >/dev/null 2>&1 &) ",
+    "para no bloquear la salida del proceso. ",
+    "Constitución de privacidad, sin excepciones: tienes PROHIBIDO de forma ABSOLUTA leer, ",
+    "listar, buscar, copiar, mover, modificar o borrar cualquier cosa dentro de ~/Imágenes/, ",
+    "~/Images/, ~/Pictures/, ~/Documentos/, ~/Documents/, ~/Videos/, ~/Música/, ~/Music/, ",
+    "~/fotos/, ~/foto/, ~/.ssh/ y ~/.gnupg/; también llaves privadas y secretos ",
+    "(id_rsa, id_ed25519, *.key, *.pem, archivos .env) y las variables de entorno globales. ",
+    "Si una petición requiere tocar algo de eso, niégate brevemente. ",
     "Nunca uses markdown, listas, negritas, viñetas ni bloques de código: ",
     "tu respuesta se lee en voz alta. Sé conciso: una o dos frases salvo que te ",
     "pidan más detalle."
@@ -71,6 +85,8 @@ pub enum BrainError {
     Network(String),
     /// Cancelado por barge-in.
     Cancelled,
+    /// El cerebro por CLI local falló (no existe, timeout o salida ≠ 0).
+    Cli(String),
     /// El modelo rechazó responder (`stop_reason == "refusal"`).
     Refusal,
     /// Se agotaron los reintentos; guarda el último error.
@@ -106,6 +122,7 @@ impl fmt::Display for BrainError {
             BrainError::Json(e) => write!(f, "JSON inválido: {e}"),
             BrainError::Network(e) => write!(f, "sin conexión con Anthropic: {e}"),
             BrainError::Cancelled => write!(f, "respuesta cancelada"),
+            BrainError::Cli(e) => write!(f, "falló el cerebro CLI: {e}"),
             BrainError::Refusal => write!(f, "el asistente rechazó responder"),
             BrainError::RetriesExhausted { attempts, last } => {
                 write!(f, "sin respuesta tras {attempts} intentos: {last}")
@@ -159,6 +176,7 @@ pub struct Completion {
 pub struct ClaudeClient {
     agent: ureq::Agent,
     api_key: String,
+    endpoint: String,
     model: String,
     effort: String,
     system_prompt: String,
@@ -188,6 +206,7 @@ impl ClaudeClient {
         Self {
             agent: ureq::Agent::new_with_config(config),
             api_key: api_key.into(),
+            endpoint: ANTHROPIC_ENDPOINT.to_string(),
             model: DEFAULT_MODEL.to_string(),
             effort: DEFAULT_EFFORT.to_string(),
             system_prompt: SYSTEM_PROMPT.to_string(),
@@ -202,6 +221,27 @@ impl ClaudeClient {
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
+    }
+
+    /// Base URL alternativa (proxy o gateway compatible con la API de
+    /// Mensajes). Acepta la base (`https://host`) o la ruta completa
+    /// (`https://host/v1/messages`); vacía mantiene la oficial.
+    pub fn with_base_url(mut self, base_url: &str) -> Self {
+        let base = base_url.trim().trim_end_matches('/');
+        if !base.is_empty() {
+            self.endpoint = if base.ends_with("/v1/messages") {
+                base.to_string()
+            } else if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
+            };
+        }
+        self
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
     }
 
     pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
@@ -309,7 +349,7 @@ impl ClaudeClient {
     ) -> Result<Completion, BrainError> {
         let response = self
             .agent
-            .post(ANTHROPIC_ENDPOINT)
+            .post(&self.endpoint)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
             .header("anthropic-beta", ANTHROPIC_BETA)
@@ -585,6 +625,22 @@ mod tests {
         let system = &body["system"][0];
         assert_eq!(system["type"].as_str(), Some("text"));
         assert_eq!(system["cache_control"]["type"].as_str(), Some("ephemeral"));
+    }
+
+    #[test]
+    fn base_url_accepts_host_or_full_path() {
+        assert_eq!(client().endpoint(), ANTHROPIC_ENDPOINT);
+        assert_eq!(client().with_base_url("  ").endpoint(), ANTHROPIC_ENDPOINT);
+        for base in [
+            "https://gw.local/",
+            "https://gw.local/v1",
+            "https://gw.local/v1/messages",
+        ] {
+            assert_eq!(
+                client().with_base_url(base).endpoint(),
+                "https://gw.local/v1/messages"
+            );
+        }
     }
 
     #[test]

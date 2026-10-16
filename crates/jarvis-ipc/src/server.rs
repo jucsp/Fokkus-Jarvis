@@ -35,7 +35,7 @@ use std::thread::{self, JoinHandle};
 #[cfg(unix)]
 use std::time::Duration;
 
-use jarvis_core::{JarvisConfig, JarvisCore, JarvisState};
+use jarvis_core::{JarvisConfig, JarvisCore, JarvisState, SharedCore};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -89,7 +89,7 @@ pub trait SpeechSink: Send + Sync {
 /// *panic* por envenenamiento de `Mutex`: los locks se recuperan del error de
 /// veneno con [`std::sync::PoisonError::into_inner`].
 pub struct ServerState {
-    core: Mutex<JarvisCore>,
+    core: SharedCore,
     swarm: Mutex<BTreeMap<String, SwarmTask>>,
     progress: Mutex<Vec<NotifySwarmProgressParams>>,
     alerts: Mutex<Vec<TriageAlert>>,
@@ -101,8 +101,14 @@ pub struct ServerState {
 impl ServerState {
     /// Crea el estado a partir de un núcleo ya construido.
     pub fn new(core: JarvisCore) -> Self {
+        Self::with_shared_core(SharedCore::new(core))
+    }
+
+    /// Crea el estado sobre un núcleo compartido con la esfera y el
+    /// orquestador de voz (un único `JarvisCore`, SDD §5).
+    pub fn with_shared_core(core: SharedCore) -> Self {
         Self {
-            core: Mutex::new(core),
+            core,
             swarm: Mutex::new(BTreeMap::new()),
             progress: Mutex::new(Vec::new()),
             alerts: Mutex::new(Vec::new()),
@@ -123,19 +129,24 @@ impl ServerState {
         self
     }
 
+    /// Núcleo compartido (el mismo que ven la esfera y el orquestador).
+    pub fn shared_core(&self) -> &SharedCore {
+        &self.core
+    }
+
     /// Estado actual del asistente.
     pub fn state(&self) -> JarvisState {
-        lock(&self.core).state()
+        self.core.state()
     }
 
     /// `true` si el asistente está silenciado.
     pub fn is_muted(&self) -> bool {
-        lock(&self.core).is_muted()
+        self.core.is_muted()
     }
 
     /// Par voz activa (`voice_id`, `voice_lang`).
     pub fn voice(&self) -> (String, String) {
-        let core = lock(&self.core);
+        let core = self.core.lock();
         (
             core.config().voice_id.clone(),
             core.config().voice_lang.clone(),
@@ -144,7 +155,7 @@ impl ServerState {
 
     /// Cambia el silencio global; es idempotente.
     pub fn set_muted(&self, muted: bool) -> Result<SetMutedResult, JsonRpcError> {
-        let mut core = lock(&self.core);
+        let mut core = self.core.lock();
         if core.is_muted() != muted {
             let target = if muted {
                 JarvisState::Muted

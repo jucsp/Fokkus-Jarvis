@@ -1234,27 +1234,31 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jarvis-app"
-version = "0.2.1"
+version = "0.2.15"
 dependencies = [
  "cpal",
+ "crossbeam-channel",
  "jarvis-audio",
  "jarvis-core",
  "jarvis-ipc",
  "jarvis-render",
  "jarvis-shell",
  "libc",
+ "ringbuf",
+ "serde_json",
  "signal-hook",
 ]
 
 [[package]]
 name = "jarvis-audio"
-version = "0.2.1"
+version = "0.2.15"
 dependencies = [
  "cpal",
  "crossbeam-channel",
  "earshot",
  "jarvis-core",
  "keyring",
+ "libc",
  "msedge-tts",
  "ort",
  "ringbuf",
@@ -1269,7 +1273,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-core"
-version = "0.2.1"
+version = "0.2.15"
 dependencies = [
  "crossbeam-channel",
  "serde",
@@ -1278,7 +1282,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-ipc"
-version = "0.2.1"
+version = "0.2.15"
 dependencies = [
  "jarvis-core",
  "serde",
@@ -1287,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "jarvis-render"
-version = "0.2.1"
+version = "0.2.15"
 dependencies = [
  "jarvis-core",
  "tiny-skia",
@@ -1295,8 +1299,9 @@ dependencies = [
 
 [[package]]
 name = "jarvis-shell"
-version = "0.2.1"
+version = "0.2.15"
 dependencies = [
+ "jarvis-core",
  "smithay-client-toolkit",
 ]
 

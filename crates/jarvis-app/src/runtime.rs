@@ -3,23 +3,25 @@
 //! Todo lo que no toca el sistema (reloj de frames, disponibilidad de STT) es
 //! puro y se prueba sin compositor ni whisper.
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crossbeam_channel::{Receiver, TryRecvError};
 use jarvis_audio::models::{ModelManager, ModelStatus, WHISPER_BASE_Q5_1};
-use jarvis_audio::ConversationCoordinator;
-use jarvis_core::{AudioLevel, JarvisState};
-use jarvis_render::{Pixmap, SphereRenderer};
-use jarvis_shell::{FrameBuffer, OverlaySurface, SurfaceStatus};
+use jarvis_audio::WhisperEngine;
+use jarvis_core::{AudioLevel, JarvisConfig, JarvisState, Opacity};
+use jarvis_render::{OpacityFade, Pixmap, RenderError, SphereRenderer};
+use jarvis_shell::{FrameBuffer, OverlaySurface, ShellCommand, SurfaceSize, SurfaceStatus};
 
 /// Intervalo entre frames en estados activos (60 FPS).
 pub const ACTIVE_FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
-/// Intervalo entre frames en `Idle`/`Muted` (30 FPS) para ahorrar CPU.
-pub const IDLE_FRAME_INTERVAL: Duration = Duration::from_nanos(33_333_333);
+/// Intervalo entre frames en `Idle`/`Muted` (60 FPS) para una animación fluida.
+pub const IDLE_FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
 
 /// Reloj de frames puro: decide cuándo toca el siguiente frame y el `t` de la
 /// animación, sin dormir ni consultar el reloj del sistema.
@@ -75,6 +77,83 @@ impl FrameClock {
     }
 }
 
+/// Duración del fundido entre opacidades (HU-34).
+pub const OPACITY_FADE: Duration = Duration::from_millis(150);
+
+/// Apariencia pedida para la esfera: la persistida o la de la vista previa.
+///
+/// La app la publica en un [`Cell`] y el bucle la aplica antes de dibujar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SphereLook {
+    /// Lado de la superficie en píxeles lógicos.
+    pub size: u32,
+    /// Opacidad de usuario (20–100 %).
+    pub opacity: Opacity,
+}
+
+impl SphereLook {
+    /// Apariencia persistida en `config.toml`.
+    pub fn from_config(config: &JarvisConfig) -> Self {
+        Self {
+            size: config.sphere_size_px(),
+            opacity: config.sphere_opacity(),
+        }
+    }
+}
+
+/// Renderer y buffer de la esfera, que cambian juntos de tamaño (HU-33).
+pub struct SphereView {
+    pub renderer: SphereRenderer,
+    pub pixmap: Pixmap,
+}
+
+impl SphereView {
+    /// Vista de `size × size` píxeles.
+    pub fn new(size: u32) -> Result<Self, RenderError> {
+        let renderer = SphereRenderer::with_size(size);
+        let pixmap = Pixmap::new(renderer.size(), renderer.size())
+            .ok_or(RenderError::AllocFailed { size })?;
+        Ok(Self { renderer, pixmap })
+    }
+
+    /// Lado actual en píxeles.
+    pub fn size(&self) -> u32 {
+        self.renderer.size()
+    }
+
+    /// Reasigna el `Pixmap` solo si el tamaño cambió. Devuelve `true` si cambió.
+    pub fn resize(&mut self, size: u32) -> Result<bool, RenderError> {
+        if size == self.size() {
+            return Ok(false);
+        }
+        self.pixmap = Pixmap::new(size, size).ok_or(RenderError::AllocFailed { size })?;
+        self.renderer.resize(size);
+        Ok(true)
+    }
+}
+
+/// Lleva superficie y vista al tamaño pedido. Si la superficie lo rechaza
+/// (backend sin soporte o compositor sin respuesta) se mantiene el anterior.
+fn apply_size(
+    surface: &mut dyn OverlaySurface,
+    view: &mut SphereView,
+    size: u32,
+) -> Result<(), (&'static str, Box<dyn std::error::Error>)> {
+    let surface_size = SurfaceSize::new(size, size).map_err(|e| ("tamaño", e.into()))?;
+    surface
+        .set_size(surface_size)
+        .map_err(|e| ("tamaño de la superficie", e.into()))?;
+    if let Err(e) = view.resize(size) {
+        // Sin buffer nuevo: la superficie vuelve al tamaño de la vista.
+        let current = view.size();
+        if let Ok(previous) = SurfaceSize::new(current, current) {
+            let _ = surface.set_size(previous);
+        }
+        return Err(("buffer de la esfera", e.into()));
+    }
+    Ok(())
+}
+
 /// Motivo de salida del bucle principal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoopExit {
@@ -82,12 +161,17 @@ pub enum LoopExit {
     Signal,
     /// El compositor cerró la superficie o se perdió la conexión.
     SurfaceClosed,
+    /// El usuario eligió "Salir" en el menú contextual.
+    UserQuit,
     /// Se alcanzó el número máximo de frames (tests).
     MaxFrames,
 }
 
 /// Fuente del estado a dibujar en cada frame: `(estado, nivel de audio)`.
 pub type FrameSource<'a> = dyn FnMut() -> (JarvisState, AudioLevel) + 'a;
+
+/// Ejecuta las acciones del menú contextual que no terminan el bucle.
+pub type CommandHandler<'a> = dyn FnMut(ShellCommand) + 'a;
 
 /// Registro de errores del bucle: cada tipo se avisa una sola vez para no
 /// inundar stderr a 60 Hz.
@@ -106,25 +190,40 @@ impl ErrorOnce {
 
 /// Bucle principal: despacha eventos, renderiza y presenta la esfera.
 ///
-/// El único punto de espera es [`OverlaySurface::pump_events`]. El `pixmap`
-/// se reutiliza en cada frame (cero asignaciones). `on_first_frame` se invoca
-/// una vez tras presentar el primer frame.
+/// El único punto de espera es [`OverlaySurface::pump_events`]. El `Pixmap`
+/// de `view` se reutiliza en cada frame (solo se reasigna al cambiar de
+/// tamaño). Antes de dibujar aplica `look` (config o vista previa): como
+/// máximo un cambio de tamaño por frame y la opacidad con un fundido de
+/// [`OPACITY_FADE`]. `on_first_frame` se invoca una vez tras presentar el
+/// primer frame. "Salir" en el menú contextual termina el bucle; el resto de
+/// acciones se entregan a `on_command`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_loop(
     surface: &mut dyn OverlaySurface,
-    renderer: &SphereRenderer,
-    pixmap: &mut Pixmap,
+    view: &mut SphereView,
+    look: &Cell<SphereLook>,
     source: &mut FrameSource<'_>,
     shutdown: &AtomicBool,
+    reset_position: &AtomicBool,
     max_frames: Option<u64>,
     on_first_frame: &mut dyn FnMut(),
+    on_command: &mut CommandHandler<'_>,
 ) -> LoopExit {
     let mut clock = FrameClock::new(Instant::now());
     let mut errors = ErrorOnce::default();
     let mut presented: u64 = 0;
+    let mut opacity_target = look.get().opacity;
+    let mut fade = OpacityFade::new(opacity_target, OPACITY_FADE);
+    surface.set_opacity(opacity_target);
+    // Último tamaño rechazado: no se reintenta en cada frame.
+    let mut rejected_size: Option<u32> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
             return LoopExit::Signal;
+        }
+        if reset_position.swap(false, Ordering::SeqCst) {
+            surface.reset_position();
         }
         if max_frames.is_some_and(|max| presented >= max) {
             return LoopExit::MaxFrames;
@@ -138,6 +237,12 @@ pub fn run_loop(
         if shutdown.load(Ordering::SeqCst) {
             return LoopExit::Signal;
         }
+        while let Some(command) = surface.poll_command() {
+            match command {
+                ShellCommand::Quit => return LoopExit::UserQuit,
+                other => on_command(other),
+            }
+        }
 
         // `pump_events` vuelve antes del deadline si llegan eventos.
         let now = Instant::now();
@@ -146,8 +251,26 @@ pub fn run_loop(
         }
 
         let (state, level) = source();
+        surface.sync_muted(state == JarvisState::Muted);
+
+        let target = look.get();
+        if target.size != view.size() && rejected_size != Some(target.size) {
+            match apply_size(surface, view, target.size) {
+                Ok(()) => rejected_size = None,
+                Err((kind, e)) => {
+                    errors.report(kind, &e);
+                    rejected_size = Some(target.size);
+                }
+            }
+        }
+        if target.opacity != opacity_target {
+            opacity_target = target.opacity;
+            fade.retarget(opacity_target, now);
+        }
+        surface.set_opacity(fade.value_at(now));
+
         if surface.wants_frame() {
-            match render_and_present(surface, renderer, pixmap, level, state, clock.t(now)) {
+            match render_and_present(surface, view, level, state, clock.t(now)) {
                 Ok(()) => {
                     presented += 1;
                     if presented == 1 {
@@ -163,12 +286,12 @@ pub fn run_loop(
 
 fn render_and_present(
     surface: &mut dyn OverlaySurface,
-    renderer: &SphereRenderer,
-    pixmap: &mut Pixmap,
+    view: &mut SphereView,
     level: AudioLevel,
     state: JarvisState,
     t: f32,
 ) -> Result<(), (&'static str, Box<dyn std::error::Error>)> {
+    let SphereView { renderer, pixmap } = view;
     renderer
         .render_into(pixmap, level, state, t)
         .map_err(|e| ("render", e.into()))?;
@@ -187,6 +310,11 @@ pub fn install_shutdown_flag() -> Arc<AtomicBool> {
         if let Err(e) = signal_hook::flag::register(signal, Arc::clone(&flag)) {
             eprintln!("[señales] no se pudo registrar la señal {signal}: {e}");
         }
+    }
+    // SIGUSR1 es "volver a posición inicial" (enviado por el panel); la acción
+    // por defecto en Linux es terminar el proceso, así que se ignora.
+    unsafe {
+        libc::signal(libc::SIGUSR1, libc::SIG_IGN);
     }
     flag
 }
@@ -218,14 +346,6 @@ impl SttAvailability {
         }
     }
 
-    /// `true` si el modelo falta o está dañado y debe (re)descargarse.
-    pub fn needs_download(&self) -> bool {
-        matches!(
-            self,
-            SttAvailability::MissingModel(_) | SttAvailability::InvalidModel(_)
-        )
-    }
-
     /// Etiqueta corta para la línea de arranque (`STT=<estado>`).
     pub fn label(&self) -> &'static str {
         match self {
@@ -255,27 +375,6 @@ impl SttAvailability {
     }
 }
 
-/// Entra en escucha solo si el STT está disponible.
-///
-/// Sin STT (o si la transición falla) avisa una vez y deja la esfera en
-/// `Idle`: nunca termina el proceso. Devuelve si se entró en `Listening`.
-pub fn start_listening_if_ready(
-    coordinator: &mut ConversationCoordinator,
-    stt: &SttAvailability,
-) -> bool {
-    if let Some(warning) = stt.warning() {
-        eprintln!("{warning}");
-        return false;
-    }
-    match coordinator.start_listening() {
-        Ok(()) => true,
-        Err(e) => {
-            eprintln!("[stt] no se pudo entrar en escucha: {e}");
-            false
-        }
-    }
-}
-
 /// Registro del progreso de descarga en tramos de 10 % (no inunda el log).
 #[derive(Debug, Default)]
 pub struct ProgressLog {
@@ -298,79 +397,125 @@ impl ProgressLog {
     }
 }
 
-/// Descarga y verifica el modelo whisper en un hilo de fondo (primera
-/// ejecución, HU-7). Nunca bloquea el arranque: el flag devuelto pasa a `true`
-/// cuando el modelo queda verificado en disco.
-pub fn spawn_model_download(manager: ModelManager) -> Option<Arc<AtomicBool>> {
-    let ready = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&ready);
+/// Resultado de la carga de whisper en segundo plano.
+pub type SttLoad<T> = Receiver<Result<T, String>>;
+
+/// Verifica (y si falta, descarga) el modelo whisper y lo carga **una sola
+/// vez** en un hilo de fondo (HU-7). Nunca bloquea el arranque ni el render:
+/// el resultado llega por el canal y lo recoge [`poll_stt_loader`].
+pub fn spawn_stt_loader(manager: ModelManager) -> Option<SttLoad<WhisperEngine>> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
     let spawned = std::thread::Builder::new()
         .name("jarvis-models".to_string())
         .spawn(move || {
             let spec = WHISPER_BASE_Q5_1;
-            println!(
-                "[stt] descargando {} ({} MB) en {}…",
-                spec.id,
-                spec.size / (1024 * 1024),
-                manager.path_of(&spec).display()
-            );
+            // Dañado también se descarga: `ensure` lo borra antes.
+            if !matches!(manager.status(&spec), ModelStatus::Verified { .. }) {
+                println!(
+                    "[stt] descargando {} ({} MB) en {}…",
+                    spec.id,
+                    spec.size / (1024 * 1024),
+                    manager.path_of(&spec).display()
+                );
+            }
             let mut log = ProgressLog::default();
             let mut progress = |done: u64, total: u64| {
                 if let Some(percent) = log.update(done, total) {
                     println!("[stt] descarga del modelo: {percent} %");
                 }
             };
-            match manager.ensure(&spec, &mut progress) {
-                Ok(model) => {
-                    println!("[stt] modelo verificado (sha256 {}).", model.sha256());
-                    flag.store(true, Ordering::SeqCst);
-                }
-                Err(e) => eprintln!("[stt] no se pudo descargar el modelo: {e}"),
-            }
+            let started = Instant::now();
+            let result = manager
+                .ensure(&spec, &mut progress)
+                .map_err(|e| format!("modelo no disponible: {e}"))
+                .and_then(|model| {
+                    let sha = model.sha256().to_string();
+                    WhisperEngine::from_verified(model)
+                        .map(|engine| engine.with_initial_prompt("Jarvis."))
+                        .map_err(|e| format!("whisper no pudo cargar el modelo: {e}"))
+                        .inspect(|_| {
+                            println!(
+                                "[stt] whisper cargado: {} (sha256 {sha}) en {} ms.",
+                                spec.id,
+                                started.elapsed().as_millis()
+                            )
+                        })
+                });
+            let _ = tx.send(result);
         });
     match spawned {
-        Ok(_) => Some(ready),
+        Ok(_) => Some(rx),
         Err(e) => {
-            eprintln!("[stt] no se pudo lanzar la descarga del modelo: {e}");
+            eprintln!("[stt] no se pudo lanzar la carga del modelo: {e}");
             None
         }
     }
 }
 
-/// Si la descarga pendiente terminó, entra en escucha y la da por resuelta.
+/// Si la carga terminó, entrega el motor a `install` y la da por resuelta.
 ///
-/// Pensada para invocarse en cada frame: solo actúa una vez.
-pub fn poll_model_ready(
-    pending: &mut Option<Arc<AtomicBool>>,
-    coordinator: &mut ConversationCoordinator,
-) -> bool {
-    if !pending
-        .as_ref()
-        .is_some_and(|ready| ready.load(Ordering::SeqCst))
-    {
+/// Pensada para invocarse en cada frame: `try_recv` es O(1) y solo actúa una
+/// vez. Devuelve `true` cuando instaló el transcriptor.
+pub fn poll_stt_loader<T>(pending: &mut Option<SttLoad<T>>, install: impl FnOnce(T)) -> bool {
+    let Some(rx) = pending.as_ref() else {
         return false;
+    };
+    match rx.try_recv() {
+        Ok(Ok(engine)) => {
+            *pending = None;
+            install(engine);
+            true
+        }
+        Ok(Err(e)) => {
+            *pending = None;
+            eprintln!("[stt] {e}; Jarvis no podrá escuchar en esta sesión.");
+            false
+        }
+        Err(TryRecvError::Empty) => false,
+        Err(TryRecvError::Disconnected) => {
+            *pending = None;
+            eprintln!("[stt] la carga del modelo terminó sin resultado.");
+            false
+        }
     }
-    *pending = None;
-    start_listening_if_ready(coordinator, &SttAvailability::Ready)
+}
+
+/// Hora local del sistema (zona horaria del SO) para "¿qué hora es?".
+#[cfg(unix)]
+pub fn local_time() -> (u32, u32) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs()) as libc::time_t;
+    // SAFETY: `localtime_r` solo escribe en `tm`, que vive en esta pila.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+        return jarvis_audio::orchestrator::utc_clock();
+    }
+    (tm.tm_hour as u32, tm.tm_min as u32)
+}
+
+/// Sin `localtime_r`: hora UTC.
+#[cfg(not(unix))]
+pub fn local_time() -> (u32, u32) {
+    jarvis_audio::orchestrator::utc_clock()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jarvis_audio::EdgeTtsEngine;
     use jarvis_shell::{HeadlessSurface, SurfaceSize};
 
     #[test]
-    fn frame_clock_uses_60fps_when_active_and_30fps_when_idle() {
+    fn frame_clock_uses_60fps_in_every_state() {
+        assert_eq!(IDLE_FRAME_INTERVAL, ACTIVE_FRAME_INTERVAL);
         for state in [
             JarvisState::Listening,
             JarvisState::Thinking,
             JarvisState::Speaking,
+            JarvisState::Idle,
+            JarvisState::Muted,
         ] {
             assert_eq!(FrameClock::interval_for(state), ACTIVE_FRAME_INTERVAL);
-        }
-        for state in [JarvisState::Idle, JarvisState::Muted] {
-            assert_eq!(FrameClock::interval_for(state), IDLE_FRAME_INTERVAL);
         }
 
         let start = Instant::now();
@@ -395,25 +540,33 @@ mod tests {
         assert!((clock.t(late) - 0.2).abs() < 1e-3);
     }
 
-    fn headless(renderer: &SphereRenderer) -> HeadlessSurface {
-        HeadlessSurface::new(SurfaceSize::new(renderer.size(), renderer.size()).unwrap())
+    fn headless(view: &SphereView) -> HeadlessSurface {
+        HeadlessSurface::new(SurfaceSize::new(view.size(), view.size()).unwrap())
+    }
+
+    fn look(size: u32) -> Cell<SphereLook> {
+        Cell::new(SphereLook {
+            size,
+            opacity: Opacity::OPAQUE,
+        })
     }
 
     #[test]
     fn loop_presents_exactly_max_frames() {
-        let renderer = SphereRenderer::with_size(32);
-        let mut surface = headless(&renderer);
-        let mut pixmap = Pixmap::new(32, 32).unwrap();
+        let mut view = SphereView::new(32).unwrap();
+        let mut surface = headless(&view);
         let shutdown = AtomicBool::new(false);
         let mut first = 0;
         let exit = run_loop(
             &mut surface,
-            &renderer,
-            &mut pixmap,
+            &mut view,
+            &look(32),
             &mut || (JarvisState::Speaking, 0.5),
             &shutdown,
+            &AtomicBool::new(false),
             Some(5),
             &mut || first += 1,
+            &mut |_| {},
         );
         assert_eq!(exit, LoopExit::MaxFrames);
         assert_eq!(surface.presented_frames(), 5);
@@ -422,9 +575,8 @@ mod tests {
 
     #[test]
     fn loop_stops_on_shutdown_flag_within_500ms() {
-        let renderer = SphereRenderer::with_size(32);
-        let mut surface = headless(&renderer);
-        let mut pixmap = Pixmap::new(32, 32).unwrap();
+        let mut view = SphereView::new(32).unwrap();
+        let mut surface = headless(&view);
         let shutdown = Arc::new(AtomicBool::new(false));
         let trigger = Arc::clone(&shutdown);
         let raised_at = Arc::new(std::sync::Mutex::new(None));
@@ -437,12 +589,14 @@ mod tests {
 
         let exit = run_loop(
             &mut surface,
-            &renderer,
-            &mut pixmap,
+            &mut view,
+            &look(32),
             &mut || (JarvisState::Idle, 0.0),
             &shutdown,
+            &AtomicBool::new(false),
             None,
             &mut || {},
+            &mut |_| {},
         );
         let stopped = Instant::now();
         handle.join().unwrap();
@@ -451,6 +605,144 @@ mod tests {
         let raised = raised_at.lock().unwrap().unwrap();
         assert!(stopped.duration_since(raised) < Duration::from_millis(500));
         assert!(surface.presented_frames() > 0);
+    }
+
+    #[test]
+    fn menu_commands_reach_the_app_and_quit_ends_the_loop() {
+        let mut view = SphereView::new(32).unwrap();
+        let mut surface = headless(&view);
+        surface.push_command(ShellCommand::ToggleMute);
+        surface.push_command(ShellCommand::Quit);
+        // Lo que quede tras "Salir" no se ejecuta.
+        surface.push_command(ShellCommand::ToggleMute);
+        let shutdown = AtomicBool::new(false);
+        let mut handled = Vec::new();
+        let exit = run_loop(
+            &mut surface,
+            &mut view,
+            &look(32),
+            &mut || (JarvisState::Idle, 0.0),
+            &shutdown,
+            &AtomicBool::new(false),
+            None,
+            &mut || {},
+            &mut |command| handled.push(command),
+        );
+        assert_eq!(exit, LoopExit::UserQuit);
+        assert_eq!(handled, vec![ShellCommand::ToggleMute]);
+    }
+
+    #[test]
+    fn loop_tells_the_surface_when_muted() {
+        let mut view = SphereView::new(32).unwrap();
+        let mut surface = headless(&view);
+        let shutdown = AtomicBool::new(false);
+        run_loop(
+            &mut surface,
+            &mut view,
+            &look(32),
+            &mut || (JarvisState::Muted, 0.0),
+            &shutdown,
+            &AtomicBool::new(false),
+            Some(1),
+            &mut || {},
+            &mut |_| {},
+        );
+        assert!(surface.is_muted());
+    }
+
+    #[test]
+    fn sphere_view_reallocates_only_on_size_change() {
+        let mut view = SphereView::new(32).unwrap();
+        assert_eq!(view.resize(32), Ok(false));
+        assert_eq!(view.resize(64), Ok(true));
+        assert_eq!(view.size(), 64);
+        assert_eq!((view.pixmap.width(), view.pixmap.height()), (64, 64));
+    }
+
+    #[test]
+    fn loop_applies_the_latest_previewed_size_and_opacity() {
+        let mut view = SphereView::new(32).unwrap();
+        let mut surface = headless(&view);
+        let look = look(32);
+        let shutdown = AtomicBool::new(false);
+        let mut frames = 0;
+        // Muchos cambios por frame: solo cuenta el último publicado.
+        let mut source = || {
+            frames += 1;
+            if frames == 2 {
+                for size in [40, 48, 56, 64] {
+                    look.set(SphereLook {
+                        size,
+                        opacity: Opacity::from_pct(60),
+                    });
+                }
+            }
+            (JarvisState::Idle, 0.0)
+        };
+        let exit = run_loop(
+            &mut surface,
+            &mut view,
+            &look,
+            &mut source,
+            &shutdown,
+            &AtomicBool::new(false),
+            Some(3),
+            &mut || {},
+            &mut |_| {},
+        );
+        assert_eq!(exit, LoopExit::MaxFrames);
+        assert_eq!(view.size(), 64);
+        assert_eq!(surface.size(), SurfaceSize::new(64, 64).unwrap());
+        assert_eq!(surface.presented_frames(), 3);
+        // El fundido ya arrancó hacia el 60 %.
+        assert!(surface.opacity() < Opacity::OPAQUE);
+        assert!(surface.opacity() >= Opacity::from_pct(60));
+    }
+
+    #[test]
+    fn loop_reverts_to_the_persisted_look() {
+        let persisted = SphereLook {
+            size: 32,
+            opacity: Opacity::OPAQUE,
+        };
+        let mut view = SphereView::new(32).unwrap();
+        let mut surface = headless(&view);
+        let look = Cell::new(SphereLook {
+            size: 48,
+            opacity: Opacity::from_pct(30),
+        });
+        let shutdown = AtomicBool::new(false);
+        let mut frames = 0;
+        // Vista previa en el primer frame; "Cancelar" en el segundo.
+        let mut source = || {
+            frames += 1;
+            if frames == 2 {
+                look.set(persisted);
+            }
+            (JarvisState::Idle, 0.0)
+        };
+        run_loop(
+            &mut surface,
+            &mut view,
+            &look,
+            &mut source,
+            &shutdown,
+            &AtomicBool::new(false),
+            Some(2),
+            &mut || {},
+            &mut |_| {},
+        );
+        assert_eq!(view.size(), 32);
+        assert_eq!(surface.size(), SurfaceSize::new(32, 32).unwrap());
+    }
+
+    #[test]
+    fn opacity_fade_settles_on_the_target() {
+        let start = Instant::now();
+        let mut fade = OpacityFade::new(Opacity::OPAQUE, OPACITY_FADE);
+        fade.retarget(Opacity::from_pct(20), start);
+        assert_eq!(fade.value_at(start + OPACITY_FADE), Opacity::from_pct(20));
     }
 
     #[test]
@@ -480,14 +772,6 @@ mod tests {
     }
 
     #[test]
-    fn only_missing_or_invalid_models_are_downloaded() {
-        assert!(SttAvailability::MissingModel(None).needs_download());
-        assert!(SttAvailability::InvalidModel("roto".to_string()).needs_download());
-        assert!(!SttAvailability::Ready.needs_download());
-        assert!(!SttAvailability::NoDataDir.needs_download());
-    }
-
-    #[test]
     fn progress_is_logged_by_deciles() {
         let mut log = ProgressLog::default();
         assert_eq!(log.update(0, 0), None);
@@ -502,35 +786,46 @@ mod tests {
     }
 
     #[test]
-    fn model_ready_flag_starts_listening_once() {
-        let mut coordinator = ConversationCoordinator::new(EdgeTtsEngine::new());
-        let flag = Arc::new(AtomicBool::new(false));
-        let mut pending = Some(Arc::clone(&flag));
+    fn stt_loader_installs_once_and_is_then_resolved() {
+        let (tx, rx) = crossbeam_channel::bounded::<Result<u32, String>>(1);
+        let mut pending = Some(rx);
+        let mut installed = Vec::new();
 
-        // Descarga en curso: sigue en Idle.
-        assert!(!poll_model_ready(&mut pending, &mut coordinator));
+        // Carga en curso: no instala nada y sigue pendiente.
+        assert!(!poll_stt_loader(&mut pending, |v| installed.push(v)));
         assert!(pending.is_some());
-        assert_eq!(coordinator.state(), JarvisState::Idle);
 
-        flag.store(true, Ordering::SeqCst);
-        assert!(poll_model_ready(&mut pending, &mut coordinator));
+        tx.send(Ok(7)).unwrap();
+        assert!(poll_stt_loader(&mut pending, |v| installed.push(v)));
+        assert_eq!(installed, vec![7]);
         assert!(pending.is_none());
-        assert_eq!(coordinator.state(), JarvisState::Listening);
 
         // Ya resuelto: no vuelve a actuar.
-        assert!(!poll_model_ready(&mut pending, &mut coordinator));
+        assert!(!poll_stt_loader(&mut pending, |v| installed.push(v)));
     }
 
     #[test]
-    fn missing_stt_keeps_assistant_idle() {
-        let mut coordinator = ConversationCoordinator::new(EdgeTtsEngine::new());
-        let entered =
-            start_listening_if_ready(&mut coordinator, &SttAvailability::MissingModel(None));
-        assert!(!entered);
-        assert_eq!(coordinator.state(), JarvisState::Idle);
+    fn stt_loader_failure_is_resolved_without_installing() {
+        let (tx, rx) = crossbeam_channel::bounded::<Result<u32, String>>(1);
+        let mut pending = Some(rx);
+        tx.send(Err("sin red".to_string())).unwrap();
+        assert!(!poll_stt_loader(&mut pending, |_| panic!(
+            "no debe instalar"
+        )));
+        assert!(pending.is_none());
 
-        let entered = start_listening_if_ready(&mut coordinator, &SttAvailability::Ready);
-        assert!(entered);
-        assert_eq!(coordinator.state(), JarvisState::Listening);
+        let (tx, rx) = crossbeam_channel::bounded::<Result<u32, String>>(1);
+        let mut pending = Some(rx);
+        drop(tx);
+        assert!(!poll_stt_loader(&mut pending, |_| panic!(
+            "no debe instalar"
+        )));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn local_time_is_a_valid_clock_reading() {
+        let (h, m) = local_time();
+        assert!(h < 24 && m < 60);
     }
 }

@@ -11,15 +11,21 @@
 //! * **Ventana de seguimiento** de 8 s (configurable): tras una respuesta o un
 //!   turno previo, los turnos siguientes dentro de la ventana se aceptan sin
 //!   repetir `"Jarvis"`. La abre el coordinador con [`open_follow_up`] o la
-//!   propia detección de la palabra clave; **no** se renueva al aceptar un
-//!   turno dentro de la ventana (así la caducidad es predecible y el
-//!   coordinador la rearma tras cada respuesta).
+//!   propia detección de la palabra clave. Cada turno aceptado **renueva** la
+//!   ventana otros 8 s, de modo que la conversación fluye turno a turno y
+//!   caduca sola tras 8 s de silencio (HU-17, HU-29).
 //! * **Modo silencio**: [`mute`] rechaza toda entrada (CA-4.3) sin llegar a
 //!   transcribir; [`unmute`] reactiva la captura.
+//! * **Escucha continua** ([`with_continuous`]/[`set_continuous`]): cuando está
+//!   activa, cualquier frase no vacía se acepta sin exigir `"Jarvis"`. Si la
+//!   frase incluye la palabra clave, esta se elimina igual que en el modo
+//!   normal.
 //!
 //! [`open_follow_up`]: ActivationDetector::open_follow_up
 //! [`mute`]: ActivationDetector::mute
 //! [`unmute`]: ActivationDetector::unmute
+//! [`with_continuous`]: ActivationDetector::with_continuous
+//! [`set_continuous`]: ActivationDetector::set_continuous
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -30,7 +36,14 @@ use crate::stt::{SttError, Transcriber};
 /// Palabra de activación por defecto.
 pub const DEFAULT_WAKE_WORD: &str = "jarvis";
 
-/// Ventana de seguimiento por defecto (8 s, CA-4.2).
+/// Variantes fonéticas que whisper en español suele devolver para `"jarvis"`
+/// (HU-32). Se aplican solo cuando la palabra configurada es la de por defecto.
+const JARVIS_PHONETIC_VARIANTS: &[&str] = &[
+    "jarvis", "yarvis", "jarbis", "yarbis", "llarvis", "llarbis", "charvis", "chárvis", "yárvis",
+    "jervis", "sharvis",
+];
+
+/// Ventana de seguimiento por defecto (8 s, HU-29; antes 5 s, HU-17).
 pub const DEFAULT_FOLLOW_UP: Duration = Duration::from_secs(8);
 
 /// Resultado de procesar una transcripción o un texto.
@@ -71,6 +84,7 @@ pub struct ActivationDetector {
     wake_word: String,
     follow_up: Duration,
     muted: AtomicBool,
+    continuous: AtomicBool,
     follow_up_until: Mutex<Option<Instant>>,
 }
 
@@ -81,6 +95,7 @@ impl ActivationDetector {
             wake_word: DEFAULT_WAKE_WORD.to_string(),
             follow_up: DEFAULT_FOLLOW_UP,
             muted: AtomicBool::new(false),
+            continuous: AtomicBool::new(false),
             follow_up_until: Mutex::new(None),
         }
     }
@@ -94,6 +109,12 @@ impl ActivationDetector {
     /// Cambia la duración de la ventana de seguimiento.
     pub fn with_follow_up(mut self, window: Duration) -> Self {
         self.follow_up = window;
+        self
+    }
+
+    /// Activa (`true`) o desactiva (`false`) la escucha continua.
+    pub fn with_continuous(mut self, enabled: bool) -> Self {
+        self.continuous = AtomicBool::new(enabled);
         self
     }
 
@@ -122,6 +143,16 @@ impl ActivationDetector {
         self.muted.load(Ordering::SeqCst)
     }
 
+    /// Activa o desactiva la escucha continua en caliente.
+    pub fn set_continuous(&self, enabled: bool) {
+        self.continuous.store(enabled, Ordering::SeqCst);
+    }
+
+    /// `true` si la escucha continua está activa.
+    pub fn is_continuous(&self) -> bool {
+        self.continuous.load(Ordering::SeqCst)
+    }
+
     /// Abre (o rearma) la ventana de seguimiento a partir de ahora.
     ///
     /// El coordinador la llama tras completar una respuesta para permitir
@@ -134,7 +165,13 @@ impl ActivationDetector {
     ///
     /// [`open_follow_up`]: ActivationDetector::open_follow_up
     pub fn open_follow_up_at(&self, now: Instant) {
-        *self.follow_up_until.lock().unwrap() = Some(now + self.follow_up);
+        // La ventana nunca puede quedar anclada al pasado: si `now` corresponde
+        // al inicio de una locución larga en diferido, `now + follow_up` podría
+        // expirar antes de que whisper devuelva la transcripción (HU-32). Se
+        // garantiza que siga viva al menos `follow_up` desde el instante real.
+        let until = now + self.follow_up;
+        let floor = Instant::now() + self.follow_up;
+        *self.follow_up_until.lock().unwrap() = Some(until.max(floor));
     }
 
     /// Cierra la ventana de seguimiento de inmediato.
@@ -160,10 +197,12 @@ impl ActivationDetector {
     /// Procesa un texto ya transcrito y decide si abre turno.
     ///
     /// - Silenciado → [`Activation::Rejected`] siempre.
+    /// - Con escucha continua activa → cualquier frase no vacía se acepta; si
+    ///   incluye la palabra clave, esta se elimina igual que en el modo normal.
     /// - Con palabra clave → [`Activation::Accepted`] (consulta limpia) o
     ///   [`Activation::WakeOnly`] (solo `"Jarvis"`); abre la ventana.
     /// - Sin palabra clave pero dentro de la ventana → [`Activation::Accepted`]
-    ///   sin renovar la ventana.
+    ///   y renueva la ventana (HU-17).
     /// - En cualquier otro caso → [`Activation::Rejected`] (CA-4.2).
     pub fn process_text(&self, text: &str) -> Activation {
         self.process_text_at(text, Instant::now())
@@ -173,8 +212,30 @@ impl ActivationDetector {
     ///
     /// [`process_text`]: ActivationDetector::process_text
     pub fn process_text_at(&self, text: &str, now: Instant) -> Activation {
+        self.process_at(text, now)
+    }
+
+    /// Igual que [`process_text_at`], pero pensado para transcripciones en
+    /// diferido: `started_at` es el instante en que empezó la voz del
+    /// segmento, no el instante en que terminó la transcripción.
+    ///
+    /// Así, una frase larga iniciada dentro de la ventana de seguimiento se
+    /// acepta aunque whisper devuelva el texto después de que la ventana haya
+    /// expirado (HU-29). La ventana se renueva a partir de `started_at`.
+    ///
+    /// [`process_text_at`]: ActivationDetector::process_text_at
+    pub fn process_text_started_at(&self, text: &str, started_at: Instant) -> Activation {
+        self.process_at(text, started_at)
+    }
+
+    /// Lógica común de decisión: `now` es el instante de referencia para
+    /// comprobar y renovar la ventana de seguimiento.
+    fn process_at(&self, text: &str, now: Instant) -> Activation {
         if self.is_muted() {
             return Activation::Rejected;
+        }
+        if self.is_continuous() {
+            return self.process_continuous(text, now);
         }
         if contains_wake_word(text, &self.wake_word) {
             self.open_follow_up_at(now);
@@ -189,10 +250,34 @@ impl ActivationDetector {
             if query.is_empty() {
                 Activation::Rejected
             } else {
+                // Cada turno aceptado renueva la ventana (HU-17): la sesión
+                // sigue viva mientras el usuario continúe hablando.
+                self.open_follow_up_at(now);
                 Activation::Accepted { query }
             }
         } else {
             Activation::Rejected
+        }
+    }
+
+    /// Decisión en escucha continua: cualquier frase no vacía abre turno. Si
+    /// incluye la palabra clave, se elimina como en el modo normal.
+    fn process_continuous(&self, text: &str, now: Instant) -> Activation {
+        if contains_wake_word(text, &self.wake_word) {
+            self.open_follow_up_at(now);
+            let query = strip_wake_word(text, &self.wake_word);
+            if query.is_empty() {
+                Activation::WakeOnly
+            } else {
+                Activation::Accepted { query }
+            }
+        } else {
+            let query = collapse_whitespace(text);
+            if query.is_empty() {
+                Activation::Rejected
+            } else {
+                Activation::Accepted { query }
+            }
         }
     }
 
@@ -239,6 +324,16 @@ pub fn contains_wake_word(text: &str, wake_word: &str) -> bool {
     }
     let haystack = normalize(text);
     let haystack = format!(" {haystack} ");
+
+    // La palabra por defecto tolera las variantes fonéticas de whisper en
+    // español (HU-32): "yarvis", "llarvis", "chárvis"… equivalen a "jarvis".
+    if needle == DEFAULT_WAKE_WORD {
+        return JARVIS_PHONETIC_VARIANTS.iter().any(|variant| {
+            let variant = format!(" {variant} ");
+            haystack.contains(variant.as_str())
+        });
+    }
+
     let needle = format!(" {needle} ");
     haystack.contains(needle.as_str())
 }
@@ -252,10 +347,15 @@ pub fn contains_wake_word(text: &str, wake_word: &str) -> bool {
 /// * `"Jarvis, qué hora es"` → `"qué hora es"`
 /// * `"jarvis?"` → `""`
 pub fn strip_wake_word(text: &str, wake_word: &str) -> String {
-    let wake_tokens: std::collections::HashSet<String> = normalize(wake_word)
+    let mut wake_tokens: std::collections::HashSet<String> = normalize(wake_word)
         .split_whitespace()
         .map(str::to_string)
         .collect();
+    // Las variantes fonéticas de "jarvis" también se limpian del vocativo
+    // (HU-32): "yarvis, qué hora es" → "qué hora es".
+    if wake_tokens.contains(DEFAULT_WAKE_WORD) {
+        wake_tokens.extend(JARVIS_PHONETIC_VARIANTS.iter().map(|v| v.to_string()));
+    }
     if wake_tokens.is_empty() {
         return collapse_whitespace(text);
     }
@@ -336,6 +436,32 @@ mod tests {
     }
 
     #[test]
+    fn wake_word_matches_spanish_phonetic_variants() {
+        for text in [
+            "yarvis, qué hora es",
+            "jarbis",
+            "yarbis, hola",
+            "llarvis, dime",
+            "llarbis",
+            "charvis",
+            "chárvis",
+            "yárvis",
+            "jervis",
+            "sharvis",
+            "Jarvis",
+        ] {
+            assert!(contains_wake_word(text, "Jarvis"), "debió activar: {text}");
+        }
+        // La limpieza del vocativo también reconoce las variantes (HU-32).
+        assert_eq!(
+            strip_wake_word("yarvis, qué hora es", "Jarvis"),
+            "qué hora es"
+        );
+        assert_eq!(strip_wake_word("chárvis?", "Jarvis"), "");
+        assert_eq!(strip_wake_word("llarvis, abre", "Jarvis"), "abre");
+    }
+
+    #[test]
     fn strip_wake_word_extracts_clean_query() {
         assert_eq!(
             strip_wake_word("Jarvis, qué hora es", "Jarvis"),
@@ -383,24 +509,72 @@ mod tests {
     }
 
     #[test]
-    fn follow_up_window_accepts_without_wake_word_until_expiry() {
+    fn follow_up_window_accepts_and_renews_without_wake_word() {
         let detector = ActivationDetector::new(); // ventana de 8 s
         let t0 = Instant::now();
         detector.open_follow_up_at(t0);
 
+        // A los 4 s: aceptado y la ventana se renueva 8 s más (hasta 12 s).
         assert_eq!(
-            detector.process_text_at("qué hora es", t0 + Duration::from_secs(7)),
+            detector.process_text_at("qué hora es", t0 + Duration::from_secs(4)),
             Activation::Accepted {
                 query: "qué hora es".into()
             }
         );
-        // Aceptar dentro de la ventana NO la renueva: la rearma el coordinador
-        // tras cada respuesta. A los 9 s ya está expirada (CA-4.2).
+        // A los 8 s: sigue dentro de la ventana renovada y vuelve a renovar
+        // (hasta 16 s).
         assert_eq!(
-            detector.process_text_at("qué hora es", t0 + Duration::from_secs(9)),
+            detector.process_text_at("y mañana", t0 + Duration::from_secs(8)),
+            Activation::Accepted {
+                query: "y mañana".into()
+            }
+        );
+        // La última renovación caduca a los 16 s: a los 17 s ya no hay sesión.
+        assert_eq!(
+            detector.process_text_at("otra cosa", t0 + Duration::from_secs(17)),
             Activation::Rejected
         );
-        assert!(!detector.is_follow_up_open_at(t0 + Duration::from_secs(9)));
+        assert!(!detector.is_follow_up_open_at(t0 + Duration::from_secs(17)));
+    }
+
+    #[test]
+    fn phrase_started_within_window_is_accepted_even_if_transcribed_after_expiry() {
+        let detector = ActivationDetector::new(); // ventana de 8 s
+        let t0 = Instant::now();
+        detector.open_follow_up_at(t0);
+
+        // La frase empieza a los 6 s (dentro de la ventana) pero whisper
+        // devuelve el texto recién a los 10 s, cuando la ventana ya expiró
+        // (HU-29): debe aceptarse usando el instante de inicio de la voz.
+        assert_eq!(
+            detector.process_text_started_at(
+                "una frase larga sobre el clima",
+                t0 + Duration::from_secs(6),
+            ),
+            Activation::Accepted {
+                query: "una frase larga sobre el clima".into()
+            }
+        );
+        // La ventana se renovó a partir del inicio de la frase (hasta 14 s).
+        assert!(detector.is_follow_up_open_at(t0 + Duration::from_secs(13)));
+        assert!(!detector.is_follow_up_open_at(t0 + Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn follow_up_window_never_anchors_to_a_past_started_at() {
+        let detector = ActivationDetector::new(); // ventana de 8 s
+        detector.open_follow_up();
+        // Locución larga en diferido: empezó hace 30 s, así que
+        // `started_at + 8 s` ya expiró. La ventana debe renovarse desde el
+        // presente y seguir abierta, no quedar anclada al pasado (HU-32).
+        let past = Instant::now() - Duration::from_secs(30);
+        assert_eq!(
+            detector.process_text_started_at("una continuación muy larga", past),
+            Activation::Accepted {
+                query: "una continuación muy larga".into()
+            }
+        );
+        assert!(detector.is_follow_up_open());
     }
 
     #[test]
@@ -472,6 +646,55 @@ mod tests {
             detector.process_text_at("dime más", t0 + Duration::from_millis(60)),
             Activation::Rejected
         );
+    }
+
+    #[test]
+    fn continuous_listening_accepts_any_non_empty_text() {
+        let detector = ActivationDetector::new().with_continuous(true);
+        assert!(detector.is_continuous());
+        assert_eq!(
+            detector.process_text("qué hora es"),
+            Activation::Accepted {
+                query: "qué hora es".into()
+            }
+        );
+        // Sigue limpiando el vocativo si aparece.
+        assert_eq!(
+            detector.process_text("Jarvis, abre el repo"),
+            Activation::Accepted {
+                query: "abre el repo".into()
+            }
+        );
+        assert_eq!(detector.process_text("Jarvis"), Activation::WakeOnly);
+        assert_eq!(detector.process_text(""), Activation::Rejected);
+        assert_eq!(detector.process_text("   "), Activation::Rejected);
+    }
+
+    #[test]
+    fn continuous_listening_can_be_toggled_hot() {
+        let detector = ActivationDetector::new();
+        assert!(!detector.is_continuous());
+        assert_eq!(detector.process_text("qué hora es"), Activation::Rejected);
+
+        detector.set_continuous(true);
+        assert!(detector.is_continuous());
+        assert_eq!(
+            detector.process_text("qué hora es"),
+            Activation::Accepted {
+                query: "qué hora es".into()
+            }
+        );
+
+        detector.set_continuous(false);
+        assert_eq!(detector.process_text("qué hora es"), Activation::Rejected);
+    }
+
+    #[test]
+    fn continuous_listening_respects_mute() {
+        let detector = ActivationDetector::new().with_continuous(true);
+        detector.mute();
+        assert_eq!(detector.process_text("qué hora es"), Activation::Rejected);
+        assert_eq!(detector.process_text("Jarvis, hola"), Activation::Rejected);
     }
 
     struct FakeTranscriber {

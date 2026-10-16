@@ -7,6 +7,7 @@ publish.workspace = true
 description = "Abstracción de la superficie overlay (ventana flotante transparente)."
 
 [dependencies]
+jarvis-core = { path = "../jarvis-core" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 smithay-client-toolkit.workspace = true

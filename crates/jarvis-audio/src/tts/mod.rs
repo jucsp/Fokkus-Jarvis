@@ -19,6 +19,7 @@ pub use piper::{parse_wav_pcm, synthesize_local_fallback};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::voices::{resolve_voice, DEFAULT_VOICE_ID};
 
@@ -50,6 +51,18 @@ pub const FILLERS_GENERAL: &[&str] = &[
     "Voy a revisarlo, dame un momento...",
     "Ahora mismo te lo confirmo...",
     "Estoy en ello, un segundo...",
+    "Mmm...",
+    "A ver...",
+    "Déjame pensar un segundo...",
+    "Pensando...",
+    "Veamos...",
+    "Estoy en ello...",
+    "Consultando...",
+    "Dame un instante...",
+    "Un momento...",
+    "Ya mismo te respondo...",
+    "Déjame ver...",
+    "Estoy pensando...",
 ];
 
 /// Fillers para órdenes de desarrollo.
@@ -59,6 +72,16 @@ pub const FILLERS_DEV: &[&str] = &[
     "Revisando el código, un momento...",
     "Entendido, voy a implementarlo...",
     "Analizando la base de código...",
+    "Mmm, revisando el repo...",
+    "A ver el código...",
+    "Pensando la arquitectura...",
+    "Déjame ver el código...",
+    "Veamos los cambios...",
+    "En ello con el código...",
+    "Consultando el repositorio...",
+    "Dame un segundo técnico...",
+    "Revisando la implementación...",
+    "Preparando los cambios...",
 ];
 
 /// Fillers para la bandeja de entrada / tickets.
@@ -66,6 +89,15 @@ pub const FILLERS_INBOX: &[&str] = &[
     "Revisando la bandeja de entrada...",
     "Consultando los tickets pendientes...",
     "Un momento, reviso la bandeja...",
+    "Mmm, revisando la bandeja...",
+    "A ver los mensajes...",
+    "Pensando el ticket...",
+    "Veamos los mensajes...",
+    "En ello con los tickets...",
+    "Veamos qué llegó...",
+    "Dame un instante para leerlo...",
+    "Revisando los mensajes...",
+    "Comprobando los tickets...",
 ];
 
 /// Backend TTS seleccionado en tiempo de ejecución.
@@ -134,6 +166,8 @@ pub struct EdgeTtsEngine {
     cache_dir: PathBuf,
     voice_id: String,
     voice_lang: String,
+    /// Cursor de rotación para no repetir siempre el primer filler cacheado.
+    filler_cursor: AtomicU64,
 }
 
 impl EdgeTtsEngine {
@@ -150,6 +184,23 @@ impl EdgeTtsEngine {
             cache_dir: cache_root(),
             voice_id: voice.id.to_string(),
             voice_lang: voice.lang.to_string(),
+            filler_cursor: AtomicU64::new(0),
+        }
+    }
+
+    /// Motor con la misma caché y binarios que `self`, pero con otra voz.
+    ///
+    /// Lo usa el cambio de voz en caliente: la caché de fillers es global y
+    /// por voz, así que solo cambia el directorio de voz al resolver rutas.
+    pub fn for_voice(&self, voice_id: &str) -> Self {
+        let voice = resolve_voice(voice_id);
+        Self {
+            edge_tts_bin: self.edge_tts_bin.clone(),
+            espeak_bin: self.espeak_bin.clone(),
+            cache_dir: self.cache_dir.clone(),
+            voice_id: voice.id.to_string(),
+            voice_lang: voice.lang.to_string(),
+            filler_cursor: AtomicU64::new(0),
         }
     }
 
@@ -207,25 +258,35 @@ impl EdgeTtsEngine {
             .join(format!("{hash:016x}.{ext}"))
     }
 
-    /// Devuelve el primer filler ya sintetizado y cacheado, sin red.
+    /// Devuelve un filler ya sintetizado y cacheado, sin red.
+    ///
+    /// En lugar de repetir siempre el primero, rota entre los disponibles con
+    /// un cursor atómico (independiente de la hora del sistema).
     pub fn get_cached_filler(&self) -> Option<PathBuf> {
-        all_fillers()
-            .map(|text| self.filler_cache_path(text))
-            .find(|path| path.is_file())
+        self.pick_cached_filler(all_fillers())
     }
 
-    /// Devuelve el primer filler cacheado de una categoría concreta (sin red).
+    /// Devuelve un filler cacheado de una categoría concreta (sin red),
+    /// rotando entre los disponibles.
     ///
     /// Es la consulta usada por el `ConversationCoordinator` para disparar la
     /// frase de relleno contextual en < 300 ms: solo comprueba el sistema de
     /// archivos local, nunca invoca al backend TTS.
     pub fn get_cached_filler_for(&self, category: FillerCategory) -> Option<PathBuf> {
-        category
-            .phrases()
-            .iter()
-            .copied()
+        self.pick_cached_filler(category.phrases().iter().copied())
+    }
+
+    /// Recolecta los fillers cacheados de `texts` y elige uno por rotación.
+    fn pick_cached_filler(&self, texts: impl Iterator<Item = &'static str>) -> Option<PathBuf> {
+        let cached: Vec<PathBuf> = texts
             .map(|text| self.filler_cache_path(text))
-            .find(|path| path.is_file())
+            .filter(|path| path.is_file())
+            .collect();
+        if cached.is_empty() {
+            return None;
+        }
+        let index = self.filler_cursor.fetch_add(1, Ordering::Relaxed) as usize;
+        cached.get(index % cached.len()).cloned()
     }
 
     /// Sintetiza (si faltan) todos los fillers en el directorio de caché.
@@ -408,6 +469,39 @@ fn base_lang(lang: &str) -> &str {
     lang.split('-').next().unwrap_or("es")
 }
 
+/// Genera en memoria un *chime* de confirmación suave (HU-18).
+///
+/// Son dos notas armónicas breves (~120 ms en total, 16 kHz mono) con ataque
+/// corto y decaimiento exponencial: un tono elegante que confirma el turno
+/// aceptado sin palabras y sin depender de la red ni de la voz sintética.
+pub fn synth_chime() -> PcmAudio {
+    use std::f32::consts::TAU;
+
+    const RATE: u32 = 16_000;
+    const TOTAL_MS: f32 = 120.0;
+    const NOTE_MS: f32 = 55.0;
+    const TOTAL: usize = (RATE as f32 * TOTAL_MS / 1_000.0) as usize;
+    const NOTE: usize = (RATE as f32 * NOTE_MS / 1_000.0) as usize;
+    const F1: f32 = 880.0;
+    const F2: f32 = 1_174.66;
+    const ATTACK_S: f32 = 0.004;
+
+    let mut samples = Vec::with_capacity(TOTAL);
+    for i in 0..TOTAL {
+        let t = i as f32 / RATE as f32;
+        let (freq, local) = if i < NOTE {
+            (F1, i as f32 / NOTE as f32)
+        } else {
+            (F2, (i - NOTE) as f32 / NOTE as f32)
+        };
+        let attack = (t / ATTACK_S).min(1.0);
+        let decay = (-3.0 * local).exp();
+        let sample = (TAU * freq * t).sin() * 0.16 * attack * decay;
+        samples.push(sample);
+    }
+    PcmAudio::new(samples, RATE, 1)
+}
+
 /// FNV-1a 64 bits (clave de caché estable; no criptográfico).
 fn fnv1a64(text: &str) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -537,7 +631,7 @@ mod tests {
     }
 
     #[test]
-    fn get_cached_filler_returns_first_cached_file() {
+    fn get_cached_filler_returns_the_only_cached_file() {
         let cache = temp_dir("cachedfiller");
         cleanup(&cache);
         std::fs::create_dir_all(&cache).unwrap();
@@ -548,6 +642,65 @@ mod tests {
 
         assert_eq!(engine.get_cached_filler(), Some(first));
         cleanup(&cache);
+    }
+
+    #[test]
+    fn get_cached_filler_rotates_across_cached_files() {
+        let cache = temp_dir("rotatefillers");
+        cleanup(&cache);
+        std::fs::create_dir_all(&cache).unwrap();
+        let engine = EdgeTtsEngine::new().with_cache_dir(cache.clone());
+        let first = engine.filler_cache_path(FILLERS_GENERAL[0]);
+        let second = engine.filler_cache_path(FILLERS_GENERAL[1]);
+        for path in [&first, &second] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"audio").unwrap();
+        }
+
+        let a = engine.get_cached_filler().unwrap();
+        let b = engine.get_cached_filler().unwrap();
+        let c = engine.get_cached_filler().unwrap();
+        assert_ne!(a, b, "la rotación alterna entre los fillers cacheados");
+        assert_eq!(a, c, "tras una vuelta completa vuelve al primero");
+        cleanup(&cache);
+    }
+
+    #[test]
+    fn for_voice_keeps_cache_and_binaries_but_changes_voice() {
+        let cache = temp_dir("forvoice");
+        cleanup(&cache);
+        let engine = EdgeTtsEngine::new()
+            .with_cache_dir(cache.clone())
+            .with_edge_tts_binary(Some(PathBuf::from("/bin/edge-tts")))
+            .with_espeak_binary(None);
+        let swapped = engine.for_voice("es-ES-ElviraNeural");
+        assert_eq!(swapped.voice_id(), "es-ES-ElviraNeural");
+        assert_eq!(swapped.voice_lang(), "es-ES");
+        assert_eq!(swapped.cache_dir(), engine.cache_dir());
+        assert_eq!(swapped.edge_tts_binary(), engine.edge_tts_binary());
+        assert_eq!(swapped.espeak_binary(), engine.espeak_binary());
+        cleanup(&cache);
+    }
+
+    #[test]
+    fn synth_chime_is_brief_quiet_and_mono() {
+        let pcm = synth_chime();
+        assert_eq!(pcm.sample_rate, 16_000);
+        assert_eq!(pcm.channels, 1);
+        let duration = pcm.duration_seconds();
+        assert!(
+            (0.10..=0.15).contains(&duration),
+            "chime de ~120 ms, duración: {duration} s"
+        );
+        let peak = pcm.samples.iter().copied().fold(0.0f32, f32::max).abs();
+        assert!(peak > 0.0, "el chime no es silencio");
+        assert!(peak < 0.3, "chime sutil (pico < 0.3): {peak}");
+        // Decae al silencio al final: la cola no corta en seco.
+        let tail = &pcm.samples[pcm.samples.len() - 16..];
+        assert!(
+            tail.iter().all(|s| s.abs() < 0.02),
+            "decaimiento suave en la cola: {tail:?}"
+        );
     }
 
     #[test]

@@ -8,8 +8,9 @@
 
 use std::f32::consts::TAU;
 use std::fmt;
+use std::time::{Duration, Instant};
 
-use jarvis_core::JarvisState;
+use jarvis_core::{JarvisState, Opacity};
 use tiny_skia::{
     Color, FillRule, GradientStop, Paint, PathBuilder, Point, RadialGradient, Shader, SpreadMode,
     Stroke, Transform,
@@ -19,7 +20,9 @@ use tiny_skia::{
 pub use tiny_skia::Pixmap;
 
 /// Tamaño por defecto de la esfera, en píxeles.
-pub const DEFAULT_SPHERE_SIZE: u32 = 220;
+///
+/// Alias de compatibilidad: la constante canónica vive en `jarvis_core`.
+pub const DEFAULT_SPHERE_SIZE: u32 = jarvis_core::DEFAULT_SPHERE_SIZE_PX;
 
 /// Número de segmentos del contorno orgánico (suficiente para 220 px).
 const BLOB_SEGMENTS: usize = 96;
@@ -118,14 +121,21 @@ impl SphereRenderer {
     }
 
     pub fn with_size(size: u32) -> Self {
+        let mut renderer = Self {
+            size: 0,
+            center: 0.0,
+            base_radius: 0.0,
+        };
+        renderer.resize(size);
+        renderer
+    }
+
+    /// Cambia el tamaño sin reasignar nada (el `Pixmap` lo gestiona el llamador).
+    pub fn resize(&mut self, size: u32) {
         let size = size.max(1);
-        let center = size as f32 / 2.0;
-        let base_radius = center * 0.72;
-        Self {
-            size,
-            center,
-            base_radius,
-        }
+        self.size = size;
+        self.center = size as f32 / 2.0;
+        self.base_radius = self.center * 0.72;
     }
 
     pub fn size(&self) -> u32 {
@@ -306,6 +316,70 @@ fn sphere_shader(center: f32, radius: f32, palette: Palette) -> Shader<'static> 
     .unwrap_or_else(|| Shader::SolidColor(Color::from_rgba8(palette.r, palette.g, palette.b, 255)))
 }
 
+/// Multiplica los canales premultiplicados de un `Pixmap` por `opacity`.
+///
+/// Con premultiplicado, escalar los cuatro canales por `α` equivale a componer
+/// la capa con opacidad `α`, sin artefactos en los bordes antialias. Con
+/// [`Opacity::OPAQUE`] no toca el buffer (atajo de coste cero).
+pub fn apply_opacity(pixmap: &mut Pixmap, opacity: Opacity) {
+    if opacity.is_opaque() {
+        return;
+    }
+    let a = u32::from(opacity.as_u8());
+    for pixel in pixmap.data_mut().as_chunks_mut::<4>().0 {
+        for channel in pixel.iter_mut() {
+            let c = u32::from(*channel);
+            *channel = ((c * a + 127) / 255) as u8;
+        }
+    }
+}
+
+/// Interpolador temporal lineal de opacidad (fundidos suaves).
+#[derive(Debug, Clone, Copy)]
+pub struct OpacityFade {
+    from: Opacity,
+    to: Opacity,
+    started_at: Instant,
+    duration: Duration,
+}
+
+impl OpacityFade {
+    /// Crea un fundido ya asentado en `initial`.
+    pub fn new(initial: Opacity, duration: Duration) -> Self {
+        Self {
+            from: initial,
+            to: initial,
+            started_at: Instant::now(),
+            duration,
+        }
+    }
+
+    /// Cambia el objetivo partiendo del valor interpolado actual (sin saltos).
+    pub fn retarget(&mut self, to: Opacity, now: Instant) {
+        self.from = self.value_at(now);
+        self.to = to;
+        self.started_at = now;
+    }
+
+    /// Opacidad interpolada en el instante `now`.
+    pub fn value_at(&self, now: Instant) -> Opacity {
+        if self.from == self.to || self.duration.is_zero() {
+            return self.to;
+        }
+        let elapsed = now.saturating_duration_since(self.started_at);
+        let t = (elapsed.as_secs_f32() / self.duration.as_secs_f32()).clamp(0.0, 1.0);
+        let from = f32::from(self.from.as_u8());
+        let to = f32::from(self.to.as_u8());
+        let value = (from + (to - from) * t).round();
+        Opacity::from_raw(value.clamp(0.0, 255.0) as u8)
+    }
+
+    /// `true` cuando se alcanzó el objetivo (no quedan pasos intermedios).
+    pub fn is_settled(&self, now: Instant) -> bool {
+        self.from == self.to || now.saturating_duration_since(self.started_at) >= self.duration
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,5 +516,83 @@ mod tests {
         assert_eq!(pixmap.width(), 128);
         assert_eq!(pixmap.height(), 128);
         assert!(alpha_at(&pixmap, 64, 64) > 200);
+    }
+
+    #[test]
+    fn resize_recalculates_geometry() {
+        let mut renderer = SphereRenderer::new();
+        assert_eq!(renderer.size(), 220);
+
+        renderer.resize(440);
+        assert_eq!(renderer.size(), 440);
+        let pixmap = renderer.render(0.0, JarvisState::Idle, 0.0).unwrap();
+        assert_eq!(pixmap.width(), 440);
+        assert_eq!(pixmap.height(), 440);
+        assert!(alpha_at(&pixmap, 220, 220) > 200);
+
+        renderer.resize(110);
+        assert_eq!(renderer.size(), 110);
+        let small = renderer.render(0.0, JarvisState::Idle, 0.0).unwrap();
+        assert_eq!(small.width(), 110);
+        assert_eq!(small.height(), 110);
+    }
+
+    #[test]
+    fn apply_opacity_scales_premultiplied_channels() {
+        let mut pixmap = Pixmap::new(1, 1).unwrap();
+        pixmap.data_mut().copy_from_slice(&[255, 255, 255, 255]);
+        apply_opacity(&mut pixmap, Opacity::from_pct(50));
+        assert_eq!(pixmap.data(), &[128, 128, 128, 128]);
+
+        let mut opaque = Pixmap::new(1, 1).unwrap();
+        opaque.data_mut().copy_from_slice(&[10, 20, 30, 40]);
+        apply_opacity(&mut opaque, Opacity::OPAQUE);
+        assert_eq!(opaque.data(), &[10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn apply_opacity_keeps_premultiplied_invariant() {
+        let mut pixmap = Pixmap::new(64, 64).unwrap();
+        let mut seed = 42u32;
+        let mut rng = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for pixel in pixmap.data_mut().as_chunks_mut::<4>().0 {
+            let a = (rng() % 256) as u8;
+            let cap = |v: u32| v.min(u32::from(a)) as u8;
+            pixel[0] = cap(rng() % 256);
+            pixel[1] = cap(rng() % 256);
+            pixel[2] = cap(rng() % 256);
+            pixel[3] = a;
+        }
+        apply_opacity(&mut pixmap, Opacity::from_pct(33));
+        for pixel in pixmap.data().as_chunks::<4>().0 {
+            let a = pixel[3];
+            assert!(pixel[0] <= a && pixel[1] <= a && pixel[2] <= a, "{pixel:?}");
+        }
+    }
+
+    #[test]
+    fn opacity_fade_interpolates_and_retargets() {
+        let duration = Duration::from_millis(150);
+        let mut fade = OpacityFade::new(Opacity::OPAQUE, duration);
+        let t0 = Instant::now();
+        assert_eq!(fade.value_at(t0), Opacity::OPAQUE);
+        assert!(fade.is_settled(t0));
+
+        fade.retarget(Opacity::from_raw(0), t0);
+        assert_eq!(fade.value_at(t0), Opacity::OPAQUE);
+        assert_eq!(fade.value_at(t0 + duration / 2), Opacity::from_raw(128));
+        assert_eq!(fade.value_at(t0 + duration), Opacity::from_raw(0));
+        assert!(!fade.is_settled(t0 + duration / 2));
+        assert!(fade.is_settled(t0 + duration));
+
+        // Un retarget a mitad del fundido parte del valor interpolado actual.
+        let mid = t0 + duration / 2;
+        fade.retarget(Opacity::OPAQUE, mid);
+        assert_eq!(fade.value_at(mid), Opacity::from_raw(128));
+        assert_eq!(fade.value_at(mid + duration / 2), Opacity::from_raw(192));
+        assert_eq!(fade.value_at(mid + duration), Opacity::OPAQUE);
     }
 }

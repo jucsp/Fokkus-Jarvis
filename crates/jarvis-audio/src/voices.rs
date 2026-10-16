@@ -1,7 +1,8 @@
-//! Catálogo de voces neuronales de Edge-TTS para el idioma español.
+//! Catálogo de voces neuronales de Edge-TTS (español e inglés).
 //!
-//! Incluye las 15 voces soportadas en Fase 2. La voz por defecto es
-//! `es-CL-LorenzoNeural` (Chile, masculina), alineada con el SDD.
+//! Incluye las 19 voces soportadas en Fase 2 (15 en español y 4 en inglés).
+//! La voz por defecto es `es-CL-LorenzoNeural` (Chile, masculina), alineada
+//! con el SDD.
 
 /// Identificador de la voz por defecto.
 pub const DEFAULT_VOICE_ID: &str = "es-CL-LorenzoNeural";
@@ -30,8 +31,8 @@ pub struct VoiceInfo {
 /// Texto de preescucha usado por todas las voces.
 const PREVIEW_TEXT: &str = "Hola, soy Jarvis, tu asistente de escritorio.";
 
-/// Catálogo de las 15 voces neuronales soportadas.
-pub static VOICES: [VoiceInfo; 15] = [
+/// Catálogo de las 19 voces neuronales soportadas.
+pub static VOICES: [VoiceInfo; 19] = [
     VoiceInfo {
         id: "es-CL-LorenzoNeural",
         name: "Lorenzo",
@@ -150,6 +151,38 @@ pub static VOICES: [VoiceInfo; 15] = [
         gender: Gender::Female,
         lang: "es-VE",
         region: "Venezuela",
+        preview_text: PREVIEW_TEXT,
+    },
+    VoiceInfo {
+        id: "en-US-AriaNeural",
+        name: "Aria",
+        gender: Gender::Female,
+        lang: "en-US",
+        region: "Estados Unidos",
+        preview_text: PREVIEW_TEXT,
+    },
+    VoiceInfo {
+        id: "en-US-GuyNeural",
+        name: "Guy",
+        gender: Gender::Male,
+        lang: "en-US",
+        region: "Estados Unidos",
+        preview_text: PREVIEW_TEXT,
+    },
+    VoiceInfo {
+        id: "en-GB-SoniaNeural",
+        name: "Sonia",
+        gender: Gender::Female,
+        lang: "en-GB",
+        region: "Reino Unido",
+        preview_text: PREVIEW_TEXT,
+    },
+    VoiceInfo {
+        id: "en-GB-RyanNeural",
+        name: "Ryan",
+        gender: Gender::Male,
+        lang: "en-GB",
+        region: "Reino Unido",
         preview_text: PREVIEW_TEXT,
     },
 ];

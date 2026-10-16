@@ -25,7 +25,7 @@ pub use delay::{stream_delay_ms, DelayTerms, LatencyProbe};
 pub use processor::{EchoProcessor, ProcessorConfig, SonoraProcessor};
 pub use reframe::Reframer;
 pub use resample::MonoResampler;
-pub use thread::{spawn_dsp_thread, DspHandle, DspThreadConfig};
+pub use thread::{spawn_dsp_thread, ConnectorSignal, DspHandle, DspThreadConfig};
 
 /// Tasa de trabajo de la cadena DSP y del VAD.
 pub const DSP_RATE: u32 = 16_000;

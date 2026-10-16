@@ -8,11 +8,16 @@
 mod bus;
 mod config;
 mod paths;
+mod shared;
 pub mod single_instance;
 mod state;
 
 pub use bus::{AudioLevel, AudioLevelStore, EventBus};
-pub use config::{ConfigError, JarvisConfig};
+pub use config::{
+    sphere_size_for_pct, BrainMode, ConfigError, JarvisConfig, Opacity, DEFAULT_CLI_COMMAND,
+    DEFAULT_SPHERE_SIZE_PX, SPHERE_OPACITY_RANGE, SPHERE_SCALE_RANGE,
+};
+pub use shared::SharedCore;
 pub use state::{JarvisState, StateMachine, StateTransition, TransitionError};
 
 /// Orquestador mínimo del núcleo: estado + configuración + bus de eventos.

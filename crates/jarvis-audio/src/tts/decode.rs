@@ -80,6 +80,9 @@ pub fn decode_mp3(bytes: &[u8]) -> Result<PcmAudio, TtsError> {
         .unwrap_or(1);
 
     let mut samples = Vec::new();
+    // `copy_to_vec_interleaved` redimensiona el destino al tamaño del paquete
+    // (no agrega): se copia a un buffer por paquete y se acumula.
+    let mut packet_samples: Vec<f32> = Vec::new();
 
     loop {
         let packet = match format.next_packet() {
@@ -98,7 +101,8 @@ pub fn decode_mp3(bytes: &[u8]) -> Result<PcmAudio, TtsError> {
 
         match decoder.decode(&packet) {
             Ok(decoded) => {
-                decoded.copy_to_vec_interleaved::<f32>(&mut samples);
+                decoded.copy_to_vec_interleaved::<f32>(&mut packet_samples);
+                samples.extend_from_slice(&packet_samples);
             }
             Err(SymphoniaError::DecodeError(_)) => continue,
             Err(SymphoniaError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -122,6 +126,22 @@ mod tests {
     #[test]
     fn decode_empty_returns_error() {
         assert!(matches!(decode_mp3(&[]), Err(TtsError::Decode(_))));
+    }
+
+    #[test]
+    fn decode_keeps_every_packet_not_only_the_last() {
+        // Filler real de Edge-TTS (24 kHz mono, ~2 s, decenas de paquetes).
+        let mp3 = include_bytes!("../../tests/fixtures/filler-es-cl.mp3");
+        let pcm = decode_mp3(mp3).expect("MP3 válido");
+        assert_eq!(pcm.sample_rate, 24_000);
+        assert_eq!(pcm.channels, 1);
+        // Un solo paquete MP3 son 1 152 muestras (48 ms): la regresión dejaba
+        // solo el último.
+        assert!(
+            pcm.duration_seconds() > 1.0,
+            "duración decodificada: {} s",
+            pcm.duration_seconds()
+        );
     }
 
     #[test]

@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 cpal.workspace = true
+crossbeam-channel.workspace = true
+serde_json.workspace = true
+ringbuf.workspace = true
 jarvis-audio = { path = "../jarvis-audio" }
 jarvis-core = { path = "../jarvis-core" }
 jarvis-ipc = { path = "../jarvis-ipc" }

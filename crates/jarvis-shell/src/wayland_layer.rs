@@ -6,9 +6,12 @@
 //!
 //! Puntero: la región de entrada es el círculo de la esfera (las esquinas
 //! transparentes dejan pasar los clics). Arrastrar con el botón izquierdo
-//! reposiciona la capa ajustando sus márgenes; el clic derecho la cierra.
+//! reposiciona la capa ajustando sus márgenes; el clic derecho emite
+//! [`ShellCommand::QuickPanel`] para que la aplicación abra el Panel Rápido
+//! (PyQt6) en lugar del antiguo menú nativo.
 
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::compositor::{
     CompositorHandler, CompositorState, FrameCallbackData, Region,
@@ -33,8 +36,9 @@ use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, delegate_registry, registry_handlers};
 
 use crate::{
-    rgba_premul_to_argb8888, Anchor, FrameBuffer, KeyboardInteractivity, OverlayOptions,
-    OverlaySurface, SurfaceBackend, SurfaceError, SurfaceSize, SurfaceStatus,
+    rgba_premul_to_argb8888_with_alpha, Anchor, FrameBuffer, KeyboardInteractivity, Opacity,
+    OverlayOptions, OverlaySurface, ShellCommand, SurfaceBackend, SurfaceError, SurfaceSize,
+    SurfaceStatus,
 };
 
 /// Namespace de la capa (lo usan los compositores para reglas por app).
@@ -54,6 +58,9 @@ const DRAG_THRESHOLD: f64 = 4.0;
 const INPUT_STRIP_HEIGHT: u32 = 4;
 
 /// Márgenes `(top, right, bottom, left)` de la capa.
+/// Espera máxima del `configure` tras un cambio de tamaño (HU-33).
+const RESIZE_CONFIGURE_TIMEOUT: Duration = Duration::from_millis(250);
+
 type Margins = (i32, i32, i32, i32);
 
 /// Traduce el anclaje lógico a los bordes de layer-shell.
@@ -198,7 +205,12 @@ struct LayerState {
     seat: SeatState,
     pointer: Option<wl_pointer::WlPointer>,
     gesture: DragGesture,
+    /// Acciones del menú pendientes de entregar a la aplicación.
+    commands: VecDeque<ShellCommand>,
     anchor: Anchor,
+    /// Margen base de [`OverlayOptions`] (para volver a la posición inicial).
+    #[allow(dead_code)] // reservado para "restablecer posición"
+    base_margin: u32,
     margins: Margins,
     /// Tamaño lógico de la salida donde está la capa (acota el arrastre).
     output_size: Option<(i32, i32)>,
@@ -216,6 +228,10 @@ struct LayerState {
     closed: bool,
     /// Ya se avisó de un tamaño propuesto distinto (se avisa una sola vez).
     size_mismatch_logged: bool,
+    /// Opacidad global aplicada en la conversión a `Argb8888` (HU-34).
+    opacity: Opacity,
+    /// Ya se avisó de un `configure` que no llegó tras redimensionar.
+    resize_timeout_logged: bool,
 }
 
 impl LayerState {
@@ -253,6 +269,33 @@ impl LayerState {
         let sw = i32::try_from(self.size.width).ok()?;
         let sh = i32::try_from(self.size.height).ok()?;
         Some((w - sw, h - sh))
+    }
+
+    /// Re-satura los márgenes al hueco libre actual (tras crecer la esfera,
+    /// para que no quede parcialmente fuera de la salida).
+    fn clamp_margins(&mut self) {
+        let next = drag_margins(self.anchor, self.margins, (0, 0), self.drag_bounds());
+        if next != self.margins {
+            self.margins = next;
+            self.apply_margins();
+        }
+    }
+
+    /// Aplica `size` a la capa: descarta los buffers del tamaño anterior,
+    /// reserva memoria en el pool y recalcula región de entrada y márgenes.
+    /// No hace commit.
+    fn apply_size(&mut self, size: SurfaceSize) -> Result<(), SurfaceError> {
+        self.size = size;
+        // Los buffers retenidos por el compositor se destruyen al liberarse.
+        self.buffers.clear();
+        let needed = size.pixel_count() * 4 * BUFFER_COUNT;
+        if self.pool.len() < needed {
+            self.pool.resize(needed).map_err(backend_error)?;
+        }
+        self.layer.set_size(size.width, size.height);
+        self.apply_sphere_input_region()?;
+        self.clamp_margins();
+        Ok(())
     }
 
     /// Desplaza la capa `delta` píxeles (arrastre con el botón izquierdo).
@@ -347,7 +390,7 @@ impl LayerShellHandler for LayerState {
         let proposed_other = w != 0 && h != 0 && (w, h) != (self.size.width, self.size.height);
         if proposed_other && !self.size_mismatch_logged {
             eprintln!(
-                "[shell] el compositor propone {w}x{h}; se mantiene {}x{} (esfera de tamaño fijo)",
+                "[shell] el compositor propone {w}x{h}; se mantiene {}x{} (tamaño fijado por la app)",
                 self.size.width, self.size.height
             );
             self.size_mismatch_logged = true;
@@ -386,7 +429,9 @@ impl SeatHandler for LayerState {
     ) {
         if capability == Capability::Pointer && self.pointer.is_none() {
             match self.seat.get_pointer(qh, &seat) {
-                Ok(pointer) => self.pointer = Some(pointer),
+                Ok(pointer) => {
+                    self.pointer = Some(pointer);
+                }
                 Err(e) => eprintln!("[shell] no se pudo obtener el puntero: {e}"),
             }
         }
@@ -439,8 +484,29 @@ impl PointerHandler for LayerState {
                 PointerEventKind::Press {
                     button: BTN_RIGHT, ..
                 } => {
-                    eprintln!("[shell] clic derecho sobre la esfera: cierre solicitado");
-                    self.closed = true;
+                    // Coordenada absoluta del clic en pantalla: posición local
+                    // dentro de la esfera + esquina superior izquierda de la
+                    // capa según el anclaje y los márgenes actuales.
+                    let (top, right, bottom, left) = self.margins;
+                    let (output_w, output_h) = self.output_size.unwrap_or((1920, 1080));
+                    let sphere_w = self.size.width as i32;
+                    let sphere_h = self.size.height as i32;
+                    let sphere_x = match self.anchor {
+                        Anchor::BottomRight | Anchor::TopRight => output_w - right - sphere_w,
+                        Anchor::BottomLeft | Anchor::TopLeft => left,
+                        Anchor::Center => (output_w - sphere_w) / 2,
+                    };
+                    let sphere_y = match self.anchor {
+                        Anchor::BottomRight | Anchor::BottomLeft => output_h - bottom - sphere_h,
+                        Anchor::TopLeft | Anchor::TopRight => top,
+                        Anchor::Center => (output_h - sphere_h) / 2,
+                    };
+                    let click_x = sphere_x + event.position.0 as i32;
+                    let click_y = sphere_y + event.position.1 as i32;
+                    self.commands.push_back(ShellCommand::QuickPanel {
+                        x: click_x,
+                        y: click_y,
+                    });
                 }
                 _ => {}
             }
@@ -518,7 +584,9 @@ impl WaylandLayerSurface {
             seat: SeatState::new(&globals, &qh),
             pointer: None,
             gesture: DragGesture::default(),
+            commands: VecDeque::new(),
             anchor: options.anchor,
+            base_margin: options.margin,
             margins: margins_for(options.anchor, options.margin),
             output_size: None,
             compositor,
@@ -532,6 +600,8 @@ impl WaylandLayerSurface {
             visible: true,
             closed: false,
             size_mismatch_logged: false,
+            opacity: Opacity::OPAQUE,
+            resize_timeout_logged: false,
         };
         state.apply_anchor(options.anchor, options.margin);
         state.apply_sphere_input_region()?;
@@ -605,7 +675,7 @@ impl OverlaySurface for WaylandLayerSurface {
         let canvas = buffer
             .canvas(&mut state.pool)
             .ok_or_else(|| SurfaceError::Backend("buffer wl_shm ocupado".to_string()))?;
-        rgba_premul_to_argb8888(frame.data, canvas)?;
+        rgba_premul_to_argb8888_with_alpha(frame.data, canvas, state.opacity)?;
 
         let surface = state.layer.wl_surface().clone();
         let width = i32::try_from(size.width).map_err(backend_error)?;
@@ -652,6 +722,77 @@ impl OverlaySurface for WaylandLayerSurface {
         self.state.apply_anchor(anchor, self.options.margin);
         self.state.layer.commit();
         let _ = self.conn.flush();
+    }
+
+    fn reset_position(&mut self) {
+        self.state
+            .apply_anchor(self.options.anchor, self.options.margin);
+        self.state.layer.commit();
+        let _ = self.conn.flush();
+    }
+
+    fn poll_command(&mut self) -> Option<ShellCommand> {
+        self.state.commands.pop_front()
+    }
+
+    /// Redimensiona la capa y espera el `configure` correspondiente (como
+    /// máximo [`RESIZE_CONFIGURE_TIMEOUT`]) para no presentar frames del
+    /// tamaño anterior. Si el compositor no responde, se conserva el tamaño
+    /// previo y se devuelve error.
+    fn set_size(&mut self, size: SurfaceSize) -> Result<(), SurfaceError> {
+        if size == self.state.size {
+            return Ok(());
+        }
+        let previous = self.state.size;
+        self.state.apply_size(size)?;
+        if !self.state.visible {
+            // Oculta: `set_visible(true)` remapea ya con el tamaño nuevo.
+            return Ok(());
+        }
+        self.state.configured = false;
+        self.state.frame_pending = false;
+        self.state.layer.commit();
+        self.conn.flush().map_err(backend_error)?;
+
+        let deadline = Instant::now() + RESIZE_CONFIGURE_TIMEOUT;
+        while !self.state.configured && !self.state.closed {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if self.event_loop.dispatch(left, &mut self.state).is_err() {
+                return Err(SurfaceError::Backend(
+                    "conexión Wayland perdida".to_string(),
+                ));
+            }
+        }
+        if self.state.configured || self.state.closed {
+            return Ok(());
+        }
+
+        // Sin `configure`: se restaura el tamaño anterior y se sigue dibujando.
+        self.state.apply_size(previous)?;
+        self.state.layer.commit();
+        self.state.configured = true;
+        let _ = self.conn.flush();
+        let detail = format!(
+            "el compositor no confirmó {}x{} en {} ms",
+            size.width,
+            size.height,
+            RESIZE_CONFIGURE_TIMEOUT.as_millis()
+        );
+        if !self.state.resize_timeout_logged {
+            eprintln!(
+                "[shell] {detail}; se mantiene {}x{}",
+                previous.width, previous.height
+            );
+            self.state.resize_timeout_logged = true;
+        }
+        Err(SurfaceError::Backend(detail))
+    }
+
+    fn set_opacity(&mut self, opacity: Opacity) {
+        self.state.opacity = opacity;
     }
 }
 
@@ -776,6 +917,46 @@ mod tests {
             assert!(x >= 0 && y >= 0 && w > 0 && h > 0);
             assert!(x + w <= 220 && y + h <= 220);
         }
+    }
+
+    #[test]
+    fn input_region_follows_the_new_size() {
+        for side in [110_i32, 440] {
+            let size = SurfaceSize::new(side as u32, side as u32).unwrap();
+            let strips = circle_strips(size);
+            let covers = |px: i32, py: i32| {
+                strips
+                    .iter()
+                    .any(|&(x, y, w, h)| px >= x && px < x + w && py >= y && py < y + h)
+            };
+            assert!(covers(side / 2, side / 2));
+            assert!(!covers(0, 0));
+            assert!(!covers(side - 1, side - 1));
+            for (x, y, w, h) in strips {
+                assert!(x + w <= side && y + h <= side);
+            }
+        }
+    }
+
+    #[test]
+    fn margins_are_resaturated_after_growing() {
+        // Esfera de 220 px arrastrada casi al borde opuesto de una salida 1920x1080.
+        let dragged = (0, 1690, 850, 0);
+        // Al crecer a 440 px el hueco libre baja a (1480, 640): se satura.
+        assert_eq!(
+            drag_margins(Anchor::BottomRight, dragged, (0, 0), Some((1480, 640))),
+            (0, 1480, 640, 0)
+        );
+        // Si cabe, no se mueve.
+        assert_eq!(
+            drag_margins(
+                Anchor::BottomRight,
+                (0, 12, 12, 0),
+                (0, 0),
+                Some((1480, 640))
+            ),
+            (0, 12, 12, 0)
+        );
     }
 
     #[test]

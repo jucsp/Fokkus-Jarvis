@@ -1,9 +1,11 @@
 //! Superficie sin ventana: valida los frames y regula el ritmo del bucle.
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use crate::{
-    Anchor, FrameBuffer, OverlaySurface, SurfaceBackend, SurfaceError, SurfaceSize, SurfaceStatus,
+    Anchor, FrameBuffer, Opacity, OverlaySurface, ShellCommand, SurfaceBackend, SurfaceError,
+    SurfaceSize, SurfaceStatus,
 };
 
 /// Superficie que valida los frames sin abrir una ventana real.
@@ -15,6 +17,9 @@ pub struct HeadlessSurface {
     visible: bool,
     anchor: Anchor,
     presented: u64,
+    commands: VecDeque<ShellCommand>,
+    muted: bool,
+    opacity: Opacity,
 }
 
 impl HeadlessSurface {
@@ -24,7 +29,20 @@ impl HeadlessSurface {
             visible: false,
             anchor: Anchor::default(),
             presented: 0,
+            commands: VecDeque::new(),
+            muted: false,
+            opacity: Opacity::OPAQUE,
         }
+    }
+
+    /// Encola una acción como si el usuario la eligiera en el menú (tests).
+    pub fn push_command(&mut self, command: ShellCommand) {
+        self.commands.push_back(command);
+    }
+
+    /// Último estado de silencio informado con [`OverlaySurface::sync_muted`].
+    pub fn is_muted(&self) -> bool {
+        self.muted
     }
 
     /// Número de frames presentados correctamente.
@@ -40,6 +58,11 @@ impl HeadlessSurface {
     /// Anclaje actual.
     pub fn anchor(&self) -> Anchor {
         self.anchor
+    }
+
+    /// Última opacidad informada con [`OverlaySurface::set_opacity`].
+    pub fn opacity(&self) -> Opacity {
+        self.opacity
     }
 }
 
@@ -80,6 +103,25 @@ impl OverlaySurface for HeadlessSurface {
     fn set_anchor(&mut self, anchor: Anchor) {
         self.anchor = anchor;
     }
+
+    fn poll_command(&mut self) -> Option<ShellCommand> {
+        self.commands.pop_front()
+    }
+
+    fn sync_muted(&mut self, muted: bool) {
+        self.muted = muted;
+    }
+
+    /// Sin compositor el cambio es inmediato: los frames siguientes se validan
+    /// contra el tamaño nuevo.
+    fn set_size(&mut self, size: SurfaceSize) -> Result<(), SurfaceError> {
+        self.size = size;
+        Ok(())
+    }
+
+    fn set_opacity(&mut self, opacity: Opacity) {
+        self.opacity = opacity;
+    }
 }
 
 #[cfg(test)]
@@ -104,6 +146,31 @@ mod tests {
             })
         );
         assert_eq!(surface.presented_frames(), 1);
+    }
+
+    #[test]
+    fn headless_set_size_revalidates_frames() {
+        let mut surface = HeadlessSurface::new(SurfaceSize::new(4, 4).unwrap());
+        let bigger = SurfaceSize::new(8, 8).unwrap();
+        assert_eq!(surface.set_size(bigger), Ok(()));
+        assert_eq!(surface.size(), bigger);
+
+        let old = [0u8; 4 * 4 * 4];
+        assert!(surface
+            .present(&FrameBuffer::new(&old, 4, 4).unwrap())
+            .is_err());
+        let new = [0u8; 8 * 8 * 4];
+        assert!(surface
+            .present(&FrameBuffer::new(&new, 8, 8).unwrap())
+            .is_ok());
+    }
+
+    #[test]
+    fn headless_remembers_opacity() {
+        let mut surface = HeadlessSurface::new(SurfaceSize::new(2, 2).unwrap());
+        assert_eq!(surface.opacity(), Opacity::OPAQUE);
+        surface.set_opacity(Opacity::from_pct(40));
+        assert_eq!(surface.opacity(), Opacity::from_pct(40));
     }
 
     #[test]

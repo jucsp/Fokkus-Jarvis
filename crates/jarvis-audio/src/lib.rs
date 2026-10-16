@@ -1,7 +1,7 @@
 //! Motor de audio de Fokkus-Jarvis (Fase 2).
 //!
 //! Agrupa:
-//! - [`voices`]: catálogo de 15 voces neuronales.
+//! - [`voices`]: catálogo de 19 voces neuronales.
 //! - [`tts`]: síntesis Edge-TTS con fallback a espeak-ng y caché de fillers.
 //! - [`playback`]: control de reproducción con parada instantánea (barge-in).
 //! - [`stt`]: transcripción local con Whisper (binario del sistema).
@@ -18,6 +18,8 @@
 //! - [`models`]: descarga y verificación segura de modelos whisper (HU-7).
 //! - [`brain`]: cliente de la API de Mensajes de Anthropic con streaming SSE y
 //!   memoria de turnos (HU-6).
+//! - [`orchestrator`]: cableado de punta a punta `VoiceEvent` → STT → Claude →
+//!   TTS con barge-in y silencio real (HU-9).
 
 pub mod activation;
 pub mod brain;
@@ -26,6 +28,7 @@ pub mod dsp;
 pub mod events;
 pub mod io;
 pub mod models;
+pub mod orchestrator;
 pub mod playback;
 pub mod stt;
 pub mod tts;
@@ -34,21 +37,29 @@ pub mod voices;
 
 pub use activation::{Activation, ActivationDetector};
 pub use brain::{
-    resolve_api_key, store_api_key, BrainError, CancellationToken, ClaudeClient, Completion,
-    Message, SseEvent, SseParser,
+    resolve_api_key, store_api_key, BrainError, CancellationToken, ClaudeClient, CliBrain,
+    Completion, Message, SseEvent, SseParser, DEFAULT_CLI_COMMAND,
 };
 pub use conversation::{
-    classify_intent, BackgroundTasks, ConversationCoordinator, ConversationError,
+    barge_in, classify_intent, BackgroundTasks, ConversationCoordinator, ConversationError,
+    TokenStream,
 };
 pub use dsp::{
-    spawn_dsp_thread, DspError, DspHandle, DspMetrics, DspMetricsSnapshot, DspThreadConfig,
-    LatencyProbe, ProcessorConfig,
+    spawn_dsp_thread, ConnectorSignal, DspError, DspHandle, DspMetrics, DspMetricsSnapshot,
+    DspThreadConfig, LatencyProbe, ProcessorConfig,
 };
 pub use events::{Segment, VoiceEvent};
-pub use io::{AudioError, AudioMetrics, AudioMetricsSnapshot};
+pub use io::{
+    AudioEngine, AudioError, AudioMetrics, AudioMetricsSnapshot, EngineConfig, EngineStatus,
+    PlayOutcome, Player,
+};
 pub use models::{
     default_models_dir, validate_header, HttpSource, ModelError, ModelHeader, ModelManager,
     ModelSource, ModelSpec, ModelStatus, VerifiedModel, MODELS, WHISPER_BASE_Q5_1, WHISPER_TINY,
+};
+pub use orchestrator::{
+    AppLauncher, AudioSink, CaptureControl, EngineControl, LocalClock, VoiceConfig, VoiceDeps,
+    VoiceOrchestrator, VoiceSpeaker, VoiceStatsSnapshot,
 };
 pub use playback::AudioPlayback;
 pub use stt::{SttError, Transcriber, WhisperEngine};
@@ -61,8 +72,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_exactly_fifteen_voices() {
-        assert_eq!(VOICES.len(), 15);
+    fn catalog_has_exactly_nineteen_voices() {
+        assert_eq!(VOICES.len(), 19);
     }
 
     #[test]

@@ -6,38 +6,46 @@
 //! 1. Analiza los argumentos de línea de comandos (`--version`, `--check`).
 //! 2. Adquiere el lock de instancia única.
 //! 3. Carga la configuración persistente (`~/.config/fokkus-jarvis/config.toml`).
-//! 4. Instancia el motor TTS ([`EdgeTtsEngine`]), la señal de reproducción
-//!    ([`AudioPlayback`]) y el gestor conversacional ([`ConversationCoordinator`])
-//!    de los Issues #3 y #4.
-//! 5. Arranca el servidor IPC en `~/.fokkus/jarvis.sock` en un hilo de fondo
-//!    no bloqueante, listo para Fokkus IDE (Issue #5).
-//! 6. Pre-sintetiza los fillers de caché en segundo plano si hay backend TTS.
-//! 7. Abre la capa overlay (o el modo headless) y entra en el bucle principal
-//!    ([`runtime::run_loop`]) hasta SIGINT/SIGTERM o el cierre de la capa.
+//! 4. Crea el **único** `JarvisCore` ([`SharedCore`]) que comparten la
+//!    esfera, el servidor IPC y el orquestador de voz.
+//! 5. Arranca el servidor IPC en `~/.fokkus/jarvis.sock` (Issue #5).
+//! 6. Abre la capa overlay (o el modo headless).
+//! 7. Arranca el motor de audio (`jarvis-audio-io`: streams `cpal` + DSP) y
+//!    el orquestador de voz (STT → Claude → TTS con barge-in). Solo lanzan
+//!    hilos: abrir dispositivos y cargar whisper ocurre fuera del render.
+//! 8. Entra en el bucle principal ([`runtime::run_loop`]) hasta SIGINT/SIGTERM,
+//!    "Salir" en el menú o el cierre de la capa, y apaga en orden.
 //!
 //! Sin terminal (lanzado desde el `.desktop`) toda la salida va al log
 //! persistente ([`logging`]); si falta el modelo whisper se descarga en
-//! segundo plano y la escucha arranca al quedar verificado.
+//! segundo plano y la escucha arranca al quedar cargado.
 
 mod logging;
 mod runtime;
+mod settings;
 
+use std::cell::{Cell, RefCell};
 use std::io::BufRead;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use cpal::traits::DeviceTrait;
-
+use jarvis_audio::io::{AudioBackend, CpalBackend, InputPort, OutputPort, PortShared};
 use jarvis_audio::{
-    AudioPlayback, ConversationCoordinator, EdgeTtsEngine, ModelManager, ModelStatus, TtsBackend,
-    WHISPER_BASE_Q5_1,
+    ActivationDetector, AudioEngine, AudioPlayback, ConversationCoordinator, DspThreadConfig,
+    EdgeTtsEngine, EngineConfig, EngineControl, ModelManager, ModelStatus, TtsBackend, VoiceConfig,
+    VoiceDeps, VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
 };
 use jarvis_core::single_instance::{self, InstanceError};
-use jarvis_core::{JarvisConfig, JarvisCore};
+use jarvis_core::{sphere_size_for_pct, JarvisConfig, JarvisCore, Opacity, SharedCore};
 use jarvis_ipc::{IpcError, IpcServer, ServerState, SpeechSink, Utterance};
-use jarvis_render::{Pixmap, SphereRenderer};
-use jarvis_shell::{HeadlessSurface, OverlayOptions, OverlaySurface, SurfaceError, SurfaceSize};
-use runtime::{LoopExit, SttAvailability};
+use jarvis_shell::{
+    HeadlessSurface, OverlayOptions, OverlaySurface, ShellCommand, SurfaceError, SurfaceSize,
+};
+use ringbuf::traits::Split;
+use ringbuf::HeapRb;
+use runtime::{LoopExit, SphereLook, SphereView, SttAvailability};
 
 /// Acción solicitada en la línea de comandos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,15 +84,34 @@ impl Health {
     }
 }
 
-/// Sumidero de locuciones del servidor IPC: arranca una locución en el motor de
-/// audio cuando Fokkus IDE pide hablar por el socket.
-struct PlaybackSpeechSink {
-    playback: AudioPlayback,
+/// Sumidero de locuciones del servidor IPC: `jarvis.speak` de Fokkus IDE se
+/// dice en voz alta por el orquestador. El orquestador arranca después del
+/// IPC, así que el destino se instala cuando existe.
+#[derive(Default)]
+struct VoiceSpeechSink {
+    speaker: Mutex<Option<VoiceSpeaker>>,
 }
 
-impl SpeechSink for PlaybackSpeechSink {
-    fn speak(&self, _utterance: &Utterance) {
-        self.playback.begin_utterance();
+impl VoiceSpeechSink {
+    fn connect(&self, speaker: VoiceSpeaker) {
+        *self
+            .speaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(speaker);
+    }
+}
+
+impl SpeechSink for VoiceSpeechSink {
+    fn speak(&self, utterance: &Utterance) {
+        let speaker = self
+            .speaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match speaker {
+            Some(speaker) => speaker.say(utterance.text.clone()),
+            None => eprintln!("[ipc] locución descartada: el motor de voz aún no arranca."),
+        }
     }
 }
 
@@ -163,6 +190,67 @@ fn run_set_api_key() -> ExitCode {
     }
 }
 
+/// Recarga `config.toml` tras guardar el formulario y aplica en caliente el
+/// cerebro y el barge-in; la voz se aplica en [`apply_loaded_voice`].
+/// Devuelve la configuración recargada (fuente de verdad de la esfera).
+fn apply_config(
+    core: &SharedCore,
+    orchestrator: Option<&VoiceOrchestrator>,
+) -> Option<JarvisConfig> {
+    let config = match JarvisConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("[config] no se pudo recargar: {e}");
+            return None;
+        }
+    };
+    if let Some(orchestrator) = orchestrator {
+        orchestrator.set_barge_in(config.barge_in_enabled);
+        orchestrator.set_continuous_listening(config.continuous_listening);
+        orchestrator.set_voice(&config.voice_id);
+        orchestrator.set_brain(settings::build_brain(&config).ok());
+        if !orchestrator.has_brain() {
+            orchestrator.speaker().say(
+                "No pude activar el cerebro con esa configuración. Solo puedo darte la hora o silenciarme.",
+            );
+        }
+    }
+    println!(
+        "[config] aplicada: cerebro={:?}, barge-in={}, escucha-continua={}, esfera={} % / opacidad {} %",
+        config.brain_mode,
+        if config.barge_in_enabled {
+            "activo"
+        } else {
+            "apagado"
+        },
+        if config.continuous_listening {
+            "activa"
+        } else {
+            "apagada"
+        },
+        config.sphere_scale_pct(),
+        config.sphere_opacity_pct(),
+    );
+    apply_loaded_voice(core, orchestrator, &config);
+    Some(config)
+}
+
+/// Aplica la voz ya cargada en `config` y actualiza el núcleo compartido.
+fn apply_loaded_voice(
+    core: &SharedCore,
+    orchestrator: Option<&VoiceOrchestrator>,
+    config: &JarvisConfig,
+) {
+    if let Some(orchestrator) = orchestrator {
+        orchestrator.set_voice(&config.voice_id);
+    }
+    println!(
+        "[voz] aplicada: {} ({})",
+        config.voice_id, config.voice_lang
+    );
+    core.lock().set_config(config.clone());
+}
+
 /// Arranca el asistente completo y lo mantiene vivo como daemon.
 fn run() -> ExitCode {
     // Antes que nada: sin terminal, la salida va al log persistente.
@@ -186,6 +274,17 @@ fn run() -> ExitCode {
 
     // Configuración persistente. Si el archivo está corrupto, se degrada a los
     // valores por defecto para no bloquear el arranque.
+    // Primer arranque: deja escrita la configuración por defecto (cerebro
+    // CLI `agy -p`, barge-in apagado) para que sea visible y editable.
+    let config_path = JarvisConfig::path();
+    match JarvisConfig::ensure_file(&config_path) {
+        Ok(true) => println!(
+            "[config] configuración por defecto creada en {}",
+            config_path.display()
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("[config] {e}"),
+    }
     let config = match JarvisConfig::load() {
         Ok(config) => config,
         Err(e) => {
@@ -194,17 +293,18 @@ fn run() -> ExitCode {
         }
     };
 
-    // Subsistemas del diálogo (Issues #3 y #4).
+    // Un único núcleo: la esfera, el IPC y el orquestador ven el mismo estado.
+    let core = SharedCore::new(JarvisCore::new(config.clone()));
+    let playback = AudioPlayback::new();
     let tts = EdgeTtsEngine::with_voice(config.voice_id.clone());
     let tts_backend = tts.backend();
-    let playback = AudioPlayback::new();
-    let mut coordinator = ConversationCoordinator::with_config(tts, config.clone());
+    let coordinator =
+        ConversationCoordinator::with_shared_core(tts, core.clone(), playback.clone());
 
     // Servidor IPC para Fokkus IDE (Issue #5): hilo de fondo no bloqueante.
-    // `ServerState` es la fuente de verdad del estado que dibuja la esfera.
-    let sink = Arc::new(PlaybackSpeechSink { playback });
+    let speech_sink = Arc::new(VoiceSpeechSink::default());
     let server_state =
-        Arc::new(ServerState::new(JarvisCore::new(config.clone())).with_speech_sink(sink));
+        Arc::new(ServerState::with_shared_core(core.clone()).with_speech_sink(speech_sink.clone()));
     let mut server = IpcServer::new(Arc::clone(&server_state));
     if let Err(e) = server.start() {
         eprintln!("No se pudo arrancar el servidor IPC: {e}");
@@ -216,56 +316,112 @@ fn run() -> ExitCode {
     spawn_filler_pre_synthesis(config.voice_id.clone());
 
     // Superficie overlay con la esfera líquida (o headless si no hay overlay).
-    let renderer = SphereRenderer::new();
-    let mut surface = match prepare_surface(&renderer) {
+    // Tamaño y opacidad persistidos (HU-33/HU-34); la vista previa de los
+    // ajustes los cambia en vivo a través de `sphere_look`.
+    let persisted_look = Cell::new(SphereLook::from_config(&config));
+    let sphere_look = Cell::new(persisted_look.get());
+    let mut view = match SphereView::new(persisted_look.get().size) {
+        Ok(view) => view,
+        Err(e) => {
+            eprintln!("No se pudo reservar el buffer de la esfera: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut surface = match prepare_surface(view.size()) {
         Ok(surface) => surface,
         Err(e) => {
             eprintln!("No se pudo preparar la superficie overlay: {e}");
             return ExitCode::FAILURE;
         }
     };
-    let Some(mut pixmap) = Pixmap::new(renderer.size(), renderer.size()) else {
-        eprintln!("No se pudo reservar el buffer de la esfera.");
-        return ExitCode::FAILURE;
-    };
     surface.set_visible(true);
 
-    // STT: sonda única. Si el modelo falta o está dañado se descarga en
-    // segundo plano y la escucha arranca cuando quede verificado.
+    // Motor de audio: solo lanza el supervisor; los dispositivos se abren en
+    // su hilo cuando el orquestador lo habilita.
+    let (events_tx, events_rx) = crossbeam_channel::unbounded();
+    let mut engine = match AudioEngine::start_cpal(
+        EngineConfig::default(),
+        None,
+        None,
+        playback.clone(),
+        events_tx,
+    ) {
+        Ok(engine) => Some(engine),
+        Err(e) => {
+            eprintln!("[audio] no se pudo arrancar el motor de audio: {e}; Jarvis no escuchará.");
+            None
+        }
+    };
+
+    // Cerebro según la configuración: CLI local (por defecto `agy -p`) o la
+    // API. Sin cerebro solo hay comandos locales y se avisa por voz.
+    let (brain, brain_notice) = match settings::build_brain(&config) {
+        Ok(brain) => (Some(brain), None),
+        Err(notice) => (None, Some(notice)),
+    };
+
+    // Orquestador de voz (HU-9).
+    let mut orchestrator = engine.as_ref().and_then(|engine| {
+        let deps = VoiceDeps {
+            core: core.clone(),
+            playback: playback.clone(),
+            capture: Arc::new(EngineControl::new(engine)),
+            sink: Arc::new(engine.player()),
+            events: events_rx,
+            coordinator,
+            brain,
+            activation: Arc::new(
+                ActivationDetector::new().with_continuous(config.continuous_listening),
+            ),
+        };
+        let config = VoiceConfig {
+            startup_notice: brain_notice.map(str::to_string),
+            clock: Arc::new(runtime::local_time),
+            barge_in_enabled: config.barge_in_enabled,
+            ..VoiceConfig::default()
+        };
+        match VoiceOrchestrator::start(deps, config) {
+            Ok(orchestrator) => {
+                speech_sink.connect(orchestrator.speaker());
+                Some(orchestrator)
+            }
+            Err(e) => {
+                eprintln!("[voz] no se pudo arrancar el orquestador: {e}; Jarvis no escuchará.");
+                None
+            }
+        }
+    });
+
+    // STT: sonda única. whisper se verifica (y si falta, se descarga) y se
+    // carga una sola vez en segundo plano; la escucha arranca al instalarlo.
     let model_manager = ModelManager::new().ok();
     let stt = match &model_manager {
         Some(mgr) => SttAvailability::probe(mgr),
         None => SttAvailability::NoDataDir,
     };
-    runtime::start_listening_if_ready(&mut coordinator, &stt);
-    let mut model_pending = match model_manager {
-        Some(manager) if stt.needs_download() => runtime::spawn_model_download(manager),
+    if let Some(warning) = stt.warning() {
+        eprintln!("{warning}");
+    }
+    let mut stt_pending = match model_manager {
+        Some(manager) if orchestrator.is_some() => runtime::spawn_stt_loader(manager),
         _ => None,
     };
 
-    // Cerebro: sin API key el diálogo con Claude no puede responder.
-    if let Err(e) = jarvis_audio::resolve_api_key(None) {
-        eprintln!(
-            "[cerebro] sin API key de Anthropic ({e}). Guárdala con: fokkus-jarvis --set-api-key"
-        );
-    }
-
     let backend = surface.backend();
+    let initial_side = view.size();
     let mut on_first_frame = || {
         println!(
-            "Fokkus-Jarvis {} — voz={} ({}) · TTS={:?} · STT={} · estado={:?}",
+            "Fokkus-Jarvis {} — voz={} ({}) · TTS={:?} · modelo STT={} · estado={:?}",
             env!("CARGO_PKG_VERSION"),
             config.voice_id,
             config.voice_lang,
             tts_backend,
             stt.label(),
-            server_state.state(),
+            core.state(),
         );
         println!(
             "Esfera renderizada: {}x{} px (backend: {:?})",
-            renderer.size(),
-            renderer.size(),
-            backend,
+            initial_side, initial_side, backend,
         );
         println!(
             "Fokkus-Jarvis iniciado correctamente. Socket IPC activo en {} — listo para conexiones de Fokkus IDE.",
@@ -275,24 +431,147 @@ fn run() -> ExitCode {
             println!("Log persistente: {}", path.display());
         }
     };
+    let audio_shared = engine.as_ref().map(|e| Arc::clone(e.shared()));
+    // Panel Rápido abierto desde el clic derecho (uno a la vez).
+    let quick_panel: RefCell<Option<settings::QuickPanel>> = RefCell::new(None);
+    // Ajustes Unificados abiertos desde el panel o el menú (uno a la vez).
+    let unified_settings: RefCell<Option<settings::UnifiedSettings>> = RefCell::new(None);
+    // "Volver a posición inicial": el panel sale con código 3 y el bucle
+    // restablece el anclaje de la esfera en el siguiente frame.
+    let reset_position = AtomicBool::new(false);
     let mut source = || {
-        runtime::poll_model_ready(&mut model_pending, &mut coordinator);
-        (server_state.state(), coordinator.core().audio_level())
+        if let Some(orchestrator) = &orchestrator {
+            runtime::poll_stt_loader(&mut stt_pending, |engine: WhisperEngine| {
+                orchestrator.set_transcriber(Box::new(engine))
+            });
+        }
+        let closed_panel = quick_panel.borrow().as_ref().and_then(|panel| panel.poll());
+        if let Some(outcome) = closed_panel {
+            quick_panel.borrow_mut().take();
+            match outcome {
+                settings::PanelOutcome::Saved => {
+                    if let Some(config) = apply_config(&core, orchestrator.as_ref()) {
+                        persisted_look.set(SphereLook::from_config(&config));
+                        sphere_look.set(persisted_look.get());
+                    }
+                }
+                settings::PanelOutcome::Cancelled => {}
+                settings::PanelOutcome::ResetPosition => {
+                    reset_position.store(true, Ordering::SeqCst);
+                }
+                settings::PanelOutcome::OpenSettings(tab) => {
+                    let mut form = unified_settings.borrow_mut();
+                    if form.is_none() {
+                        *form = settings::UnifiedSettings::open(&config_path, tab.as_deref());
+                    }
+                }
+            }
+        }
+        // Vista previa en vivo: se queda con el último valor de cada tipo y
+        // el bucle lo aplica antes de dibujar este frame.
+        if let Some(form) = unified_settings.borrow().as_ref() {
+            let mut next = sphere_look.get();
+            while let Some(preview) = form.poll_preview() {
+                match preview {
+                    settings::SettingsPreview::SphereScale(pct) => {
+                        next.size = sphere_size_for_pct(pct);
+                    }
+                    settings::SettingsPreview::SphereOpacity(pct) => {
+                        next.opacity = Opacity::from_pct(pct);
+                    }
+                }
+            }
+            sphere_look.set(next);
+        }
+        let closed_settings = unified_settings
+            .borrow()
+            .as_ref()
+            .and_then(|form| form.poll());
+        if let Some(outcome) = closed_settings {
+            unified_settings.borrow_mut().take();
+            match outcome {
+                settings::FormOutcome::Saved => {
+                    // El TOML es la fuente de verdad: se relee y se aplica.
+                    if let Some(config) = apply_config(&core, orchestrator.as_ref()) {
+                        persisted_look.set(SphereLook::from_config(&config));
+                    }
+                }
+                settings::FormOutcome::ResetPosition => {
+                    // "Volver a posición inicial" también guarda el resto.
+                    if let Some(config) = apply_config(&core, orchestrator.as_ref()) {
+                        persisted_look.set(SphereLook::from_config(&config));
+                    }
+                    reset_position.store(true, Ordering::SeqCst);
+                }
+                // Cancelado, cerrado o proceso muerto: se descarta la vista previa.
+                settings::FormOutcome::Cancelled => {}
+            }
+            sphere_look.set(persisted_look.get());
+        }
+        let level = audio_shared.as_ref().map_or(0.0, |shared| shared.level());
+        (core.state(), level)
+    };
+    // Menú contextual de la esfera: "Salir" lo resuelve el propio bucle. El
+    // orquestador aplica el silencio (micrófono liberado) en ≤ 50 ms.
+    let mut on_command = |command: ShellCommand| match command {
+        ShellCommand::ToggleMute => {
+            let muted = !server_state.is_muted();
+            match server_state.set_muted(muted) {
+                Ok(result) => println!(
+                    "[shell] micrófono {}",
+                    if result.muted { "silenciado" } else { "activo" }
+                ),
+                Err(e) => eprintln!("[shell] no se pudo cambiar el silencio: {}", e.message),
+            }
+        }
+        ShellCommand::Configure => {
+            let mut form = unified_settings.borrow_mut();
+            if form.is_none() {
+                *form = settings::UnifiedSettings::open(&config_path, Some("cerebro"));
+            }
+        }
+        ShellCommand::ChangeVoice => {
+            let mut form = unified_settings.borrow_mut();
+            if form.is_none() {
+                *form = settings::UnifiedSettings::open(&config_path, Some("voz"));
+            }
+        }
+        ShellCommand::QuickPanel { x, y } => {
+            let mut panel = quick_panel.borrow_mut();
+            if panel.is_none() {
+                *panel =
+                    settings::QuickPanel::open(&config_path, Some((x, y)), server_state.is_muted());
+            }
+        }
+        ShellCommand::Quit => {}
     };
     let exit = runtime::run_loop(
         surface.as_mut(),
-        &renderer,
-        &mut pixmap,
+        &mut view,
+        &sphere_look,
         &mut source,
         &shutdown,
+        &reset_position,
         None,
         &mut on_first_frame,
+        &mut on_command,
     );
 
-    // Apagado ordenado: superficie → coordinador → IPC (borra el socket) → lock.
+    // Apagado ordenado: superficie → orquestador (y coordinador) → streams y
+    // DSP → IPC (borra el socket) → lock.
     surface.set_visible(false);
     drop(surface);
-    drop(coordinator);
+    if let Some(orchestrator) = orchestrator.as_mut() {
+        let abandoned = orchestrator.shutdown(Duration::from_millis(300));
+        if !abandoned.is_empty() {
+            eprintln!("[voz] hilos ocupados al salir: {}", abandoned.join(", "));
+        }
+    }
+    drop(orchestrator);
+    if let Some(engine) = engine.as_mut() {
+        engine.shutdown();
+    }
+    drop(engine);
     server.shutdown();
     drop(server);
     drop(lock);
@@ -300,8 +579,9 @@ fn run() -> ExitCode {
     match exit {
         LoopExit::Signal => println!("Fokkus-Jarvis detenido por señal."),
         LoopExit::SurfaceClosed => {
-            println!("Fokkus-Jarvis detenido: se cerró la capa (clic derecho o compositor).")
+            println!("Fokkus-Jarvis detenido: el compositor cerró la capa.")
         }
+        LoopExit::UserQuit => println!("Fokkus-Jarvis cerrado desde el menú contextual."),
         LoopExit::MaxFrames => {}
     }
     ExitCode::SUCCESS
@@ -374,24 +654,35 @@ fn run_health_check() -> ExitCode {
         )),
     }
 
-    // 4. Backend STT y modelos Whisper.
+    // 4. Backend STT: el modelo se verifica y se carga en whisper de verdad.
     match ModelManager::new() {
         Ok(manager) => match manager.status(&WHISPER_BASE_Q5_1) {
-            ModelStatus::Verified { sha256 } => checks.push((
-                "STT",
-                Health::Ok,
-                format!(
-                    "{} verificado en {} (sha256 {})",
-                    WHISPER_BASE_Q5_1.id,
-                    manager.path_of(&WHISPER_BASE_Q5_1).display(),
-                    sha256
-                ),
-            )),
+            ModelStatus::Verified { .. } => {
+                let started = std::time::Instant::now();
+                match manager
+                    .load_verified(&WHISPER_BASE_Q5_1)
+                    .map_err(|e| e.to_string())
+                    .and_then(|model| {
+                        WhisperEngine::from_verified(model).map_err(|e| e.to_string())
+                    }) {
+                    Ok(engine) => checks.push((
+                        "STT",
+                        Health::Ok,
+                        format!(
+                            "{} cargado en whisper en {} ms (sha256 {})",
+                            engine.model_id(),
+                            started.elapsed().as_millis(),
+                            engine.model_sha256()
+                        ),
+                    )),
+                    Err(e) => checks.push(("STT", Health::Fail, format!("no carga: {e}"))),
+                }
+            }
             ModelStatus::Missing => checks.push((
                 "STT",
                 Health::Warn,
                 format!(
-                    "modelo no descargado aún en {}",
+                    "modelo no descargado aún en {} (se descarga al arrancar)",
                     manager.path_of(&WHISPER_BASE_Q5_1).display()
                 ),
             )),
@@ -406,36 +697,8 @@ fn run_health_check() -> ExitCode {
         )),
     }
 
-    // 5. Dispositivos de audio.
-    let host = cpal::default_host();
-    let input = jarvis_audio::io::select_input_device(&host, None);
-    let output = jarvis_audio::io::select_output_device(&host, None);
-    match (input, output) {
-        (Ok(input), Ok(output)) => {
-            let input_name = device_name(&input);
-            let output_name = device_name(&output);
-            checks.push((
-                "audio",
-                Health::Ok,
-                format!("entrada: {input_name} · salida: {output_name}"),
-            ));
-        }
-        (Err(_), Ok(_)) => checks.push((
-            "audio",
-            Health::Warn,
-            "no se detectó micrófono (altavoces disponibles)".to_string(),
-        )),
-        (Ok(_), Err(_)) => checks.push((
-            "audio",
-            Health::Warn,
-            "no se detectó altavoz (micrófono disponible)".to_string(),
-        )),
-        (Err(_), Err(_)) => checks.push((
-            "audio",
-            Health::Warn,
-            "no se detectaron micrófono ni altavoces".to_string(),
-        )),
-    }
+    // 5. Dispositivos de audio: se abren de verdad y se sueltan al terminar.
+    checks.extend(probe_audio_streams());
 
     // 6. API key de Claude / Anthropic.
     match jarvis_audio::brain::resolve_api_key(None) {
@@ -497,12 +760,114 @@ fn run_health_check() -> ExitCode {
     }
 }
 
-/// Nombre legible de un dispositivo `cpal` (o `desconocido` si no se puede leer).
-fn device_name(device: &cpal::Device) -> String {
-    device
-        .description()
-        .map(|d| d.name().to_string())
-        .unwrap_or_else(|_| "desconocido".to_string())
+/// Abre los streams reales de entrada y salida, corre el DSP medio segundo y
+/// los suelta (HU-11): comprueba que el audio fluye, no solo que el
+/// dispositivo existe. Al volver, el micrófono queda libre.
+fn probe_audio_streams() -> Vec<(&'static str, Health, String)> {
+    const WINDOW: Duration = Duration::from_millis(500);
+    let mut backend = CpalBackend::new(None, None);
+    let has_input = backend.has_input();
+    let has_output = backend.has_output();
+    let shared = Arc::new(PortShared::new(AudioPlayback::new()));
+    let mut checks = Vec::new();
+
+    let mut render = None;
+    let output = has_output.then(|| {
+        backend.open_output(&mut |format| {
+            let capacity = format.sample_rate as usize * 2;
+            let (_tts, tts_cons) = HeapRb::<f32>::new(capacity).split();
+            let (render_prod, render_cons) = HeapRb::<f32>::new(capacity).split();
+            render = Some((render_cons, format.sample_rate));
+            OutputPort::new(
+                tts_cons,
+                render_prod,
+                format.sample_rate,
+                format.channels,
+                Arc::clone(&shared),
+            )
+        })
+    });
+    let mut capture = None;
+    let input = has_input.then(|| {
+        backend.open_input(&mut |format| {
+            let (prod, cons) = HeapRb::<f32>::new(format.sample_rate as usize * 2).split();
+            capture = Some((cons, format.sample_rate));
+            InputPort::new(prod, format.channels, Arc::clone(&shared))
+        })
+    });
+
+    let describe = |s: &jarvis_audio::io::OpenStream| {
+        format!(
+            "{} ({} Hz, {} canales)",
+            s.device, s.format.sample_rate, s.format.channels
+        )
+    };
+    match &output {
+        None => checks.push(("altavoz", Health::Warn, "no se detectó altavoz".to_string())),
+        Some(Err(e)) => checks.push(("altavoz", Health::Fail, format!("no abre: {e}"))),
+        Some(Ok((stream, _))) => checks.push(("altavoz", Health::Ok, describe(stream))),
+    }
+    match &input {
+        None => checks.push((
+            "micrófono",
+            Health::Warn,
+            "no se detectó micrófono".to_string(),
+        )),
+        Some(Err(e)) => checks.push(("micrófono", Health::Fail, format!("no abre: {e}"))),
+        Some(Ok((stream, _))) => checks.push(("micrófono", Health::Ok, describe(stream))),
+    }
+
+    // DSP real sobre lo capturado: prueba que el micrófono entrega audio.
+    if let Some((capture_cons, capture_rate)) = capture.filter(|_| matches!(input, Some(Ok(_)))) {
+        let output_ok = matches!(output, Some(Ok(_)));
+        let (render_cons, render_rate) = match render.filter(|_| output_ok) {
+            Some(pair) => pair,
+            None => (HeapRb::<f32>::new(1).split().1, capture_rate),
+        };
+        shared
+            .render_tap
+            .store(output_ok, std::sync::atomic::Ordering::Release);
+        let (events_tx, _events_rx) = crossbeam_channel::unbounded();
+        let config = DspThreadConfig {
+            capture_rate,
+            render_rate,
+            processor: Default::default(),
+            endpoint: Default::default(),
+        };
+        match jarvis_audio::spawn_dsp_thread(
+            config,
+            capture_cons,
+            render_cons,
+            Arc::clone(&shared.latency),
+            events_tx,
+        ) {
+            Ok(mut dsp) => {
+                std::thread::sleep(WINDOW);
+                let m = dsp.metrics().snapshot();
+                let io = shared.metrics.snapshot();
+                drop(input);
+                drop(output);
+                dsp.stop();
+                let detail = format!(
+                    "{} frames de captura y {} de referencia en {} ms · retardo AEC {} ms · xruns {} · errores {}",
+                    m.capture_frames,
+                    m.render_frames,
+                    WINDOW.as_millis(),
+                    m.stream_delay_ms,
+                    io.xruns,
+                    m.processor_errors + m.resampler_errors,
+                );
+                let health = if m.capture_frames == 0 || (output_ok && m.render_frames == 0) {
+                    Health::Fail
+                } else {
+                    Health::Ok
+                };
+                checks.push(("DSP", health, detail));
+            }
+            Err(e) => checks.push(("DSP", Health::Fail, format!("no arranca: {e}"))),
+        }
+    }
+    checks
 }
 
 /// Lanza la pre-síntesis de fillers en un hilo de fondo.
@@ -532,8 +897,8 @@ fn spawn_filler_pre_synthesis(voice_id: String) {
 ///
 /// Si no hay overlay disponible (sin `WAYLAND_DISPLAY`, sin layer-shell…)
 /// avisa y degrada a [`HeadlessSurface`]: el proceso sigue vivo como daemon IPC.
-fn prepare_surface(renderer: &SphereRenderer) -> Result<Box<dyn OverlaySurface>, SurfaceError> {
-    let size = SurfaceSize::new(renderer.size(), renderer.size())?;
+fn prepare_surface(side: u32) -> Result<Box<dyn OverlaySurface>, SurfaceError> {
+    let size = SurfaceSize::new(side, side)?;
     let options = OverlayOptions {
         size,
         ..OverlayOptions::default()
@@ -545,7 +910,7 @@ fn prepare_surface(renderer: &SphereRenderer) -> Result<Box<dyn OverlaySurface>,
             Box::new(HeadlessSurface::new(size))
         }
     };
-    // La esfera tiene tamaño fijo: superficie y renderer deben coincidir.
+    // Al abrir, superficie y renderer deben coincidir (luego cambian juntos).
     if surface.size() != size {
         return Err(SurfaceError::InvalidSize {
             width: surface.size().width,

@@ -7,7 +7,9 @@
 
 pub mod callbacks;
 pub mod device;
+pub mod engine;
 pub mod metrics;
+pub mod ports;
 
 use std::fmt;
 
@@ -18,7 +20,12 @@ pub use callbacks::{
 pub use device::{
     negotiate_input, negotiate_output, select_input_device, select_output_device, Negotiated,
 };
+pub use engine::{
+    device_label, to_output_pcm, AudioBackend, AudioEngine, CpalBackend, EngineConfig,
+    EngineShared, EngineStatus, OpenStream, PlayOutcome, Player, StreamFormat, StreamInfo,
+};
 pub use metrics::{AudioMetrics, AudioMetricsSnapshot};
+pub use ports::{InputPort, LevelMeter, OutputPort, PortShared, StreamFault};
 
 /// Errores del motor de E/S de audio.
 #[derive(Debug)]
@@ -35,6 +42,10 @@ pub enum AudioError {
     NoSuchOutputDevice(String),
     /// El dispositivo no ofrece ninguna configuración utilizable.
     NoSupportedConfig,
+    /// El dispositivo solo ofrece un formato de muestra no soportado.
+    UnsupportedFormat(cpal::SampleFormat),
+    /// No se pudo crear el hilo supervisor.
+    Spawn(std::io::Error),
 }
 
 impl fmt::Display for AudioError {
@@ -52,6 +63,10 @@ impl fmt::Display for AudioError {
             Self::NoSupportedConfig => {
                 write!(f, "el dispositivo no ofrece una configuración soportada")
             }
+            Self::UnsupportedFormat(format) => {
+                write!(f, "formato de muestra no soportado: {format}")
+            }
+            Self::Spawn(e) => write!(f, "no se pudo crear el hilo de audio: {e}"),
         }
     }
 }
@@ -60,6 +75,7 @@ impl std::error::Error for AudioError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Backend(e) => Some(e),
+            Self::Spawn(e) => Some(e),
             _ => None,
         }
     }

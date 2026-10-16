@@ -40,6 +40,27 @@ pub struct DspThreadConfig {
     pub endpoint: EndpointConfig,
 }
 
+/// Señal de conector compartible: equivale a [`DspHandle::signal_connector`]
+/// sin tener que poseer el `DspHandle` (vive en el supervisor de audio).
+#[derive(Debug, Clone)]
+pub struct ConnectorSignal(Arc<AtomicBool>);
+
+impl ConnectorSignal {
+    /// Señal suelta (sin hilo DSP detrás): para dobles de prueba.
+    pub fn detached() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn signal(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// `true` si hay una señal pendiente que el DSP aún no consumió.
+    pub fn is_pending(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// Control del hilo DSP. Al soltarlo, el hilo se detiene y se espera.
 pub struct DspHandle {
     shutdown: Arc<AtomicBool>,
@@ -58,6 +79,11 @@ impl DspHandle {
     /// turno en curso espera hasta `extended_silence_ms` antes de cerrarse.
     pub fn signal_connector(&self) {
         self.connector.store(true, Ordering::Release);
+    }
+
+    /// Copia clonable de la señal de conector para otros hilos (STT).
+    pub fn connector_signal(&self) -> ConnectorSignal {
+        ConnectorSignal(Arc::clone(&self.connector))
     }
 
     /// `true` mientras el hilo sigue vivo.
