@@ -751,6 +751,37 @@ fn open_app_command(app: App) -> LocalCommand {
     }
 }
 
+/// Reconoce la palabra "silencio" como orden aislada de reposo: "silencio",
+/// "silencio por favor", "por favor silencio", "guarda silencio", "haz
+/// silencio", "ya silencio", etc. No cuenta dentro de preguntas o frases como
+/// "¿qué es el silencio?", "el silencio" o "silencio absoluto mientras
+/// trabajo" (HU-23, HU-Fix-Silencio).
+fn is_standalone_silence(text: &str) -> bool {
+    let folded = fold_accents(text);
+    let words: Vec<&str> = folded.split_whitespace().collect();
+    if words.is_empty() {
+        return false;
+    }
+    const FILLERS: &[&str] = &["por", "favor", "porfa", "porfavor", "ya", "ahora", "mismo"];
+    const SILENCE_VERBS: &[&str] = &["guarda", "guardar", "haz", "hacer", "manten", "mantener"];
+
+    // "deja de hablar" / "dejá de hablar": verbo de cierre directo.
+    if words[0] == "deja" && words.len() >= 3 && words[1] == "de" && words[2] == "hablar" {
+        return words[3..].iter().all(|w| FILLERS.contains(w));
+    }
+
+    // El resto de órdenes giran en torno a la palabra "silencio".
+    let Some(pos) = words.iter().position(|w| *w == "silencio") else {
+        return false;
+    };
+    let before = &words[..pos];
+    let after = &words[pos + 1..];
+    let before_ok = before.iter().all(|w| FILLERS.contains(w))
+        || (before.len() == 1 && SILENCE_VERBS.contains(&before[0]));
+    let after_ok = after.iter().all(|w| FILLERS.contains(w));
+    before_ok && after_ok
+}
+
 /// Reconoce una orden local en la consulta (ya sin el vocativo).
 pub fn local_command(query: &str) -> Option<LocalCommand> {
     let text: String = query
@@ -773,11 +804,11 @@ pub fn local_command(query: &str) -> Option<LocalCommand> {
             return Some(LocalCommand::StopAutomation);
         }
     }
-    // La palabra aislada "silencio" solo cierra la sesión cuando abre la
-    // consulta ("silencio", "silencio por favor"); nunca en preguntas como
-    // "¿qué es el silencio?" o "el silencio" (HU-23).
-    let standalone_standby = text.split_whitespace().next() == Some("silencio");
-    if has(STANDBY_PHRASES) || standalone_standby {
+    // La palabra aislada "silencio" solo cierra la sesión cuando es toda la
+    // orden ("silencio", "silencio por favor"); nunca dentro de una frase como
+    // "silencio absoluto mientras trabajo", ni en preguntas como "¿qué es el
+    // silencio?" o "el silencio" (HU-23).
+    if has(STANDBY_PHRASES) || is_standalone_silence(&text) {
         Some(LocalCommand::Standby)
     } else if has(TIME_PHRASES) {
         Some(LocalCommand::Time)
@@ -798,6 +829,18 @@ pub fn local_command(query: &str) -> Option<LocalCommand> {
             requested_app(&words).map(open_app_command)
         }
     }
+}
+
+/// Órdenes de anulación prioritaria (HU-Fix-Silencio): reposo, kill switch y
+/// cancelación de tareas. Nunca deben fusionarse con un turno pendiente: se
+/// ejecutan de inmediato y en silencio, sin pasar por el LLM.
+fn is_priority_override(query: &str) -> bool {
+    matches!(
+        local_command(query),
+        Some(LocalCommand::Standby)
+            | Some(LocalCommand::StopAutomation)
+            | Some(LocalCommand::CancelTask { .. })
+    )
 }
 
 /// Reconoce "cancela la tarea de …" o "cancela todas las tareas".
@@ -1853,7 +1896,9 @@ impl ControlLoop {
         let stt_ready = self.stt_ready.load(Ordering::Acquire);
         let ready = !muted && stt_ready && self.capture.is_listening();
         self.ready.store(ready, Ordering::Release);
-        if ready {
+        // En reposo (`standby`) el micrófono sigue armado, pero la esfera no
+        // promete escuchar: solo la palabra de activación abre turno (HU-17).
+        if ready && !self.activation.is_standby() {
             let _ = self
                 .core
                 .transition_from(JarvisState::Idle, JarvisState::Listening);
@@ -1961,6 +2006,18 @@ impl ControlLoop {
         }
         match outcome.activation {
             Activation::Accepted { query } => {
+                // Órdenes de anulación prioritaria (silencio, kill switch,
+                // cancelar tareas): cortan cualquier razonamiento en curso y se
+                // despachan en el acto. Jamás se fusionan con una continuación
+                // retenida, o "silencio" acabaría dentro de "busca X y silencio"
+                // y no se reconocería (HU-Fix-Silencio).
+                if is_priority_override(&query) {
+                    self.cancel_in_flight();
+                    self.pending = None;
+                    self.pending_user_turn.clear();
+                    self.dispatch(query, outcome.at);
+                    return;
+                }
                 if let Some(held) = self.pending.take() {
                     let merged = format!("{} {query}", held.query);
                     if outcome.connector {
@@ -2652,9 +2709,16 @@ impl BrainLoop {
     /// Cierre de sesión por voz ("silencio", "descansa"...): cierra la ventana
     /// de seguimiento y vuelve a reposo SIN mutear el micrófono. El wake-word
     /// "Jarvis" reactiva la escucha (HU-17).
+    ///
+    /// El reposo apaga también la escucha continua: si siguiera activa,
+    /// cualquier ruido ambiente abriría turno y la orden de silencio no
+    /// serviría de nada. La esfera queda en `Idle`, no en `Listening`, porque
+    /// no hay ningún turno abierto.
     fn standby(&mut self) {
         self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
-        self.activation.close_follow_up();
+        // Primero el reposo: el hilo de voz consulta la bandera en cada tick y
+        // no debe devolver el estado a `Listening` mientras se cierra el turno.
+        self.activation.enter_standby();
         // Corta cualquier locución o razonamiento en curso.
         self.playback.stop();
         if let Some(client) = self.client.get() {
@@ -2663,13 +2727,14 @@ impl BrainLoop {
         self.speaking = None;
         self.pending_user_turn.clear();
         self.close_hud(true);
-        let _ = self
-            .core
-            .transition_from(JarvisState::Speaking, JarvisState::Listening);
-        let _ = self
-            .core
-            .transition_from(JarvisState::Thinking, JarvisState::Listening);
         let _ = self.coordinator.finish_speech(false);
+        for from in [
+            JarvisState::Speaking,
+            JarvisState::Thinking,
+            JarvisState::Listening,
+        ] {
+            let _ = self.core.transition_from(from, JarvisState::Idle);
+        }
     }
 
     /// Cierra en el HUD la respuesta del turno abierto: `JarvisDone` (empieza

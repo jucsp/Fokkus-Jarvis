@@ -129,6 +129,7 @@ const SCRIPT: &[&str] = &[
     "Jarvis, métete a YouTube y busca Marvel Rivals",        // 17: búsqueda web
     "Jarvis, pausa el video",                                // 18: multimedia
     "Jarvis, escribe en pantalla Hola mundo.",               // 19: escribir
+    "silencio",                                              // 20: reposo como continuación
 ];
 
 struct ScriptTranscriber;
@@ -595,7 +596,7 @@ fn local_commands_work_without_api_key_and_standby_closes_the_window() {
     // "Jarvis" vuelve a abrir turno.
     h.say_line(5);
     wait_until("comando de reposo", || h.stats().local_commands == 2);
-    h.wait_state(JarvisState::Listening);
+    h.wait_state(JarvisState::Idle);
     assert!(h.capture.enabled(), "el micrófono sigue abierto en reposo");
     assert!(!h.activation.is_muted(), "el reposo no mutea el detector");
     assert!(
@@ -705,7 +706,22 @@ fn local_command_and_connector_parsing() {
         local_command("deja de escuchar, por favor"),
         Some(LocalCommand::Standby)
     );
+    assert_eq!(local_command("silencio"), Some(LocalCommand::Standby));
+    assert_eq!(
+        local_command("silencio por favor"),
+        Some(LocalCommand::Standby)
+    );
+    assert_eq!(
+        local_command("por favor silencio"),
+        Some(LocalCommand::Standby)
+    );
+    assert_eq!(local_command("guarda silencio"), Some(LocalCommand::Standby));
+    assert_eq!(local_command("haz silencio"), Some(LocalCommand::Standby));
+    assert_eq!(local_command("ya silencio"), Some(LocalCommand::Standby));
+    assert_eq!(local_command("deja de hablar"), Some(LocalCommand::Standby));
     assert_eq!(local_command("¿qué es el silencio?"), None);
+    assert_eq!(local_command("el silencio"), None);
+    assert_eq!(local_command("silencio absoluto"), None);
     assert_eq!(local_command("explícame qué horario tiene"), None);
 
     assert_eq!(local_command("abre el menú y"), None);
@@ -863,6 +879,34 @@ fn user_speech_during_thinking_concatenates_into_single_turn() {
     );
     h.wait_spoken_and_listening(0, 0);
     assert_eq!(h.stats().speech_errors, 0);
+}
+
+#[test]
+fn silence_during_thinking_overrides_without_merging() {
+    let brain = FakeBrain::new("Voy con eso.");
+    brain.set_reply("Voy con eso.", Duration::from_millis(500));
+    let h = harness("silencio-thinking", Some(brain.clone()), fast());
+
+    // Primer turno: entra al LLM y Jarvis queda pensando.
+    h.say_line(1); // "Jarvis, ¿qué tal el clima?"
+    wait_until("primer turno en el LLM", || brain.queries().len() == 1);
+    h.wait_state(JarvisState::Thinking);
+
+    // "silencio" llega como continuación: es una anulación prioritaria, NO
+    // una continuación del turno en curso (HU-Fix-Silencio). Debe cortar el
+    // razonamiento y ejecutarse en el acto, sin fusionarse ni pasar por el LLM.
+    h.say_line(20);
+    wait_until("comando de reposo", || h.stats().local_commands == 1);
+    h.wait_state(JarvisState::Idle);
+
+    assert_eq!(
+        brain.queries(),
+        vec!["¿qué tal el clima?".to_string()],
+        "el turno original no se re-despacha fusionado con 'silencio'"
+    );
+    assert!(!h.activation.is_follow_up_open(), "la ventana se cierra");
+    assert!(h.capture.enabled(), "el micrófono sigue abierto en reposo");
+    assert!(!h.activation.is_muted(), "el reposo no mutea el detector");
 }
 
 /// `(argv[0] sin ruta, display_name)` de la orden, o `None` si no es OpenApp.

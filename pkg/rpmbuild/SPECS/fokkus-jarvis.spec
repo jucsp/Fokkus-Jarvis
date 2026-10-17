@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.2.24
+Version:        0.2.25
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,6 +23,9 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.25-1
+- Fix: comando local de silencio y reposo inmediato sin pasar por el LLM ni reactivar follow-up
+
 * Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.24-1
 - HU-38/HU-39: subcomandos CLI 'fokkus-jarvis input (type|key|click)' y 'capture' para ojos y manos del agente.
 - Fix: inyeccion explicita de YDOTOOL_SOCKET en invocaciones de ydotool.

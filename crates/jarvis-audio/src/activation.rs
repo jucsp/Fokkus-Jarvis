@@ -85,6 +85,9 @@ pub struct ActivationDetector {
     follow_up: Duration,
     muted: AtomicBool,
     continuous: AtomicBool,
+    /// Reposo por orden de silencio (HU-17): el micrófono sigue armado pero
+    /// solo la palabra de activación abre turno.
+    standby: AtomicBool,
     follow_up_until: Mutex<Option<Instant>>,
 }
 
@@ -96,6 +99,7 @@ impl ActivationDetector {
             follow_up: DEFAULT_FOLLOW_UP,
             muted: AtomicBool::new(false),
             continuous: AtomicBool::new(false),
+            standby: AtomicBool::new(false),
             follow_up_until: Mutex::new(None),
         }
     }
@@ -136,6 +140,8 @@ impl ActivationDetector {
     /// Reactiva la captura.
     pub fn unmute(&self) {
         self.muted.store(false, Ordering::SeqCst);
+        // Desmutear devuelve a escuchar: el reposo no sobrevive a un mute.
+        self.leave_standby();
     }
 
     /// `true` si el asistente está silenciado.
@@ -146,11 +152,37 @@ impl ActivationDetector {
     /// Activa o desactiva la escucha continua en caliente.
     pub fn set_continuous(&self, enabled: bool) {
         self.continuous.store(enabled, Ordering::SeqCst);
+        if enabled {
+            // Escuchar siempre es incompatible con el reposo: activarla es una
+            // orden explícita de volver a escuchar.
+            self.leave_standby();
+        }
     }
 
     /// `true` si la escucha continua está activa.
     pub fn is_continuous(&self) -> bool {
         self.continuous.load(Ordering::SeqCst)
+    }
+
+    /// Entra en reposo por orden de silencio ("silencio", "deja de escuchar").
+    ///
+    /// Cierra la ventana de seguimiento y apaga la escucha continua: a partir
+    /// de aquí solo la palabra de activación abre turno (HU-17). El micrófono
+    /// **no** se libera: no es un mute duro, la esfera debe verse en reposo.
+    pub fn enter_standby(&self) {
+        self.close_follow_up();
+        self.continuous.store(false, Ordering::SeqCst);
+        self.standby.store(true, Ordering::SeqCst);
+    }
+
+    /// Sale del reposo (palabra de activación, desmuteo o escucha continua).
+    pub fn leave_standby(&self) {
+        self.standby.store(false, Ordering::SeqCst);
+    }
+
+    /// `true` si está en reposo esperando la palabra de activación.
+    pub fn is_standby(&self) -> bool {
+        self.standby.load(Ordering::SeqCst)
     }
 
     /// Abre (o rearma) la ventana de seguimiento a partir de ahora.
@@ -238,6 +270,9 @@ impl ActivationDetector {
             return self.process_continuous(text, now);
         }
         if contains_wake_word(text, &self.wake_word) {
+            // Decir la palabra de activación saca del reposo (HU-17): la sesión
+            // vuelve a estar viva aunque se hubiera pedido silencio.
+            self.leave_standby();
             self.open_follow_up_at(now);
             let query = strip_wake_word(text, &self.wake_word);
             if query.is_empty() {
