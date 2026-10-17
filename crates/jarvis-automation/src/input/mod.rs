@@ -72,6 +72,10 @@ pub enum Key {
     Alt,
     Super,
     MediaPlayPause,
+    /// Pista/video siguiente (`KEY_NEXTSONG`).
+    MediaNext,
+    /// Pista/video anterior (`KEY_PREVIOUSSONG`).
+    MediaPrevious,
     VolumeUp,
     VolumeDown,
     Mute,

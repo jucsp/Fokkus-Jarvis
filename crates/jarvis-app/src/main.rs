@@ -40,7 +40,10 @@ use jarvis_audio::{
     TaskConfig, TaskManager, TaskOrigin, TaskStatus, TtsBackend, VoiceConfig, VoiceDeps,
     VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
 };
-use jarvis_automation::{AutomationGuard, Capabilities, KillReason, ProbeOptions};
+use jarvis_automation::{
+    ActionRiskLevel, AutomationGuard, Capabilities, InputAction, InputSynth, KillReason,
+    ProbeOptions,
+};
 use jarvis_core::single_instance::{self, InstanceError};
 use jarvis_core::{
     sphere_size_for_pct, FullscreenBehavior, JarvisConfig, JarvisCore, Opacity, SharedCore,
@@ -486,6 +489,10 @@ fn run() -> ExitCode {
                 let automation = Arc::clone(&automation);
                 Arc::new(move || automation.kill(KillReason::Voice))
             }),
+            automation_input: config
+                .automation
+                .enabled
+                .then(|| automation_input(Arc::clone(&automation), &config.automation)),
             ..VoiceConfig::default()
         };
         match VoiceOrchestrator::start(deps, config) {
@@ -934,6 +941,32 @@ fn run_health_check() -> ExitCode {
         println!("Diagnóstico: todos los subsistemas operativos.");
         ExitCode::SUCCESS
     }
+}
+
+/// Manos de las órdenes de pantalla por voz (HU-38): cada acción abre un
+/// *lease* de riesgo bajo en el guard y la ejecuta con el backend de entrada
+/// elegido por el sondeo, que se instancia en la primera orden.
+fn automation_input(
+    guard: Arc<AutomationGuard>,
+    cfg: &jarvis_core::AutomationConfig,
+) -> jarvis_audio::AutomationInput {
+    let opts = ProbeOptions::from(cfg);
+    let synth: Mutex<Option<Box<dyn InputSynth>>> = Mutex::new(None);
+    Arc::new(move |action: InputAction| {
+        let mut synth = synth.lock().unwrap_or_else(|e| e.into_inner());
+        if synth.is_none() {
+            let backend = jarvis_automation::probe::probe_input_backend_with(&opts)
+                .map_err(|e| e.to_string())?;
+            *synth = Some(backend);
+        }
+        let backend = synth.as_mut().expect("backend recién instanciado");
+        let mut lease = guard
+            .acquire_with_risk("orden de voz", "", ActionRiskLevel::Low)
+            .map_err(|e| e.to_string())?;
+        lease
+            .perform(backend.as_mut(), action)
+            .map_err(|e| e.to_string())
+    })
 }
 
 /// Sondea los backends de captura y entrada (CA-38.1). Con la automatización

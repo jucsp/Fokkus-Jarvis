@@ -51,7 +51,9 @@ fn evdev_code(key: &Key) -> Option<u16> {
         Key::VolumeDown => 114,
         Key::VolumeUp => 115,
         Key::Super => 125,
+        Key::MediaNext => 163,
         Key::MediaPlayPause => 164,
+        Key::MediaPrevious => 165,
         Key::F(n @ 1..=10) => 58 + u16::from(*n),
         Key::F(11) => 87,
         Key::F(12) => 88,
@@ -238,6 +240,8 @@ mod tests {
         assert_eq!(evdev_code(&Key::F(12)), Some(88));
         assert_eq!(evdev_code(&Key::F(13)), Some(183));
         assert_eq!(evdev_code(&Key::MediaPlayPause), Some(164));
+        assert_eq!(evdev_code(&Key::MediaNext), Some(163));
+        assert_eq!(evdev_code(&Key::MediaPrevious), Some(165));
         assert_eq!(evdev_code(&Key::Char('a')), Some(30));
         assert_eq!(evdev_code(&Key::Char('m')), Some(50));
         assert_eq!(evdev_code(&Key::Char('0')), Some(11));

@@ -63,8 +63,8 @@ pub use models::{
     ModelSource, ModelSpec, ModelStatus, VerifiedModel, MODELS, WHISPER_BASE_Q5_1, WHISPER_TINY,
 };
 pub use orchestrator::{
-    AppLauncher, AudioSink, AutomationKill, CaptureControl, EngineControl, LocalClock, VoiceConfig,
-    VoiceDeps, VoiceOrchestrator, VoiceSpeaker, VoiceStatsSnapshot,
+    AppLauncher, AudioSink, AutomationInput, AutomationKill, CaptureControl, EngineControl,
+    LocalClock, VoiceConfig, VoiceDeps, VoiceOrchestrator, VoiceSpeaker, VoiceStatsSnapshot,
 };
 pub use playback::AudioPlayback;
 pub use speech_queue::{

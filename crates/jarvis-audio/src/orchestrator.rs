@@ -45,6 +45,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{select, Receiver, Sender};
+use jarvis_automation::{InputAction, Key};
 use jarvis_core::{JarvisState, SharedCore};
 
 use crate::activation::{Activation, ActivationDetector};
@@ -171,6 +172,12 @@ pub type AppLauncher = Arc<dyn Fn(&[String]) -> std::io::Result<()> + Send + Syn
 /// con `AutomationGuard::kill(KillReason::Voice)`.
 pub type AutomationKill = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// Ejecuta una acción de entrada sintética (teclas multimedia, texto) a
+/// través del `AutomationGuard` y el backend elegido (HU-38). Lo inyecta el
+/// binario solo con `[automation] enabled = true`; el error ya viene en
+/// texto legible para el log.
+pub type AutomationInput = Arc<dyn Fn(InputAction) -> Result<(), String> + Send + Sync>;
+
 /// Parámetros del orquestador.
 #[derive(Clone)]
 pub struct VoiceConfig {
@@ -196,6 +203,9 @@ pub struct VoiceConfig {
     /// Kill switch por voz de la automatización (HU-38). `None` = sin
     /// automatización: "para" solo responde "Detenido.".
     pub automation_kill: Option<AutomationKill>,
+    /// Manos de la automatización para las órdenes locales de pantalla
+    /// ("pausa", "escribe en pantalla …"). `None` = automatización apagada.
+    pub automation_input: Option<AutomationInput>,
 }
 
 impl Default for VoiceConfig {
@@ -211,6 +221,7 @@ impl Default for VoiceConfig {
             barge_in_enabled: false,
             tasks: None,
             automation_kill: None,
+            automation_input: None,
         }
     }
 }
@@ -399,6 +410,57 @@ pub enum LocalCommand {
     /// Kill switch de la automatización ("para", "detente", "cancela"). Se
     /// evalúa antes que cualquier otra orden (HU-38, CA-38.5).
     StopAutomation,
+    /// Abre una URL en el navegador del sistema ("busca X en YouTube").
+    OpenUrl {
+        url: String,
+        /// Respuesta hablada: "Buscando X en YouTube."
+        spoken: String,
+    },
+    /// Acción de pantalla vía `jarvis-automation` ("pausa", "escribe …").
+    Screen(ScreenAction),
+}
+
+/// Acciones de pantalla que el orquestador resuelve sin LLM (HU-38).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenAction {
+    Play,
+    Pause,
+    Next,
+    Previous,
+    /// Teclea el texto en la ventana con foco.
+    Type(String),
+}
+
+impl ScreenAction {
+    /// Acción de entrada equivalente. Reproducir y pausar usan la tecla
+    /// multimedia (MPRIS la entrega al reproductor aunque no tenga el foco).
+    pub fn input_action(&self) -> InputAction {
+        match self {
+            Self::Play | Self::Pause => InputAction::KeyCombo(vec![Key::MediaPlayPause]),
+            Self::Next => InputAction::KeyCombo(vec![Key::MediaNext]),
+            Self::Previous => InputAction::KeyCombo(vec![Key::MediaPrevious]),
+            Self::Type(text) => InputAction::TypeText(text.clone()),
+        }
+    }
+
+    /// Confirmación hablada tras ejecutar la acción.
+    pub fn done_phrase(&self) -> &'static str {
+        match self {
+            Self::Play => "Reproduciendo.",
+            Self::Pause => "Pausado.",
+            Self::Next => "Siguiente.",
+            Self::Previous => "Anterior.",
+            Self::Type(_) => "Escrito en pantalla.",
+        }
+    }
+
+    /// Respuesta hablada si el backend falla.
+    fn failure_phrase(&self) -> &'static str {
+        match self {
+            Self::Type(_) => "No pude escribir en pantalla.",
+            _ => "No pude controlar la reproducción.",
+        }
+    }
 }
 
 /// Verbos del kill switch por voz (texto ya sin acentos).
@@ -723,6 +785,8 @@ pub fn local_command(query: &str) -> Option<LocalCommand> {
         Some(LocalCommand::ListTasks)
     } else if let Some(command) = cancel_task_command(&text) {
         Some(command)
+    } else if let Some(command) = web_or_automation_command(query) {
+        Some(command)
     } else {
         let folded = fold_accents(&text);
         let words: Vec<&str> = folded.split_whitespace().collect();
@@ -763,6 +827,301 @@ fn cancel_task_command(text: &str) -> Option<LocalCommand> {
     target.map(|spoken_target| LocalCommand::CancelTask {
         spoken_target: Some(spoken_target),
     })
+}
+
+/// Palabra hablada: la original (mayúsculas, tildes y puntuación, para la
+/// búsqueda o el texto a teclear) y su clave de comparación (minúsculas, sin
+/// tildes ni puntuación).
+struct Token<'a> {
+    raw: &'a str,
+    key: String,
+}
+
+fn tokenize(query: &str) -> Vec<Token<'_>> {
+    query
+        .split_whitespace()
+        .filter_map(|raw| {
+            let alnum: String = raw.chars().filter(|c| c.is_alphanumeric()).collect();
+            let key = fold_accents(&alnum);
+            (!key.is_empty()).then_some(Token { raw, key })
+        })
+        .collect()
+}
+
+/// Une las palabras originales sin la puntuación de los extremos
+/// ("Marvel Rivals." → "Marvel Rivals").
+fn join_raw(tokens: &[Token<'_>]) -> String {
+    tokens
+        .iter()
+        .map(|t| t.raw)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_matches(|c: char| ".,;:!?¿¡\"'«»".contains(c))
+        .to_string()
+}
+
+/// Codifica `text` para una query string (`application/x-www-form-urlencoded`).
+pub fn url_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for b in text.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(char::from(b));
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// Verbos que llevan a un sitio sin buscar nada ("metete a YouTube").
+const NAV_VERBS: &[&str] = &[
+    "abre", "abrir", "abreme", "ve", "vete", "anda", "ir", "vamos", "metete", "meterte", "entra",
+    "entrar", "ingresa", "ingresar", "llevame", "inicio",
+];
+
+/// Verbos de búsqueda en YouTube ("pon X en YouTube" también busca).
+const YOUTUBE_VERBS: &[&str] = &[
+    "busca",
+    "buscame",
+    "buscar",
+    "busques",
+    "busqueda",
+    "pon",
+    "ponme",
+    "reproduce",
+    "reproduceme",
+    "reproducir",
+];
+
+/// Verbos de búsqueda en Google.
+const GOOGLE_VERBS: &[&str] = &[
+    "busca", "buscame", "buscar", "busques", "busqueda", "googlea", "googlear",
+];
+
+/// Palabras que nombran el sitio de la búsqueda.
+const YOUTUBE_SITES: &[&str] = &["youtube"];
+const GOOGLE_SITES: &[&str] = &["google", "internet", "web"];
+
+/// Conectores que rodean la consulta y no forman parte de ella:
+/// "busca *en* YouTube", "con una búsqueda *de* X".
+const SEARCH_EDGE_FILLERS: &[&str] = &[
+    "de", "del", "en", "con", "una", "un", "busqueda", "sobre", "y", "por", "a", "al", "la", "el",
+    "desde",
+];
+
+/// Consultas que no buscan nada concreto: "un video al azar" abre el inicio.
+const RANDOM_WORDS: &[&str] = &["azar", "cualquier", "cualquiera", "aleatorio", "random"];
+const GENERIC_WORDS: &[&str] = &["un", "una", "video", "videos", "algo", "cancion", "musica"];
+
+fn trim_edges<'t, 'a>(mut words: &'t [Token<'a>]) -> &'t [Token<'a>] {
+    while let Some((first, rest)) = words.split_first() {
+        if !SEARCH_EDGE_FILLERS.contains(&first.key.as_str()) {
+            break;
+        }
+        words = rest;
+    }
+    while let Some((last, rest)) = words.split_last() {
+        if !SEARCH_EDGE_FILLERS.contains(&last.key.as_str()) {
+            break;
+        }
+        words = rest;
+    }
+    words
+}
+
+/// Petición sobre un sitio: `Some(Some(query))` = buscar, `Some(None)` = ir
+/// al inicio (solo si `home` y hay un verbo de navegación), `None` = no es
+/// una petición a ese sitio.
+fn site_request(
+    tokens: &[Token<'_>],
+    sites: &[&str],
+    verbs: &[&str],
+    home: bool,
+) -> Option<Option<String>> {
+    let site = tokens
+        .iter()
+        .position(|t| sites.contains(&t.key.as_str()))?;
+    let Some(verb) = tokens.iter().position(|t| verbs.contains(&t.key.as_str())) else {
+        let navigates = tokens[..site]
+            .iter()
+            .any(|t| NAV_VERBS.contains(&t.key.as_str()));
+        return (home && navigates).then_some(None);
+    };
+    // "busca X en YouTube" → entre el verbo y el sitio; "busca en YouTube X"
+    // y "métete a YouTube y busca X" → lo que sigue.
+    let span = if site > verb {
+        let between = trim_edges(&tokens[verb + 1..site]);
+        if between.is_empty() {
+            trim_edges(&tokens[site + 1..])
+        } else {
+            between
+        }
+    } else {
+        trim_edges(&tokens[verb + 1..])
+    };
+    let random = span.iter().any(|t| RANDOM_WORDS.contains(&t.key.as_str()))
+        || (!span.is_empty() && span.iter().all(|t| GENERIC_WORDS.contains(&t.key.as_str())));
+    if span.is_empty() || random {
+        return home.then_some(None);
+    }
+    Some(Some(join_raw(span)))
+}
+
+/// Palabras de cortesía o vocativos que pueden abrir la orden.
+const LEAD_FILLERS: &[&str] = &["oye", "jarvis", "por", "favor", "porfa", "ahora", "ya"];
+
+/// Palabras que acompañan a una orden multimedia sin cambiarla.
+const MEDIA_FILLERS: &[&str] = &[
+    "el",
+    "la",
+    "lo",
+    "los",
+    "las",
+    "un",
+    "video",
+    "videos",
+    "musica",
+    "cancion",
+    "tema",
+    "reproduccion",
+    "por",
+    "favor",
+    "porfa",
+    "ya",
+    "de",
+    "nuevo",
+    "otra",
+    "vez",
+    "oye",
+    "jarvis",
+    "ahora",
+    "a",
+    "al",
+    "esta",
+    "este",
+    "eso",
+];
+
+/// Sustantivos que confirman que la orden es sobre la reproducción.
+const MEDIA_NOUNS: &[&str] = &[
+    "video",
+    "videos",
+    "musica",
+    "cancion",
+    "tema",
+    "reproduccion",
+];
+
+/// "reproduce", "pausa el video", "siguiente canción"… La orden debe ser solo
+/// eso (salvo muletillas): "reproduce Queen" o "pausa para pensar" no cuentan.
+fn media_command(tokens: &[Token<'_>]) -> Option<ScreenAction> {
+    let noun = tokens.iter().any(|t| MEDIA_NOUNS.contains(&t.key.as_str()));
+    let core: Vec<&str> = tokens
+        .iter()
+        .map(|t| t.key.as_str())
+        .filter(|k| !MEDIA_FILLERS.contains(k))
+        .collect();
+    let action = match core.as_slice() {
+        ["reproduce" | "reproducir" | "reanuda" | "reanudar" | "reanudalo" | "play"]
+        | ["pon" | "ponle" | "dale", "play"] => ScreenAction::Play,
+        ["continua" | "continuar" | "sigue"] if noun => ScreenAction::Play,
+        ["pausa" | "pausar" | "pausalo" | "pausala"] | ["pon" | "ponle" | "dale", "pausa"] => {
+            ScreenAction::Pause
+        }
+        ["deten" | "detener" | "para" | "parar" | "detene"] if noun => ScreenAction::Pause,
+        ["siguiente" | "proxima" | "proximo"]
+        | ["pasa" | "pon" | "salta" | "cambia" | "pasate", "siguiente" | "proxima" | "proximo"]
+        | ["salta" | "saltate" | "cambia" | "pasa"]
+            if noun =>
+        {
+            ScreenAction::Next
+        }
+        ["anterior"] | ["pon" | "vuelve" | "volver", "anterior"] if noun => ScreenAction::Previous,
+        _ => return None,
+    };
+    Some(action)
+}
+
+/// Verbos de escritura en pantalla.
+const TYPE_VERBS: &[&str] = &["escribe", "escribeme", "teclea", "tipea", "digita"];
+
+/// Lugar explícito tras el verbo: "escribe *en pantalla* …".
+const TYPE_PLACES: &[&[&str]] = &[
+    &["en", "pantalla"],
+    &["en", "la", "pantalla"],
+    &["aqui"],
+    &["ahi"],
+    &["lo", "siguiente"],
+    &["esto"],
+];
+
+/// Inicios que piden redactar (LLM), no teclear literal: "escribe un correo".
+const COMPOSE_STARTS: &[&str] = &[
+    "un", "una", "unos", "unas", "me", "le", "les", "sobre", "acerca", "algo", "como",
+];
+
+/// "escribe en pantalla hola mundo" / "escribe hola mundo". El verbo debe
+/// abrir la orden: "¿cómo se escribe X?" va al LLM.
+fn type_command(tokens: &[Token<'_>]) -> Option<ScreenAction> {
+    let start = tokens
+        .iter()
+        .position(|t| !LEAD_FILLERS.contains(&t.key.as_str()))?;
+    if !TYPE_VERBS.contains(&tokens[start].key.as_str()) {
+        return None;
+    }
+    let mut rest = &tokens[start + 1..];
+    let mut explicit = false;
+    while let Some(place) = TYPE_PLACES.iter().find(|place| {
+        rest.len() >= place.len() && rest.iter().zip(place.iter()).all(|(t, p)| t.key == *p)
+    }) {
+        rest = &rest[place.len()..];
+        explicit = true;
+    }
+    let first = rest.first()?;
+    if !explicit && COMPOSE_STARTS.contains(&first.key.as_str()) {
+        return None;
+    }
+    let text = rest
+        .iter()
+        .map(|t| t.raw)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .trim_start_matches(|c: char| c == ':' || c == ',' || c == '-' || c.is_whitespace())
+        .trim_end_matches('.')
+        .to_string();
+    (!text.is_empty()).then_some(ScreenAction::Type(text))
+}
+
+/// Órdenes web (YouTube, Google) y de pantalla (multimedia, escribir) que el
+/// orquestador resuelve al instante, sin pasar por el cerebro CLI.
+pub fn web_or_automation_command(query: &str) -> Option<LocalCommand> {
+    let tokens = tokenize(query);
+    if let Some(request) = site_request(&tokens, YOUTUBE_SITES, YOUTUBE_VERBS, true) {
+        return Some(match request {
+            Some(q) => LocalCommand::OpenUrl {
+                url: format!(
+                    "https://www.youtube.com/results?search_query={}",
+                    url_encode(&q)
+                ),
+                spoken: format!("Buscando {q} en YouTube."),
+            },
+            None => LocalCommand::OpenUrl {
+                url: "https://www.youtube.com".into(),
+                spoken: "Abriendo YouTube.".into(),
+            },
+        });
+    }
+    if let Some(Some(q)) = site_request(&tokens, GOOGLE_SITES, GOOGLE_VERBS, false) {
+        return Some(LocalCommand::OpenUrl {
+            url: format!("https://www.google.com/search?q={}", url_encode(&q)),
+            spoken: format!("Buscando {q} en Google."),
+        });
+    }
+    media_command(&tokens)
+        .or_else(|| type_command(&tokens))
+        .map(LocalCommand::Screen)
 }
 
 /// Frase con la hora: "Es la 1:05." / "Son las 15:30."
@@ -1003,6 +1362,7 @@ impl VoiceOrchestrator {
                 clock: Arc::clone(&config.clock),
                 launcher: Arc::clone(&config.launcher),
                 automation_kill: config.automation_kill.clone(),
+                automation_input: config.automation_input.clone(),
                 stats: Arc::clone(&stats),
                 ready: Arc::clone(&ready),
                 speaking: None,
@@ -1774,6 +2134,8 @@ struct BrainLoop {
     launcher: AppLauncher,
     /// Kill switch de la automatización (HU-38).
     automation_kill: Option<AutomationKill>,
+    /// Entrada sintética para órdenes de pantalla (HU-38).
+    automation_input: Option<AutomationInput>,
     stats: Arc<VoiceStats>,
     ready: Arc<AtomicBool>,
     /// Locución en curso: (generación, qué hacer al terminar).
@@ -2047,11 +2409,43 @@ impl BrainLoop {
             }
             Some(LocalCommand::ListTasks) => self.list_tasks(),
             Some(LocalCommand::StopAutomation) => self.stop_automation(),
+            Some(LocalCommand::OpenUrl { url, spoken }) => {
+                self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+                let argv = vec!["xdg-open".to_string(), url];
+                match (self.launcher)(&argv) {
+                    Ok(()) => self.say(&spoken, AfterSpeech::Listen),
+                    Err(e) => {
+                        eprintln!("[voz] no se pudo abrir {argv:?}: {e}");
+                        self.say("No pude abrir el navegador.", AfterSpeech::Listen);
+                    }
+                }
+            }
+            Some(LocalCommand::Screen(action)) => self.screen_action(&action),
             None if classify_workload(query) == Workload::Heavy && self.dispatch_task(query) => {}
             None => match self.client.get() {
                 Some(client) => self.converse(client.as_ref(), query),
                 None => self.say(NO_API_KEY_PHRASE, AfterSpeech::Listen),
             },
+        }
+    }
+
+    /// Acción de pantalla (HU-38) por el guard de la automatización. Sin
+    /// automatización lo dice en vez de delegar al cerebro CLI.
+    fn screen_action(&mut self, action: &ScreenAction) {
+        self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+        let Some(input) = self.automation_input.clone() else {
+            self.say(
+                "La automatización está desactivada. Actívala en la configuración de Jarvis.",
+                AfterSpeech::Listen,
+            );
+            return;
+        };
+        match input(action.input_action()) {
+            Ok(()) => self.say(action.done_phrase(), AfterSpeech::Listen),
+            Err(e) => {
+                eprintln!("[voz] acción de pantalla {action:?} falló: {e}");
+                self.say(action.failure_phrase(), AfterSpeech::Listen);
+            }
         }
     }
 

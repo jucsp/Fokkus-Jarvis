@@ -226,6 +226,8 @@ fn is_navigation_or_media_key(key: &Key) -> bool {
             | Key::Home
             | Key::End
             | Key::MediaPlayPause
+            | Key::MediaNext
+            | Key::MediaPrevious
             | Key::VolumeUp
             | Key::VolumeDown
             | Key::Mute

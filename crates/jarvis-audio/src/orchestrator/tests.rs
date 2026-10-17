@@ -126,6 +126,9 @@ const SCRIPT: &[&str] = &[
     "Jarvis, cancela todas las tareas",                      // 14
     "Jarvis, qué tareas tengo",                              // 15
     "Jarvis, detente",                                       // 16: kill switch
+    "Jarvis, métete a YouTube y busca Marvel Rivals",        // 17: búsqueda web
+    "Jarvis, pausa el video",                                // 18: multimedia
+    "Jarvis, escribe en pantalla Hola mundo.",               // 19: escribir
 ];
 
 struct ScriptTranscriber;
@@ -1429,4 +1432,243 @@ fn stop_automation_by_voice_fires_the_kill_switch_without_llm() {
     assert_eq!(kills.load(Ordering::SeqCst), 1);
     assert_eq!(h.stats().local_commands, 1);
     assert!(brain.queries().is_empty(), "no pasa por el LLM");
+}
+
+// ------------------------------------------------- HU-38 web y pantalla
+
+fn youtube_search(url_query: &str, spoken: &str) -> Option<LocalCommand> {
+    Some(LocalCommand::OpenUrl {
+        url: format!("https://www.youtube.com/results?search_query={url_query}"),
+        spoken: format!("Buscando {spoken} en YouTube."),
+    })
+}
+
+fn youtube_home() -> Option<LocalCommand> {
+    Some(LocalCommand::OpenUrl {
+        url: "https://www.youtube.com".into(),
+        spoken: "Abriendo YouTube.".into(),
+    })
+}
+
+#[test]
+fn youtube_search_commands_extract_the_query() {
+    for query in [
+        "busca Marvel Rivals en YouTube",
+        "búscame Marvel Rivals en youtube.",
+        "métete a YouTube y busca Marvel Rivals",
+        "ve a YouTube y busca Marvel Rivals",
+        "pon Marvel Rivals en YouTube",
+        "ingresa a YouTube con una búsqueda de Marvel Rivals",
+        "busca en YouTube Marvel Rivals",
+        "Oye, ¿puedes buscar Marvel Rivals en YouTube?",
+    ] {
+        assert_eq!(
+            local_command(query),
+            youtube_search("Marvel+Rivals", "Marvel Rivals"),
+            "{query}"
+        );
+    }
+    // Tildes y símbolos se codifican en UTF-8.
+    assert_eq!(
+        local_command("busca canción de cuna en C++ en youtube"),
+        youtube_search("canci%C3%B3n+de+cuna+en+C%2B%2B", "canción de cuna en C++")
+    );
+}
+
+#[test]
+fn youtube_navigation_opens_the_home_page() {
+    for query in [
+        "abre YouTube",
+        "ve a youtube",
+        "métete a YouTube",
+        "ve al inicio de YouTube",
+        "ve al inicio de YouTube y reproduce un video al azar",
+        "entra a YouTube y pon cualquier video",
+    ] {
+        assert_eq!(local_command(query), youtube_home(), "{query}");
+    }
+    // Hablar de YouTube no es una orden.
+    assert_eq!(local_command("qué es youtube"), None);
+    assert_eq!(local_command("cuántos videos tiene youtube"), None);
+}
+
+#[test]
+fn google_search_commands_extract_the_query() {
+    let google = |q: &str, spoken: &str| {
+        Some(LocalCommand::OpenUrl {
+            url: format!("https://www.google.com/search?q={q}"),
+            spoken: format!("Buscando {spoken} en Google."),
+        })
+    };
+    for query in [
+        "busca el clima en Temuco en Google",
+        "busca en Google el clima en Temuco",
+        "busca en internet el clima en Temuco",
+        "busca el clima en Temuco en internet",
+    ] {
+        assert_eq!(
+            local_command(query),
+            google("clima+en+Temuco", "clima en Temuco"),
+            "{query}"
+        );
+    }
+    // "abre google" sigue abriendo el navegador; buscar sin sitio va al LLM.
+    assert!(matches!(
+        local_command("abre google"),
+        Some(LocalCommand::OpenApp { .. })
+    ));
+    assert_eq!(local_command("busca el archivo de configuración"), None);
+}
+
+#[test]
+fn media_and_type_commands_are_recognized() {
+    let screen = |a: ScreenAction| Some(LocalCommand::Screen(a));
+    for query in [
+        "reproduce",
+        "pon play",
+        "reanuda",
+        "dale play",
+        "Reproduce.",
+    ] {
+        assert_eq!(local_command(query), screen(ScreenAction::Play), "{query}");
+    }
+    for query in [
+        "pausa",
+        "pausar",
+        "pausa el video",
+        "pausa la música",
+        "detén la música",
+        "para el video",
+    ] {
+        assert_eq!(local_command(query), screen(ScreenAction::Pause), "{query}");
+    }
+    for query in [
+        "siguiente canción",
+        "siguiente video",
+        "pasa a la siguiente canción",
+    ] {
+        assert_eq!(local_command(query), screen(ScreenAction::Next), "{query}");
+    }
+    assert_eq!(
+        local_command("canción anterior"),
+        screen(ScreenAction::Previous)
+    );
+    // El kill switch sigue teniendo prioridad sobre "detén".
+    assert_eq!(local_command("detente"), Some(LocalCommand::StopAutomation));
+    assert_eq!(local_command("para"), Some(LocalCommand::StopAutomation));
+
+    assert_eq!(
+        local_command("escribe en pantalla Hola, ¿cómo estás?"),
+        screen(ScreenAction::Type("Hola, ¿cómo estás?".into()))
+    );
+    assert_eq!(
+        local_command("Escribe: Hola mundo."),
+        screen(ScreenAction::Type("Hola mundo".into()))
+    );
+    assert_eq!(
+        local_command("escribe en pantalla un saludo"),
+        screen(ScreenAction::Type("un saludo".into()))
+    );
+
+    // Redactar, preguntar o reproducir algo concreto: al LLM.
+    assert_eq!(local_command("escribe un correo para Felipe"), None);
+    assert_eq!(local_command("cómo se escribe excepción"), None);
+    assert_eq!(local_command("reproduce Queen"), None);
+    assert_eq!(local_command("siguiente"), None);
+    assert_eq!(local_command("escribe"), None);
+}
+
+#[test]
+fn screen_actions_map_to_input_actions() {
+    use jarvis_automation::{InputAction, Key};
+    assert_eq!(
+        ScreenAction::Pause.input_action(),
+        InputAction::KeyCombo(vec![Key::MediaPlayPause])
+    );
+    assert_eq!(
+        ScreenAction::Next.input_action(),
+        InputAction::KeyCombo(vec![Key::MediaNext])
+    );
+    assert_eq!(
+        ScreenAction::Type("hola".into()).input_action(),
+        InputAction::TypeText("hola".into())
+    );
+    assert_eq!(ScreenAction::Play.done_phrase(), "Reproduciendo.");
+    assert_eq!(url_encode("a b/ñ"), "a+b%2F%C3%B1");
+}
+
+fn recording_launcher(launched: &Arc<Mutex<Vec<Vec<String>>>>) -> AppLauncher {
+    let launched = Arc::clone(launched);
+    Arc::new(move |argv: &[String]| {
+        launched.lock().unwrap().push(argv.to_vec());
+        Ok(())
+    })
+}
+
+#[test]
+fn youtube_search_opens_the_url_without_llm() {
+    let launched = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let config = VoiceConfig {
+        launcher: recording_launcher(&launched),
+        ..fast()
+    };
+    let brain = FakeBrain::new("No debería hablar.");
+    let h = harness("youtube-search", Some(brain.clone()), config);
+
+    h.say_line(17); // "Jarvis, métete a YouTube y busca Marvel Rivals"
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(h.stats().local_commands, 1);
+    assert!(brain.queries().is_empty(), "no pasa por el cerebro");
+    assert_eq!(
+        *launched.lock().unwrap(),
+        vec![vec![
+            "xdg-open",
+            "https://www.youtube.com/results?search_query=Marvel+Rivals"
+        ]]
+    );
+}
+
+#[test]
+fn screen_commands_go_through_automation_input_without_llm() {
+    use jarvis_automation::{InputAction, Key};
+    let actions = Arc::new(Mutex::new(Vec::<InputAction>::new()));
+    let config = VoiceConfig {
+        automation_input: Some({
+            let actions = Arc::clone(&actions);
+            Arc::new(move |action: InputAction| {
+                actions.lock().unwrap().push(action);
+                Ok(())
+            })
+        }),
+        ..fast()
+    };
+    let brain = FakeBrain::new("No debería hablar.");
+    let h = harness("screen-actions", Some(brain.clone()), config);
+
+    h.say_line(18); // "Jarvis, pausa el video"
+    h.wait_spoken_and_listening(0, 0);
+    let (played, drained) = (h.played().len(), h.drained());
+    h.say_line(19); // "Jarvis, escribe en pantalla Hola mundo."
+    h.wait_spoken_and_listening(played, drained);
+
+    assert_eq!(h.stats().local_commands, 2);
+    assert!(brain.queries().is_empty(), "no pasa por el cerebro");
+    assert_eq!(
+        *actions.lock().unwrap(),
+        vec![
+            InputAction::KeyCombo(vec![Key::MediaPlayPause]),
+            InputAction::TypeText("Hola mundo".into()),
+        ]
+    );
+}
+
+#[test]
+fn screen_commands_without_automation_answer_locally() {
+    let brain = FakeBrain::new("No debería hablar.");
+    let h = harness("screen-disabled", Some(brain.clone()), fast());
+
+    h.say_line(18); // "Jarvis, pausa el video"
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(h.stats().local_commands, 1);
+    assert!(brain.queries().is_empty(), "no cae al cerebro CLI");
 }
