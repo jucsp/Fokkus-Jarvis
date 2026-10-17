@@ -1045,7 +1045,20 @@ fn media_command(tokens: &[Token<'_>]) -> Option<ScreenAction> {
 }
 
 /// Verbos de escritura en pantalla.
-const TYPE_VERBS: &[&str] = &["escribe", "escribeme", "teclea", "tipea", "digita"];
+const TYPE_VERBS: &[&str] = &[
+    "escribe",
+    "escribeme",
+    "escribir",
+    "teclea",
+    "teclear",
+    "tipea",
+    "tipear",
+    "digita",
+    "digitar",
+];
+
+/// Verbos que piden intentarlo: "*prueba* escribir …", "*intenta* buscar …".
+const TRY_VERBS: &[&str] = &["prueba", "intenta", "trata", "puedes", "podrias"];
 
 /// Lugar explícito tras el verbo: "escribe *en pantalla* …".
 const TYPE_PLACES: &[&[&str]] = &[
@@ -1057,30 +1070,108 @@ const TYPE_PLACES: &[&[&str]] = &[
     &["esto"],
 ];
 
+/// Campos de texto nombrables: "en *la caja de texto*", "en *el buscador*".
+const FIELD_NOUNS: &[&str] = &["caja", "buscador", "campo", "cuadro", "barra", "casilla"];
+const FIELD_ARTICLES: &[&str] = &["el", "la", "esta", "este", "esa", "ese"];
+const FIELD_KINDS: &[&str] = &["texto", "busqueda", "dialogo"];
+
 /// Inicios que piden redactar (LLM), no teclear literal: "escribe un correo".
 const COMPOSE_STARTS: &[&str] = &[
     "un", "una", "unos", "unas", "me", "le", "les", "sobre", "acerca", "algo", "como",
 ];
 
-/// "escribe en pantalla hola mundo" / "escribe hola mundo". El verbo debe
-/// abrir la orden: "¿cómo se escribe X?" va al LLM.
-fn type_command(tokens: &[Token<'_>]) -> Option<ScreenAction> {
-    let start = tokens
+/// Piezas que se redactan, no se teclean: "escribe código para …".
+const COMPOSE_NOUNS: &[&str] = &[
+    "correo", "correos", "mail", "email", "carta", "mensaje", "codigo", "poema", "cuento",
+    "ensayo", "resumen", "funcion", "script", "programa", "historia",
+];
+
+/// Lo que sigue a "algo" cuando se pide redactar: "escribe algo *sobre* X".
+const COMPOSE_AFTER_ALGO: &[&str] = &[
+    "sobre",
+    "acerca",
+    "de",
+    "para",
+    "que",
+    "como",
+    "bonito",
+    "lindo",
+    "corto",
+    "largo",
+    "gracioso",
+    "interesante",
+    "creativo",
+];
+
+/// Índice tras el verbo si la orden abre (salvo muletillas e "intenta…")
+/// con uno de `verbs`. "¿cómo se escribe X?" no cuenta.
+fn leading_verb_end(tokens: &[Token<'_>], verbs: &[&str]) -> Option<usize> {
+    let mut i = tokens
         .iter()
         .position(|t| !LEAD_FILLERS.contains(&t.key.as_str()))?;
-    if !TYPE_VERBS.contains(&tokens[start].key.as_str()) {
+    if TRY_VERBS.contains(&tokens[i].key.as_str()) {
+        i += 1;
+        if tokens.get(i).is_some_and(|t| t.key == "a" || t.key == "de") {
+            i += 1;
+        }
+    }
+    verbs
+        .contains(&tokens.get(i)?.key.as_str())
+        .then_some(i + 1)
+}
+
+/// Palabras que ocupa un lugar de escritura al inicio de `rest`.
+fn place_len(rest: &[Token<'_>]) -> Option<usize> {
+    let keys: Vec<&str> = rest.iter().map(|t| t.key.as_str()).collect();
+    if let Some(place) = TYPE_PLACES.iter().find(|p| keys.starts_with(p)) {
+        return Some(place.len());
+    }
+    // "en [la] caja [de texto]".
+    if keys.first() != Some(&"en") {
         return None;
     }
-    let mut rest = &tokens[start + 1..];
+    let mut i = 1;
+    if keys.get(i).is_some_and(|k| FIELD_ARTICLES.contains(k)) {
+        i += 1;
+    }
+    if !keys.get(i).is_some_and(|k| FIELD_NOUNS.contains(k)) {
+        return None;
+    }
+    i += 1;
+    if keys.get(i) == Some(&"de") && keys.get(i + 1).is_some_and(|k| FIELD_KINDS.contains(k)) {
+        i += 2;
+    }
+    Some(i)
+}
+
+/// "escribe en pantalla hola mundo" / "prueba escribir hola" / "escribe en
+/// el buscador X" / "escribe X en la caja de texto". Pedir que se redacte
+/// algo ("escribe un correo…") va al LLM.
+fn type_command(tokens: &[Token<'_>]) -> Option<ScreenAction> {
+    let mut rest = &tokens[leading_verb_end(tokens, TYPE_VERBS)?..];
     let mut explicit = false;
-    while let Some(place) = TYPE_PLACES.iter().find(|place| {
-        rest.len() >= place.len() && rest.iter().zip(place.iter()).all(|(t, p)| t.key == *p)
-    }) {
-        rest = &rest[place.len()..];
+    while let Some(len) = place_len(rest) {
+        rest = &rest[len..];
         explicit = true;
     }
+    // "escribe algo: hola" teclea; "escribe algo sobre X" se redacta.
+    if rest.first().is_some_and(|t| t.key == "algo")
+        && rest
+            .get(1)
+            .is_some_and(|t| !COMPOSE_AFTER_ALGO.contains(&t.key.as_str()))
+    {
+        rest = &rest[1..];
+        explicit = true;
+    }
+    // Lugar al final: "escribe hola mundo en el buscador".
+    if let Some(at) = (1..rest.len()).find(|&i| place_len(&rest[i..]) == Some(rest.len() - i)) {
+        rest = &rest[..at];
+    }
     let first = rest.first()?;
-    if !explicit && COMPOSE_STARTS.contains(&first.key.as_str()) {
+    if !explicit
+        && (COMPOSE_STARTS.contains(&first.key.as_str())
+            || COMPOSE_NOUNS.contains(&first.key.as_str()))
+    {
         return None;
     }
     let text = rest
@@ -1094,34 +1185,127 @@ fn type_command(tokens: &[Token<'_>]) -> Option<ScreenAction> {
     (!text.is_empty()).then_some(ScreenAction::Type(text))
 }
 
+/// "escribe en YouTube X": teclear en un sitio es buscar en él. Devuelve la
+/// consulta, vacía si no la hay (`None` si la orden no es esa).
+fn typed_site_query(tokens: &[Token<'_>], sites: &[&str]) -> Option<String> {
+    let rest = &tokens[leading_verb_end(tokens, TYPE_VERBS)?..];
+    let keys: Vec<&str> = rest.iter().map(|t| t.key.as_str()).collect();
+    let site = match keys.as_slice() {
+        ["en", site, ..] if sites.contains(site) => 2,
+        ["en", "el", site, ..] if sites.contains(site) => 3,
+        _ => return None,
+    };
+    Some(join_raw(trim_edges(&rest[site..])))
+}
+
+/// Búsquedas sobre el equipo o el trabajo del usuario: "busca X" sin sitio
+/// no va a Google si menciona alguna (el LLM sabe buscar en local).
+const LOCAL_SEARCH_WORDS: &[&str] = &[
+    "archivo",
+    "archivos",
+    "carpeta",
+    "carpetas",
+    "fichero",
+    "ficheros",
+    "directorio",
+    "documento",
+    "documentos",
+    "correo",
+    "correos",
+    "mail",
+    "mails",
+    "tarea",
+    "tareas",
+    "mi",
+    "mis",
+    "codigo",
+    "funcion",
+    "clase",
+    "proyecto",
+    "repo",
+    "repositorio",
+    "log",
+    "logs",
+    "equipo",
+    "disco",
+    "spotify",
+];
+
+/// "busca recetas de pan" → Google; "busca en el buscador X" → teclea X en el
+/// campo con foco.
+fn bare_search(tokens: &[Token<'_>]) -> Option<LocalCommand> {
+    let rest = &tokens[leading_verb_end(tokens, GOOGLE_VERBS)?..];
+    if let Some(len) = place_len(rest).filter(|_| rest.first().is_some_and(|t| t.key == "en")) {
+        let query = trim_edges(&rest[len..]);
+        return (!query.is_empty())
+            .then(|| LocalCommand::Screen(ScreenAction::Type(join_raw(query))));
+    }
+    let query = trim_edges(rest);
+    if query.is_empty()
+        || query
+            .iter()
+            .any(|t| LOCAL_SEARCH_WORDS.contains(&t.key.as_str()))
+    {
+        return None;
+    }
+    Some(google_search(&join_raw(query)))
+}
+
+fn youtube_search(q: &str) -> LocalCommand {
+    LocalCommand::OpenUrl {
+        url: format!(
+            "https://www.youtube.com/results?search_query={}",
+            url_encode(q)
+        ),
+        spoken: format!("Buscando {q} en YouTube."),
+    }
+}
+
+fn google_search(q: &str) -> LocalCommand {
+    LocalCommand::OpenUrl {
+        url: format!("https://www.google.com/search?q={}", url_encode(q)),
+        spoken: format!("Buscando {q} en Google."),
+    }
+}
+
 /// Órdenes web (YouTube, Google) y de pantalla (multimedia, escribir) que el
 /// orquestador resuelve al instante, sin pasar por el cerebro CLI.
 pub fn web_or_automation_command(query: &str) -> Option<LocalCommand> {
     let tokens = tokenize(query);
+    let youtube_home = || LocalCommand::OpenUrl {
+        url: "https://www.youtube.com".into(),
+        spoken: "Abriendo YouTube.".into(),
+    };
+    if let Some(q) = typed_site_query(&tokens, YOUTUBE_SITES) {
+        return Some(if q.is_empty() {
+            youtube_home()
+        } else {
+            youtube_search(&q)
+        });
+    }
+    if let Some(q) = typed_site_query(&tokens, GOOGLE_SITES) {
+        return Some(if q.is_empty() {
+            LocalCommand::OpenUrl {
+                url: "https://www.google.com".into(),
+                spoken: "Abriendo Google.".into(),
+            }
+        } else {
+            google_search(&q)
+        });
+    }
     if let Some(request) = site_request(&tokens, YOUTUBE_SITES, YOUTUBE_VERBS, true) {
         return Some(match request {
-            Some(q) => LocalCommand::OpenUrl {
-                url: format!(
-                    "https://www.youtube.com/results?search_query={}",
-                    url_encode(&q)
-                ),
-                spoken: format!("Buscando {q} en YouTube."),
-            },
-            None => LocalCommand::OpenUrl {
-                url: "https://www.youtube.com".into(),
-                spoken: "Abriendo YouTube.".into(),
-            },
+            Some(q) => youtube_search(&q),
+            None => youtube_home(),
         });
     }
     if let Some(Some(q)) = site_request(&tokens, GOOGLE_SITES, GOOGLE_VERBS, false) {
-        return Some(LocalCommand::OpenUrl {
-            url: format!("https://www.google.com/search?q={}", url_encode(&q)),
-            spoken: format!("Buscando {q} en Google."),
-        });
+        return Some(google_search(&q));
     }
     media_command(&tokens)
         .or_else(|| type_command(&tokens))
         .map(LocalCommand::Screen)
+        .or_else(|| bare_search(&tokens))
 }
 
 /// Frase con la hora: "Es la 1:05." / "Son las 15:30."

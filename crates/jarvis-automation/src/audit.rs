@@ -57,6 +57,9 @@ pub fn action_json(action: &InputAction, log_text: bool) -> Value {
         } => json!({
             "type": "click", "x": at.x, "y": at.y, "button": button(b), "count": count,
         }),
+        InputAction::ClickHere { button: b, count } => json!({
+            "type": "click", "button": button(b), "count": count,
+        }),
         InputAction::Scroll { at, dx, dy } => json!({
             "type": "scroll", "x": at.x, "y": at.y, "dx": dx, "dy": dy,
         }),

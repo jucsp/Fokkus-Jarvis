@@ -1392,7 +1392,10 @@ fn stop_automation_is_recognized_with_priority() {
     }
     // "para" como preposición o "cancela" con objeto no son el kill switch.
     assert_eq!(local_command("para qué sirve esto"), None);
-    assert_eq!(local_command("busca vuelos para mañana"), None);
+    assert!(matches!(
+        local_command("busca vuelos para mañana"),
+        Some(LocalCommand::OpenUrl { .. })
+    ));
     assert_eq!(
         local_command("cancela todas las tareas"),
         Some(LocalCommand::CancelTask {
@@ -1512,12 +1515,44 @@ fn google_search_commands_extract_the_query() {
             "{query}"
         );
     }
-    // "abre google" sigue abriendo el navegador; buscar sin sitio va al LLM.
+    // Buscar sin sitio va a Google, salvo que sea algo del equipo o del
+    // trabajo del usuario (eso lo resuelve el LLM).
+    for query in [
+        "busca el clima en Temuco",
+        "búscame el clima en Temuco",
+        "prueba buscar el clima en Temuco",
+        "escribe en Google el clima en Temuco",
+    ] {
+        assert_eq!(
+            local_command(query),
+            google("clima+en+Temuco", "clima en Temuco"),
+            "{query}"
+        );
+    }
     assert!(matches!(
         local_command("abre google"),
         Some(LocalCommand::OpenApp { .. })
     ));
     assert_eq!(local_command("busca el archivo de configuración"), None);
+    assert_eq!(local_command("busca mis correos de Felipe"), None);
+    assert_eq!(local_command("busca"), None);
+    assert_eq!(local_command("¿qué busca la gente?"), None);
+}
+
+#[test]
+fn typing_into_youtube_searches_it() {
+    for query in [
+        "escribe en YouTube Marvel Rivals",
+        "escribe en el youtube Marvel Rivals",
+        "prueba escribir en YouTube Marvel Rivals",
+    ] {
+        assert_eq!(
+            local_command(query),
+            youtube_search("Marvel+Rivals", "Marvel Rivals"),
+            "{query}"
+        );
+    }
+    assert_eq!(local_command("escribe en YouTube"), youtube_home());
 }
 
 #[test]
@@ -1569,9 +1604,40 @@ fn media_and_type_commands_are_recognized() {
         local_command("escribe en pantalla un saludo"),
         screen(ScreenAction::Type("un saludo".into()))
     );
+    // Sin "en pantalla", con "prueba/intenta" y nombrando el campo de texto.
+    for (query, typed) in [
+        ("escribe hola mundo", "hola mundo"),
+        ("prueba escribir hola mundo", "hola mundo"),
+        ("intenta escribir hola mundo", "hola mundo"),
+        ("prueba a escribir hola mundo", "hola mundo"),
+        ("¿puedes escribir hola mundo?", "hola mundo?"),
+        ("teclea Fokkus Jarvis", "Fokkus Jarvis"),
+        ("escribe algo: hola mundo", "hola mundo"),
+        ("escribe algo hola mundo", "hola mundo"),
+        ("escribe en la caja de texto hola mundo", "hola mundo"),
+        ("escribe en el buscador recetas de pan", "recetas de pan"),
+        ("escribe en el campo de búsqueda recetas", "recetas"),
+        ("prueba escribir en esta caja hola", "hola"),
+        ("escribe hola mundo en el buscador", "hola mundo"),
+        ("escribe hola en la caja de texto.", "hola"),
+        ("escribe en la caja de texto un saludo", "un saludo"),
+        ("busca en el buscador recetas de pan", "recetas de pan"),
+    ] {
+        assert_eq!(
+            local_command(query),
+            screen(ScreenAction::Type(typed.into())),
+            "{query}"
+        );
+    }
 
     // Redactar, preguntar o reproducir algo concreto: al LLM.
     assert_eq!(local_command("escribe un correo para Felipe"), None);
+    assert_eq!(local_command("prueba escribir un correo para Felipe"), None);
+    assert_eq!(local_command("escribe código para ordenar una lista"), None);
+    assert_eq!(local_command("escribe algo sobre perros"), None);
+    assert_eq!(local_command("escribe algo"), None);
+    assert_eq!(local_command("escribe en la caja de texto"), None);
+    assert_eq!(local_command("prueba escribir"), None);
     assert_eq!(local_command("cómo se escribe excepción"), None);
     assert_eq!(local_command("reproduce Queen"), None);
     assert_eq!(local_command("siguiente"), None);

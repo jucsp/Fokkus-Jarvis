@@ -129,6 +129,14 @@ pub(crate) fn ydotool_argvs(action: &InputAction) -> Result<Vec<Vec<String>>, In
                 button_code(*button).into(),
             ],
         ],
+        InputAction::ClickHere { button, count } => vec![vec![
+            "click".into(),
+            "-r".into(),
+            count.max(&1).to_string(),
+            "-D".into(),
+            "60".into(),
+            button_code(*button).into(),
+        ]],
         InputAction::Scroll { at, dx, dy } => vec![
             move_to(at.x, at.y),
             vec![
@@ -174,6 +182,9 @@ impl InputSynth for YdotoolInput {
     fn perform(&mut self, action: &InputAction) -> Result<(), InputError> {
         for argv in ydotool_argvs(action)? {
             let mut cmd = Command::new("ydotool");
+            if let Some(socket) = ydotool_socket() {
+                cmd.env("YDOTOOL_SOCKET", socket);
+            }
             cmd.args(&argv);
             let out = run_with_timeout(cmd, TIMEOUT).map_err(|e| {
                 if e.contains("tiempo agotado") {
@@ -183,7 +194,11 @@ impl InputSynth for YdotoolInput {
                 }
             })?;
             if !out.success {
-                let err = out.stderr.trim().to_string();
+                // Sin `ydotoold`, ydotool avisa por stdout, no por stderr.
+                let mut err = out.stderr.trim().to_string();
+                if err.is_empty() {
+                    err = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                }
                 return Err(if err.contains("ermission") {
                     InputError::PermissionDenied
                 } else {
@@ -225,6 +240,16 @@ mod tests {
                 s(&["click", "-r", "2", "-D", "60", "0xC1"]),
             ]
         );
+    }
+
+    #[test]
+    fn click_here_does_not_move_the_pointer() {
+        let argvs = ydotool_argvs(&InputAction::ClickHere {
+            button: MouseButton::Left,
+            count: 1,
+        })
+        .unwrap();
+        assert_eq!(argvs, vec![s(&["click", "-r", "1", "-D", "60", "0xC0"])]);
     }
 
     #[test]

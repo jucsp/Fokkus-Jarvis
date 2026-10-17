@@ -57,9 +57,13 @@ pub const SYSTEM_PROMPT: &str = concat!(
     "Al abrir aplicaciones gráficas, lánzalas SIEMPRE en segundo plano y desacopladas ",
     "(systemd-run --user --collect <app>, gtk-launch <app> o nohup <cmd> >/dev/null 2>&1 &) ",
     "para no bloquear la salida del proceso. ",
-    "NUNCA intentes ejecutar comandos de consola o scripts en segundo plano para controlar ",
-    "la pantalla, el mouse o emular pulsaciones de teclas en el navegador del usuario; ",
-    "la interacción de pantalla la gestiona el orquestador nativo de Jarvis. ",
+    "Cuentas con ojos y manos nativos en el sistema a través del comando fokkus-jarvis: ",
+    "para escribir texto en la ventana o caja activa ejecuta fokkus-jarvis input type \"<texto>\"; ",
+    "para pulsar teclas o atajos (Enter, Tab, Escape, Ctrl+l, etc.) ejecuta ",
+    "fokkus-jarvis input key <tecla>; para hacer clic ejecuta fokkus-jarvis input click [x y]; ",
+    "para capturar y ver la pantalla ejecuta fokkus-jarvis capture [ruta.png]. ",
+    "Cuando el usuario te pida escribir en pantalla, interactuar con cajas de texto, ",
+    "buscadores o hacer clic, USA estas herramientas para realizar la acción directamente. ",
     "Constitución de privacidad, sin excepciones: tienes PROHIBIDO de forma ABSOLUTA leer, ",
     "listar, buscar, copiar, mover, modificar o borrar cualquier cosa dentro de ~/Imágenes/, ",
     "~/Images/, ~/Pictures/, ~/Documentos/, ~/Documents/, ~/Videos/, ~/Música/, ~/Music/, ",
@@ -607,6 +611,20 @@ mod tests {
         std::env::set_var(API_KEY_ENV, "env-key");
         assert_eq!(resolve_api_key(None).unwrap(), "env-key");
         std::env::remove_var(API_KEY_ENV);
+    }
+
+    #[test]
+    fn system_prompt_exposes_eyes_and_hands() {
+        for tool in [
+            "fokkus-jarvis input type",
+            "fokkus-jarvis input key",
+            "fokkus-jarvis input click",
+            "fokkus-jarvis capture",
+        ] {
+            assert!(SYSTEM_PROMPT.contains(tool), "{tool}");
+        }
+        // La prohibición vieja hacía que el LLM se negara a escribir.
+        assert!(!SYSTEM_PROMPT.contains("NUNCA intentes ejecutar comandos de consola"));
     }
 
     #[test]

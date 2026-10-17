@@ -3,7 +3,8 @@
 //! Orquesta el arranque completo del asistente combinando `jarvis-core`,
 //! `jarvis-render`, `jarvis-shell`, `jarvis-audio` y `jarvis-ipc`:
 //!
-//! 1. Analiza los argumentos de línea de comandos (`--version`, `--check`).
+//! 1. Analiza los argumentos de línea de comandos (`--version`, `--check`,
+//!    y los subcomandos de ojos y manos `input`/`capture`).
 //! 2. Adquiere el lock de instancia única.
 //! 3. Carga la configuración persistente (`~/.config/fokkus-jarvis/config.toml`).
 //! 4. Crea el **único** `JarvisCore` ([`SharedCore`]) que comparten la
@@ -28,6 +29,7 @@ mod settings;
 
 use std::cell::{Cell, RefCell};
 use std::io::BufRead;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,8 +43,8 @@ use jarvis_audio::{
     VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
 };
 use jarvis_automation::{
-    ActionRiskLevel, AutomationGuard, Capabilities, InputAction, InputSynth, KillReason,
-    ProbeOptions,
+    ActionRiskLevel, AutomationGuard, Capabilities, CaptureTarget, InputAction, InputSynth, Key,
+    KillReason, MouseButton, Point, ProbeOptions,
 };
 use jarvis_core::single_instance::{self, InstanceError};
 use jarvis_core::{
@@ -58,8 +60,11 @@ use ringbuf::traits::Split;
 use ringbuf::HeapRb;
 use runtime::{LoopExit, SphereLook, SphereView, SttAvailability};
 
+/// Ruta por defecto de `fokkus-jarvis capture`.
+const DEFAULT_CAPTURE_PATH: &str = "/tmp/jarvis-screen.png";
+
 /// Acción solicitada en la línea de comandos.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum CliAction {
     /// Imprime la versión y sale con éxito.
     Version,
@@ -71,6 +76,10 @@ enum CliAction {
     SetApiKey,
     /// Arranca el asistente (comportamiento por defecto).
     Run,
+    /// `input type|key|click`: una acción de entrada sintética (HU-38).
+    Input(InputAction),
+    /// `capture [ruta]`: guarda la pantalla activa como PNG (HU-38).
+    Capture(PathBuf),
 }
 
 /// Resultado de una sonda de salud sobre un subsistema.
@@ -210,6 +219,8 @@ fn main() -> ExitCode {
         }
         Ok(CliAction::SetApiKey) => run_set_api_key(),
         Ok(CliAction::Run) => run(),
+        Ok(CliAction::Input(action)) => run_input(action),
+        Ok(CliAction::Capture(path)) => run_capture(&path),
         Err(message) => {
             eprintln!("{message}");
             print_usage();
@@ -226,7 +237,51 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         Some("-c" | "--check") => Ok(CliAction::Check),
         Some("-h" | "--help") => Ok(CliAction::Help),
         Some("--set-api-key") => Ok(CliAction::SetApiKey),
+        Some("input") => parse_input(&args[1..]).map(CliAction::Input),
+        Some("capture") => match &args[1..] {
+            [] => Ok(CliAction::Capture(PathBuf::from(DEFAULT_CAPTURE_PATH))),
+            [path] => Ok(CliAction::Capture(PathBuf::from(path))),
+            _ => Err("uso: capture [ruta.png]".into()),
+        },
         Some(other) => Err(format!("argumento desconocido: {other}")),
+    }
+}
+
+/// `input type <texto…>` | `input key <combo>` | `input click [x y]`.
+fn parse_input(args: &[String]) -> Result<InputAction, String> {
+    match args.split_first() {
+        Some((verb, rest)) if verb == "type" => {
+            let text = rest.join(" ");
+            if text.is_empty() {
+                return Err("uso: input type <texto>".into());
+            }
+            Ok(InputAction::TypeText(text))
+        }
+        Some((verb, [combo])) if verb == "key" => {
+            Key::parse_combo(combo).map(InputAction::KeyCombo)
+        }
+        Some((verb, _)) if verb == "key" => Err("uso: input key <tecla_o_combo>".into()),
+        Some((verb, rest)) if verb == "click" => match rest {
+            [] => Ok(InputAction::ClickHere {
+                button: MouseButton::Left,
+                count: 1,
+            }),
+            [x, y] => {
+                let coord = |v: &str| {
+                    v.parse::<f64>()
+                        .ok()
+                        .filter(|n| n.is_finite() && *n >= 0.0)
+                        .ok_or_else(|| format!("coordenada inválida: {v}"))
+                };
+                Ok(InputAction::Click {
+                    at: Point::new(coord(x)?, coord(y)?),
+                    button: MouseButton::Left,
+                    count: 1,
+                })
+            }
+            _ => Err("uso: input click [x y]".into()),
+        },
+        _ => Err("uso: input type <texto> | input key <tecla_o_combo> | input click [x y]".into()),
     }
 }
 
@@ -240,6 +295,13 @@ fn print_usage() {
     println!("  -h, --help      Muestra esta ayuda y sale.");
     println!("  --set-api-key   Lee la API key de Anthropic por stdin y la guarda");
     println!("                  en el llavero del sistema.");
+    println!();
+    println!("Ojos y manos (requieren [automation] enabled = true):");
+    println!("  input type <texto>          Escribe el texto en la ventana con foco.");
+    println!("  input key <tecla_o_combo>   Pulsa una tecla o atajo (Enter, Tab, Ctrl+L…).");
+    println!("  input click [x y]           Clic en (x, y) o donde esté el puntero.");
+    println!("  capture [ruta.png]          Captura la pantalla activa (por defecto");
+    println!("                              {DEFAULT_CAPTURE_PATH}).");
     println!();
     println!("Sin opciones, arranca Fokkus-Jarvis, levanta el servidor IPC y deja");
     println!("el socket listo para conexiones de Fokkus IDE.");
@@ -269,6 +331,74 @@ fn run_set_api_key() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `[automation]` para los subcomandos `input`/`capture`, o `None` (con el
+/// aviso ya impreso) si la automatización está apagada.
+fn cli_automation_config() -> Option<jarvis_core::AutomationConfig> {
+    let config = JarvisConfig::load().unwrap_or_else(|e| {
+        eprintln!("No se pudo leer la configuración ({e}); se usan los valores por defecto.");
+        JarvisConfig::default()
+    });
+    if !config.automation.enabled {
+        eprintln!(
+            "La automatización está desactivada: actívala en {} con [automation] enabled = true.",
+            JarvisConfig::path().display()
+        );
+        return None;
+    }
+    Some(config.automation)
+}
+
+fn automation_failure(what: &str, err: impl std::fmt::Display) -> ExitCode {
+    eprintln!("No se pudo {what}: {err}");
+    ExitCode::FAILURE
+}
+
+/// `fokkus-jarvis input …`: una acción de entrada bajo un *lease* de riesgo
+/// bajo, con la misma auditoría que las órdenes de voz.
+fn run_input(action: InputAction) -> ExitCode {
+    let Some(cfg) = cli_automation_config() else {
+        return ExitCode::FAILURE;
+    };
+    let guard = AutomationGuard::from_config(&cfg);
+    let mut synth =
+        match jarvis_automation::probe::probe_input_backend_with(&ProbeOptions::from(&cfg)) {
+            Ok(synth) => synth,
+            Err(e) => return automation_failure("abrir la entrada sintética", e),
+        };
+    let result = guard
+        .acquire_with_risk("cli input", "", ActionRiskLevel::Low)
+        .and_then(|mut lease| lease.perform(synth.as_mut(), action));
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => automation_failure("actuar", e),
+    }
+}
+
+/// `fokkus-jarvis capture [ruta]`: captura el monitor activo y lo guarda como
+/// PNG; imprime la ruta al terminar.
+fn run_capture(path: &std::path::Path) -> ExitCode {
+    let Some(cfg) = cli_automation_config() else {
+        return ExitCode::FAILURE;
+    };
+    let guard = AutomationGuard::from_config(&cfg);
+    let mut backend = match jarvis_automation::probe_capture_backend() {
+        Ok(backend) => backend,
+        Err(e) => return automation_failure("abrir la captura", e),
+    };
+    let frame = match guard
+        .acquire_with_risk("cli capture", "", ActionRiskLevel::Low)
+        .and_then(|mut lease| lease.capture(backend.as_mut(), &CaptureTarget::ActiveOutput))
+    {
+        Ok(frame) => frame,
+        Err(e) => return automation_failure("capturar la pantalla", e),
+    };
+    if let Err(e) = std::fs::write(path, frame.encode_png()) {
+        return automation_failure(&format!("guardar {}", path.display()), e);
+    }
+    println!("{}", path.display());
+    ExitCode::SUCCESS
 }
 
 /// Recarga `config.toml` tras guardar el formulario y aplica en caliente el
@@ -1188,5 +1318,74 @@ mod tests {
             Ok(CliAction::SetApiKey)
         );
         assert!(parse_args(&args(&["--desconocida"])).is_err());
+    }
+
+    #[test]
+    fn input_subcommands_build_input_actions() {
+        assert_eq!(
+            parse_args(&args(&["input", "type", "hola mundo"])),
+            Ok(CliAction::Input(InputAction::TypeText("hola mundo".into())))
+        );
+        // Sin comillas, las palabras se unen con un espacio.
+        assert_eq!(
+            parse_args(&args(&["input", "type", "hola", "mundo"])),
+            Ok(CliAction::Input(InputAction::TypeText("hola mundo".into())))
+        );
+        assert_eq!(
+            parse_args(&args(&["input", "key", "Enter"])),
+            Ok(CliAction::Input(InputAction::KeyCombo(vec![Key::Enter])))
+        );
+        assert_eq!(
+            parse_args(&args(&["input", "key", "Ctrl+L"])),
+            Ok(CliAction::Input(InputAction::KeyCombo(vec![
+                Key::Ctrl,
+                Key::Char('l')
+            ])))
+        );
+        assert_eq!(
+            parse_args(&args(&["input", "click"])),
+            Ok(CliAction::Input(InputAction::ClickHere {
+                button: MouseButton::Left,
+                count: 1
+            }))
+        );
+        assert_eq!(
+            parse_args(&args(&["input", "click", "640", "360.5"])),
+            Ok(CliAction::Input(InputAction::Click {
+                at: Point::new(640.0, 360.5),
+                button: MouseButton::Left,
+                count: 1
+            }))
+        );
+    }
+
+    #[test]
+    fn input_subcommands_reject_bad_usage() {
+        for bad in [
+            &["input"][..],
+            &["input", "type"],
+            &["input", "key"],
+            &["input", "key", "Ctrl+"],
+            &["input", "key", "Enter", "Tab"],
+            &["input", "click", "10"],
+            &["input", "click", "x", "10"],
+            &["input", "click", "-5", "10"],
+            &["input", "mueve"],
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn capture_defaults_to_tmp() {
+        assert_eq!(
+            parse_args(&args(&["capture"])),
+            Ok(CliAction::Capture(PathBuf::from(DEFAULT_CAPTURE_PATH)))
+        );
+        assert_eq!(
+            parse_args(&args(&["capture", "/home/x/p.png"])),
+            Ok(CliAction::Capture(PathBuf::from("/home/x/p.png")))
+        );
+        assert!(parse_args(&args(&["capture", "a.png", "b.png"])).is_err());
     }
 }

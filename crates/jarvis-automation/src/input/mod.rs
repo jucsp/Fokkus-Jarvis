@@ -93,12 +93,82 @@ impl Key {
     }
 }
 
+impl Key {
+    /// Tecla por nombre, sin distinguir mayúsculas: `Enter`, `BackSpace`,
+    /// `ctrl`, `F5`, `l`…
+    pub fn from_name(name: &str) -> Option<Key> {
+        let lower = name.trim().to_lowercase();
+        let key = match lower.as_str() {
+            "enter" | "return" | "intro" => Key::Enter,
+            "escape" | "esc" => Key::Escape,
+            "tab" => Key::Tab,
+            "backspace" | "retroceso" => Key::Backspace,
+            "delete" | "del" | "supr" | "suprimir" => Key::Delete,
+            "space" | "espacio" => Key::Space,
+            "up" | "arriba" => Key::Up,
+            "down" | "abajo" => Key::Down,
+            "left" | "izquierda" => Key::Left,
+            "right" | "derecha" => Key::Right,
+            "home" | "inicio" => Key::Home,
+            "end" | "fin" => Key::End,
+            "pageup" | "pgup" => Key::PageUp,
+            "pagedown" | "pgdn" => Key::PageDown,
+            "ctrl" | "control" => Key::Ctrl,
+            "shift" | "mayus" => Key::Shift,
+            "alt" => Key::Alt,
+            "super" | "meta" | "win" => Key::Super,
+            "playpause" | "play" | "pause" => Key::MediaPlayPause,
+            "next" => Key::MediaNext,
+            "previous" | "prev" => Key::MediaPrevious,
+            "volumeup" => Key::VolumeUp,
+            "volumedown" => Key::VolumeDown,
+            "mute" => Key::Mute,
+            _ => {
+                let mut chars = lower.chars();
+                return match (chars.next(), chars.next()) {
+                    (Some(c), None) if !c.is_whitespace() => Some(Key::Char(c)),
+                    (Some('f'), Some(_)) => lower[1..]
+                        .parse::<u8>()
+                        .ok()
+                        .filter(|n| (1..=24).contains(n))
+                        .map(Key::F),
+                    _ => None,
+                };
+            }
+        };
+        Some(key)
+    }
+
+    /// Combo como `Ctrl+L` o `ctrl+shift+t` (modificadores primero).
+    pub fn parse_combo(spec: &str) -> Result<Vec<Key>, String> {
+        let spec = spec.trim();
+        // "Ctrl++" → Ctrl y la tecla '+'.
+        let parts: Vec<&str> = match spec.strip_suffix("++") {
+            Some(head) => head.split('+').chain(std::iter::once("+")).collect(),
+            None if spec == "+" => vec!["+"],
+            None => spec.split('+').collect(),
+        };
+        if parts.iter().any(|p| p.trim().is_empty()) {
+            return Err(format!("combinación de teclas inválida: {spec:?}"));
+        }
+        parts
+            .iter()
+            .map(|p| Key::from_name(p).ok_or_else(|| format!("tecla desconocida: {:?}", p.trim())))
+            .collect()
+    }
+}
+
 /// Una acción de entrada, siempre en coordenadas lógicas.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InputAction {
     MoveTo(Point),
     Click {
         at: Point,
+        button: MouseButton,
+        count: u8,
+    },
+    /// Clic donde esté el puntero, sin moverlo.
+    ClickHere {
         button: MouseButton,
         count: u8,
     },
@@ -116,7 +186,7 @@ impl InputAction {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::MoveTo(_) => "move_to",
-            Self::Click { .. } => "click",
+            Self::Click { .. } | Self::ClickHere { .. } => "click",
             Self::Scroll { .. } => "scroll",
             Self::TypeText(_) => "type_text",
             Self::KeyCombo(_) => "key_combo",
@@ -127,7 +197,7 @@ impl InputAction {
     pub fn point(&self) -> Option<Point> {
         match self {
             Self::MoveTo(p) | Self::Click { at: p, .. } | Self::Scroll { at: p, .. } => Some(*p),
-            Self::TypeText(_) | Self::KeyCombo(_) => None,
+            Self::ClickHere { .. } | Self::TypeText(_) | Self::KeyCombo(_) => None,
         }
     }
 }
@@ -206,4 +276,40 @@ pub trait InputSynth: Send {
 /// [`crate::probe::probe_input_backend_with`].
 pub fn probe_input_backend() -> Result<Box<dyn InputSynth>, InputError> {
     crate::probe::probe_input_backend_with(&crate::probe::ProbeOptions::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_names_are_case_insensitive() {
+        assert_eq!(Key::from_name("Enter"), Some(Key::Enter));
+        assert_eq!(Key::from_name("BackSpace"), Some(Key::Backspace));
+        assert_eq!(Key::from_name("ESC"), Some(Key::Escape));
+        assert_eq!(Key::from_name("F5"), Some(Key::F(5)));
+        assert_eq!(Key::from_name("L"), Some(Key::Char('l')));
+        assert_eq!(Key::from_name("F25"), None);
+        assert_eq!(Key::from_name("hola"), None);
+    }
+
+    #[test]
+    fn combos_keep_their_order() {
+        assert_eq!(
+            Key::parse_combo("Ctrl+L"),
+            Ok(vec![Key::Ctrl, Key::Char('l')])
+        );
+        assert_eq!(
+            Key::parse_combo("ctrl+shift+t"),
+            Ok(vec![Key::Ctrl, Key::Shift, Key::Char('t')])
+        );
+        assert_eq!(
+            Key::parse_combo("Ctrl++"),
+            Ok(vec![Key::Ctrl, Key::Char('+')])
+        );
+        assert_eq!(Key::parse_combo("Tab"), Ok(vec![Key::Tab]));
+        assert!(Key::parse_combo("").is_err());
+        assert!(Key::parse_combo("ctrl+").is_err());
+        assert!(Key::parse_combo("ctrl+nada").is_err());
+    }
 }
