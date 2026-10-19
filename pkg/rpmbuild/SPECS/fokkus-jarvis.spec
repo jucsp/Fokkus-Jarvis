@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.2.25
+Version:        0.2.26
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,6 +23,9 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Mon Oct 19 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.26-1
+- Feat (Issue #7): tareas de desarrollo en segundo plano con contexto de la propuesta, timeout CLI configurable (cli_timeout_secs) y consulta verbal del estado del desarrollo
+
 * Fri Oct 16 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.25-1
 - Fix: comando local de silencio y reposo inmediato sin pasar por el LLM ni reactivar follow-up
 

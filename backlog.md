@@ -77,6 +77,11 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 ---
 
 ## 👁️ Épica 7: Agente Visual Multiplataforma y Automatización Generalista (Computer Use)
+- [x] [#7](https://github.com/jucsp/Fokkus-Jarvis/issues/7) **fix(cli): soporte para tareas asíncronas en segundo plano y desacoplamiento del timeout síncrono de 120s** (Contrato: [sdd-issue7-tareas-asincronas-cli-timeout.md](docs/specs/sdd-contracts/sdd-issue7-tareas-asincronas-cli-timeout.md)) ✅ Cerrada en v0.2.26
+  - _Contexto de negocio:_ Evitar que órdenes de desarrollo ("lánselo no más", "inicia el pipeline", orquestaciones con `agy`) bloqueen la conversación durante 120s y fallen por timeout rígido.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa a trabajar:_ `crates/jarvis-core` (`cli_timeout_secs`), `crates/jarvis-audio` (`classify_workload`, `LIST_TASK_PHRASES`), `crates/jarvis-app` (`settings.rs`).
+  - 📌 _Objetivo técnico:_ Clasificación asíncrona inmediata de tareas de desarrollo/swarm, despacho desacoplado a `TaskManager`, timeout CLI configurable en `config.toml` y consulta verbal de estado de tareas en curso.
 - [x] **feat(automation): tareas pesadas en segundo plano con notificación vocal secuencial vía IPC** (HU-37)
   - _Contexto de negocio:_ Las tareas de larga duración (revisión de correos, Slack, análisis de datos) no deben bloquear la voz ni ser canceladas accidentalmente si el usuario sigue conversando.
   - 📁 _Repositorio:_ `Fokkus-Jarvis`

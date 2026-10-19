@@ -715,7 +715,10 @@ fn local_command_and_connector_parsing() {
         local_command("por favor silencio"),
         Some(LocalCommand::Standby)
     );
-    assert_eq!(local_command("guarda silencio"), Some(LocalCommand::Standby));
+    assert_eq!(
+        local_command("guarda silencio"),
+        Some(LocalCommand::Standby)
+    );
     assert_eq!(local_command("haz silencio"), Some(LocalCommand::Standby));
     assert_eq!(local_command("ya silencio"), Some(LocalCommand::Standby));
     assert_eq!(local_command("deja de hablar"), Some(LocalCommand::Standby));
@@ -1292,6 +1295,38 @@ fn local_command_recognizes_task_commands() {
     assert_eq!(
         local_command("¿qué tareas tengo?"),
         Some(LocalCommand::ListTasks)
+    );
+}
+
+#[test]
+fn local_command_recognizes_task_status_phrases_and_leaves_dev_orders_to_workload() {
+    for phrase in [
+        "¿cómo va el desarrollo?",
+        "¿como va el desarrollo?",
+        "¿en qué estado va el desarrollo?",
+        "¿en que estado va el desarrollo?",
+        "estado del desarrollo",
+        "estado de las tareas",
+        "¿cómo va la tarea?",
+        "¿como va la tarea?",
+        "¿cómo va el swarm?",
+        "¿como va el swarm?",
+    ] {
+        assert_eq!(
+            local_command(phrase),
+            Some(LocalCommand::ListTasks),
+            "{phrase}"
+        );
+    }
+    assert_eq!(
+        local_command("lanza el desarrollo"),
+        None,
+        "debe llegar a classify_workload, no abrir apps"
+    );
+    assert_eq!(
+        local_command("Perfecto, lánselo no más"),
+        None,
+        "debe llegar a classify_workload, no abrir apps"
     );
 }
 

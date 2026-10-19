@@ -38,7 +38,9 @@ pub fn build_brain(config: &JarvisConfig) -> Result<Brain, &'static str> {
     match config.brain_mode {
         BrainMode::Cli => {
             let command = config.effective_cli_command();
-            match CliBrain::new(command) {
+            match CliBrain::new(command).map(|brain| {
+                brain.with_timeout(Duration::from_secs(u64::from(config.cli_timeout_secs())))
+            }) {
                 Ok(brain) if brain.is_available() => {
                     println!("[cerebro] modo CLI: `{command}`.");
                     Ok(Arc::new(brain))

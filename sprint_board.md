@@ -1,9 +1,9 @@
 # Sprint Board — Fokkus-Jarvis
 
-**Épica 6:** Experiencia Visual Adaptativa y Personalización de Interfaz
-**Sprint:** HU-36 (mensajes efímeros flotantes en burbujas transparentes - Speech Popups HUD) — ✅ cerrado en v0.2.18
-**Actualizado:** 2026-10-16 · **PM/QA:** Claude · **PO:** Antigravity
-**Contratos:** [HU-36](docs/specs/sdd-contracts/sdd-hu36-burbujas-chat-efimeras-hud.md) · [HU-37](docs/specs/sdd-contracts/sdd-hu37-tareas-pesadas-asincronas-ipc.md) · [HU-35](docs/specs/sdd-contracts/sdd-hu35-deteccion-pantalla-completa.md)
+**Épica:** Issue #7 (Soporte para tareas asíncronas y desacoplamiento de timeout CLI) — ✅ CERRADA
+**Sprint:** Issue #7 / v0.2.26
+**Actualizado:** 2026-10-19 · **PM/QA:** Claude · **PO:** Antigravity · **Dev:** DeepSeek
+**Contratos:** [Issue #7](docs/specs/sdd-contracts/sdd-issue7-tareas-asincronas-cli-timeout.md) · [HU-37](docs/specs/sdd-contracts/sdd-hu37-tareas-pesadas-asincronas-ipc.md) · [HU-36](docs/specs/sdd-contracts/sdd-hu36-burbujas-chat-efimeras-hud.md)
 
 Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere prueba manual
 
@@ -13,6 +13,7 @@ Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere 
 
 | HU | Versión | Tests | Autoría | Pendiente |
 |----|---------|-------|---------|-----------|
+| Issue #7 Tareas Asíncronas CLI | v0.2.26 | 628 passed / 0 failed · clippy OK · fmt OK · deny OK | DeepSeek (7.1–7.5: core, tasks, orchestrator, settings) · Claude (QA, C-1 a C-7, tests UTF-8) · Antigravity (PO / SDD) | 🧪 Prueba con usuario por voz |
 | Fix Thinking Barge-In | v0.2.21 | 516 passed / 0 failed · clippy OK · fmt OK | DeepSeek Dev · Antigravity PO | — |
 | HU-AUDIO-CONTINUITY | v0.2.20 | 515 passed / 0 failed · clippy OK · fmt OK | DeepSeek (histéresis VAD, concatenación Thinking, merge HUD) · Antigravity PO | 🧪 Prueba con usuario en vivo |
 | HU-36 Speech Popups HUD | v0.2.18 | `make test` 512 passed / 0 failed · `make lint` OK · `make fmt-check` OK | DeepSeek (36.1–36.6: config, `hud` render, `TextRasterizer`) · Claude (36.7–36.14: `HudEvent`, `HudLayer`, `HudPipeline`, toggle, QA) | 🧪 36.15 prueba manual en KWin (PO) |

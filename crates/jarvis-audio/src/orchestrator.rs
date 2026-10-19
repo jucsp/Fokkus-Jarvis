@@ -58,8 +58,8 @@ use crate::playback::AudioPlayback;
 use crate::speech_queue::{Delivery, DeliveryGate, SpeechPriority};
 use crate::stt::Transcriber;
 use crate::tasks::{
-    classify_workload, task_prompt, task_title, BrainFactory, SpeechQueueHandle, TaskConfig,
-    TaskManager, TaskOrigin, Workload,
+    classify_workload, dev_task_prompt, is_dev_task, task_prompt, task_title, BrainFactory,
+    SpeechQueueHandle, TaskConfig, TaskManager, TaskOrigin, Workload,
 };
 use crate::tts::{synth_chime, FillerCategory, PcmAudio};
 
@@ -547,6 +547,16 @@ const LIST_TASK_PHRASES: &[&str] = &[
     "que tareas hay",
     "tareas activas",
     "dime las tareas",
+    "cómo va el desarrollo",
+    "como va el desarrollo",
+    "en qué estado va el desarrollo",
+    "en que estado va el desarrollo",
+    "estado del desarrollo",
+    "estado de las tareas",
+    "cómo va la tarea",
+    "como va la tarea",
+    "cómo va el swarm",
+    "como va el swarm",
 ];
 
 /// Verbos que piden abrir una aplicación (texto ya sin acentos).
@@ -1594,6 +1604,7 @@ impl VoiceOrchestrator {
                 ready: Arc::clone(&ready),
                 speaking: None,
                 tasks: tasks.clone(),
+                last_assistant_response: None,
                 queue: queue.clone(),
                 last_voice_activity: Arc::clone(&last_voice_activity),
                 gaming_mode: Arc::clone(&gaming_mode),
@@ -2383,6 +2394,9 @@ struct BrainLoop {
     speaking: Option<(u64, AfterSpeech)>,
     /// Gestor de tareas pesadas (HU-37); `None` = desactivado.
     tasks: Option<TaskManager>,
+    /// Última respuesta completa del asistente (contexto para aprobar
+    /// desarrollos, Issue #7).
+    last_assistant_response: Option<String>,
     /// Cola hablada priorizada: avisos (IPC) y resultados de tareas.
     queue: SpeechQueueHandle,
     /// Última voz del usuario (la escribe el hilo de voz).
@@ -2495,12 +2509,20 @@ impl BrainLoop {
         };
         self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
         let title = task_title(query);
-        let id = tasks.submit(title.clone(), task_prompt(query), TaskOrigin::Voice);
-        println!("[tareas] #{id} despachada en segundo plano.");
-        let ack = match crate::conversation::classify_intent(query) {
-            FillerCategory::Inbox => "Reviso tu bandeja y te aviso.",
-            _ => "Voy con eso, te aviso cuando termine.",
+        let (prompt, ack) = if is_dev_task(query) {
+            (
+                dev_task_prompt(query, self.last_assistant_response.as_deref()),
+                "Iniciando el desarrollo en segundo plano, te aviso cuando termine.",
+            )
+        } else {
+            let ack = match crate::conversation::classify_intent(query) {
+                FillerCategory::Inbox => "Reviso tu bandeja y te aviso.",
+                _ => "Voy con eso, te aviso cuando termine.",
+            };
+            (task_prompt(query), ack)
         };
+        let id = tasks.submit(title, prompt, TaskOrigin::Voice);
+        println!("[tareas] #{id} despachada en segundo plano.");
         self.say(ack, AfterSpeech::Listen);
         true
     }
@@ -2820,7 +2842,10 @@ impl BrainLoop {
             return;
         }
         match result {
-            Ok(_) => {
+            Ok(completion) => {
+                if !completion.text.trim().is_empty() {
+                    self.last_assistant_response = Some(completion.text);
+                }
                 if self.core.state() == JarvisState::Speaking {
                     self.finish_after(generation, AfterSpeech::Listen);
                 } else {

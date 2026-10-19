@@ -100,11 +100,70 @@ const LIGHT_OVERRIDES: &[&str] = &[
     "respuesta rápida",
 ];
 
+/// Verbos que sugieren una tarea de desarrollo (Issue #7). Comparación por
+/// palabra completa sobre texto normalizado, para no confundir "inicia" con
+/// "iniciativa" ni "procede" con "procedencia".
+const DEV_VERBS: &[&str] = &[
+    "lanza",
+    "lanzar",
+    "ejecuta",
+    "ejecutar",
+    "inicia",
+    "iniciar",
+    "desarrolla",
+    "desarrollar",
+    "construye",
+    "construir",
+    "implementa",
+    "implementar",
+    "orquesta",
+    "orquestar",
+    "compila",
+    "compilar",
+    "procede",
+];
+
+/// Objetos de desarrollo que, junto a un verbo de desarrollo, marcan la
+/// consulta como tarea de desarrollo.
+const DEV_NOUNS: &[&str] = &[
+    "desarrollo",
+    "swarm",
+    "pipeline",
+    "tarea",
+    "proyecto",
+    "script",
+    "suite",
+    "build",
+    "agente",
+    "funcionalidad",
+    "funcionalidades",
+    "feature",
+];
+
+/// Aprobaciones explícitas de lanzamiento/desarrollo (Issue #7). Todo en
+/// minúsculas y sin tildes: se comparan contra el texto normalizado. No se
+/// incluyen "dale no más" ni "procede no más" aislados (afirmaciones genéricas).
+const DEV_OVERRIDES: &[&str] = &[
+    "lansalo",
+    "lanselo",
+    "lanzalo no mas",
+    "lanzalo nomas",
+    "lanselo no mas",
+    "lanselo nomas",
+    "lansalo no mas",
+    "lansalo nomas",
+    "procede con el desarrollo",
+    "adelante con el desarrollo",
+];
+
 /// Clasifica una consulta como ligera o pesada mediante heurística pura.
 pub fn classify_workload(query: &str) -> Workload {
     let lower = query.to_lowercase();
     if contains_any(&lower, LIGHT_OVERRIDES) {
         return Workload::Light;
+    }
+    if is_dev_task(query) {
+        return Workload::Heavy;
     }
     if contains_any(&lower, HEAVY_OVERRIDES) {
         return Workload::Heavy;
@@ -119,6 +178,53 @@ pub fn classify_workload(query: &str) -> Workload {
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+/// Normaliza un texto para comparación por palabras completas: minúsculas, sin
+/// tildes (`ñ` → `n`, `ü` → `u`), no alfanuméricos → espacio, espacios
+/// colapsados y un espacio al inicio y al final.
+fn normalize_words(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push(' ');
+    let mut prev_space = true;
+    for c in text.to_lowercase().chars() {
+        let c = match c {
+            'á' => 'a',
+            'é' => 'e',
+            'í' => 'i',
+            'ó' => 'o',
+            'ú' | 'ü' => 'u',
+            'ñ' => 'n',
+            other => other,
+        };
+        if c.is_alphanumeric() {
+            out.push(c);
+            prev_space = false;
+        } else if !prev_space {
+            out.push(' ');
+            prev_space = true;
+        }
+    }
+    if !prev_space {
+        out.push(' ');
+    }
+    out
+}
+
+/// `true` si `normalized` contiene alguna `needle` como palabra o frase completa.
+fn contains_phrase(normalized: &str, needles: &[&str]) -> bool {
+    needles
+        .iter()
+        .any(|needle| normalized.contains(&format!(" {needle} ")))
+}
+
+/// `true` si la consulta es una tarea de desarrollo o una aprobación de
+/// lanzamiento (Issue #7): una aprobación explícita, o un verbo y un objeto de
+/// desarrollo juntos.
+pub fn is_dev_task(query: &str) -> bool {
+    let normalized = normalize_words(query);
+    contains_phrase(&normalized, DEV_OVERRIDES)
+        || (contains_phrase(&normalized, DEV_VERBS) && contains_phrase(&normalized, DEV_NOUNS))
 }
 
 /// Estado del ciclo de vida de una tarea.
@@ -222,6 +328,9 @@ impl SpeechQueueHandle {
 
 /// Título corto para el encabezado hablado ("Sobre tus correos: …").
 pub fn task_title(query: &str) -> String {
+    if is_dev_task(query) {
+        return "el desarrollo".to_string();
+    }
     let lower = query.to_lowercase();
     let known: &[(&[&str], &str)] = &[
         (&["correo", "bandeja", "inbox", "gmail"], "tus correos"),
@@ -259,6 +368,47 @@ pub fn task_prompt(query: &str) -> String {
          RESUMEN_HABLADO: como mucho 60 palabras, en español, sin markdown.\n\
          DETALLE: el resultado completo en markdown."
     )
+}
+
+/// Prompt del subagente de desarrollo (Issue #7): a diferencia de
+/// [`task_prompt`] (solo lectura), este subagente sí ejecuta la tarea técnica
+/// (análisis, código, pruebas o pipelines). `proposal_context` es la última
+/// respuesta del asistente que el usuario está aprobando.
+pub fn dev_task_prompt(query: &str, proposal_context: Option<&str>) -> String {
+    let mut prompt = String::from(
+        "Eres un subagente de ingeniería y desarrollo de Jarvis. Ejecuta la tarea \
+         técnica solicitada por el usuario (análisis, modificación de código, \
+         ejecución de pruebas o pipelines según corresponda).",
+    );
+    if let Some(context) = proposal_context.map(str::trim) {
+        if !context.is_empty() {
+            prompt.push_str("\nPropuesta previa de Jarvis que el usuario está aprobando:\n");
+            prompt.push_str(last_chars(context, 4_000));
+            prompt.push('\n');
+        }
+    }
+    prompt.push_str(&format!(
+        "\nInstrucción del usuario: {query}\n\n\
+         Responde exactamente con dos secciones:\n\
+         RESUMEN_HABLADO: como mucho 60 palabras, en español, sin markdown, \
+         indicando qué se realizó y el resultado.\n\
+         DETALLE: el resultado completo, cambios o logs en markdown."
+    ));
+    prompt
+}
+
+/// Últimos `max_chars` caracteres de `s`, cortando en frontera de `char` para
+/// no partir nunca un carácter UTF-8.
+fn last_chars(s: &str, max_chars: usize) -> &str {
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s;
+    }
+    let skip = count - max_chars;
+    s.char_indices()
+        .nth(skip)
+        .map(|(idx, _)| &s[idx..])
+        .unwrap_or("")
 }
 
 /// Convierte el texto completo de una tarea en `(resumen, detalle)`.
@@ -824,6 +974,101 @@ mod tests {
             classify_workload("revisa mis correos pero dime ya"),
             Workload::Light
         );
+    }
+
+    #[test]
+    fn dev_orders_classify_as_heavy() {
+        for query in [
+            "Lanza el desarrollo",
+            "Perfecto. Me parece correcto. Lánselo no más. Sin problema.",
+            "Perfecto, lánzalo nomás",
+            "Inicia el pipeline de pruebas",
+            "Desarrolla la nueva funcionalidad",
+            "orquesta el swarm",
+            "adelante con el desarrollo",
+        ] {
+            assert_eq!(
+                classify_workload(query),
+                Workload::Heavy,
+                "debe ser pesada: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn dev_keywords_do_not_create_false_positives() {
+        for query in [
+            "busca la tarea de matemáticas",
+            "cuál es la iniciativa del proyecto",
+            "la procedencia del vino",
+            "reserva la suite del hotel",
+            "dale no más",
+            "procede no más",
+            "construyendo una casa",
+        ] {
+            assert_eq!(
+                classify_workload(query),
+                Workload::Light,
+                "debe ser ligera: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_dev_task_accepts_orders_and_rejects_negatives() {
+        for query in [
+            "Lanza el desarrollo",
+            "Perfecto, lánzalo nomás",
+            "procede con el desarrollo",
+        ] {
+            assert!(is_dev_task(query), "{query}");
+        }
+        for query in [
+            "busca la tarea de matemáticas",
+            "cuál es la iniciativa del proyecto",
+            "la procedencia del vino",
+            "reserva la suite del hotel",
+            "dale no más",
+            "procede no más",
+            "construyendo una casa",
+        ] {
+            assert!(!is_dev_task(query), "{query}");
+        }
+    }
+
+    #[test]
+    fn dev_task_prompt_with_and_without_context() {
+        let query = "Lanza el desarrollo";
+        let plain = dev_task_prompt(query, None);
+        assert!(plain.contains(query));
+        assert!(plain.contains("RESUMEN_HABLADO"));
+        assert!(plain.contains("DETALLE"));
+        assert!(!plain.contains("Propuesta previa"));
+        assert!(!plain.contains("Solo lees y resumes"));
+
+        let with_ctx = dev_task_prompt(query, Some("Propuesta de cambios en el pipeline"));
+        assert!(with_ctx.contains(query));
+        assert!(with_ctx.contains("Propuesta previa de Jarvis"));
+        assert!(with_ctx.contains("Propuesta de cambios en el pipeline"));
+    }
+
+    #[test]
+    fn dev_task_prompt_truncates_long_utf8_context_without_panicking() {
+        let context = "ñ".repeat(5_000);
+        let prompt = dev_task_prompt("Lanza el desarrollo", Some(&context));
+        // Se conservan los últimos 4000 caracteres y la consulta sigue íntegra
+        // (el texto fijo del prompt ya trae alguna "ñ": "español").
+        let base = dev_task_prompt("Lanza el desarrollo", None)
+            .matches('ñ')
+            .count();
+        assert_eq!(prompt.matches('ñ').count() - base, 4_000);
+        assert!(prompt.contains("Lanza el desarrollo"));
+    }
+
+    #[test]
+    fn dev_task_title_is_stable() {
+        assert_eq!(task_title("Lanza el desarrollo"), "el desarrollo");
+        assert_eq!(task_title("Perfecto, lánzalo nomás"), "el desarrollo");
     }
 
     #[test]

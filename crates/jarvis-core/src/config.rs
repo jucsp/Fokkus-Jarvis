@@ -40,6 +40,9 @@ pub const TASKS_PARALLEL_RANGE: std::ops::RangeInclusive<u8> = 1..=4;
 /// Timeout por tarea pesada, en segundos (HU-37).
 pub const TASKS_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 60..=3_600;
 
+/// Timeout del cerebro CLI síncrono, en segundos (Issue #7).
+pub const CLI_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 30..=1_800;
+
 /// Hueco de silencio para entregar resultados de tareas, en milisegundos (HU-37).
 pub const TASKS_QUIET_GAP_RANGE: std::ops::RangeInclusive<u32> = 500..=5_000;
 
@@ -161,6 +164,9 @@ pub struct JarvisConfig {
     /// default 1500).
     #[serde(default = "default_tasks_quiet_gap_ms")]
     tasks_quiet_gap_ms: u32,
+    /// Timeout del cerebro CLI síncrono en segundos (30–1800, default 120).
+    #[serde(default = "default_cli_timeout_secs")]
+    cli_timeout_secs: u32,
     /// Mostrar burbujas de conversación efímeras (HUD) sobre la esfera (HU-36).
     #[serde(default = "default_hud_enabled")]
     hud_enabled: bool,
@@ -234,6 +240,10 @@ fn default_tasks_quiet_gap_ms() -> u32 {
     1_500
 }
 
+fn default_cli_timeout_secs() -> u32 {
+    120
+}
+
 fn default_hud_enabled() -> bool {
     true
 }
@@ -262,6 +272,7 @@ impl Default for JarvisConfig {
             tasks_max_parallel: 2,
             tasks_timeout_secs: 900,
             tasks_quiet_gap_ms: 1_500,
+            cli_timeout_secs: 120,
             hud_enabled: true,
             hud_max_bubbles: 3,
             automation: AutomationConfig::default(),
@@ -365,6 +376,11 @@ impl JarvisConfig {
         self
     }
 
+    pub fn with_cli_timeout_secs(mut self, value: u32) -> Self {
+        self.cli_timeout_secs = value;
+        self
+    }
+
     pub fn with_hud_enabled(mut self, enabled: bool) -> Self {
         self.hud_enabled = enabled;
         self
@@ -443,6 +459,12 @@ impl JarvisConfig {
             .clamp(*TASKS_QUIET_GAP_RANGE.start(), *TASKS_QUIET_GAP_RANGE.end())
     }
 
+    /// Timeout del cerebro CLI síncrono en segundos, saturado a 30–1800.
+    pub fn cli_timeout_secs(&self) -> u32 {
+        self.cli_timeout_secs
+            .clamp(*CLI_TIMEOUT_RANGE.start(), *CLI_TIMEOUT_RANGE.end())
+    }
+
     /// `true` si el HUD de burbujas de conversación está habilitado (HU-36).
     pub fn hud_enabled(&self) -> bool {
         self.hud_enabled
@@ -515,6 +537,15 @@ impl JarvisConfig {
                 self.tasks_quiet_gap_ms
             );
             self.tasks_quiet_gap_ms = quiet_gap;
+        }
+
+        let cli_timeout = self.cli_timeout_secs();
+        if cli_timeout != self.cli_timeout_secs {
+            eprintln!(
+                "[config] cli_timeout_secs fuera de rango ({}): se satura a {cli_timeout}",
+                self.cli_timeout_secs
+            );
+            self.cli_timeout_secs = cli_timeout;
         }
 
         let hud_bubbles = self.hud_max_bubbles();
@@ -958,6 +989,52 @@ mod tests {
         assert_eq!(loaded.tasks_timeout_secs(), 60);
         assert_eq!(loaded.tasks_quiet_gap_ms(), 5_000);
         cleanup(&path);
+    }
+
+    #[test]
+    fn cli_timeout_defaults_and_builder() {
+        let config = JarvisConfig::default();
+        assert_eq!(config.cli_timeout_secs(), 120);
+
+        let config = config.with_cli_timeout_secs(300);
+        assert_eq!(config.cli_timeout_secs(), 300);
+    }
+
+    #[test]
+    fn cli_timeout_roundtrip_through_toml() {
+        let path = temp_config_path("cli-timeout-roundtrip");
+        cleanup(&path);
+        let config = JarvisConfig {
+            cli_timeout_secs: 240,
+            ..JarvisConfig::default()
+        };
+        config.save_to(&path).unwrap();
+        let toml = std::fs::read_to_string(&path).unwrap();
+        assert!(toml.contains("cli_timeout_secs = 240"), "{toml}");
+
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded, config);
+        assert_eq!(loaded.cli_timeout_secs(), 240);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn out_of_range_cli_timeout_saturates_on_load() {
+        let path = temp_config_path("cli-timeout-sat");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "cli_timeout_secs = 5\n").unwrap();
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.cli_timeout_secs(), 30);
+        cleanup(&path);
+
+        let path2 = temp_config_path("cli-timeout-sat2");
+        cleanup(&path2);
+        std::fs::create_dir_all(path2.parent().unwrap()).unwrap();
+        std::fs::write(&path2, "cli_timeout_secs = 99999\n").unwrap();
+        let loaded2 = JarvisConfig::load_from(&path2).unwrap();
+        assert_eq!(loaded2.cli_timeout_secs(), 1_800);
+        cleanup(&path2);
     }
 
     #[test]
