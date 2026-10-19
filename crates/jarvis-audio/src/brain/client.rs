@@ -64,6 +64,11 @@ pub const SYSTEM_PROMPT: &str = concat!(
     "para capturar y ver la pantalla ejecuta fokkus-jarvis capture [ruta.png]. ",
     "Cuando el usuario te pida escribir en pantalla, interactuar con cajas de texto, ",
     "buscadores o hacer clic, USA estas herramientas para realizar la acción directamente. ",
+    "Si el usuario te pide desarrollos, construir software, ejecutar pipelines, ",
+    "refactorizaciones o tareas técnicas de programación, NUNCA las ejecutes de forma ",
+    "síncrona en este turno; despáchalas de inmediato ejecutando fokkus-jarvis dev run ",
+    "\"<descripción clara y completa de la tarea>\" y responde en una frase breve que el ",
+    "desarrollo partió en segundo plano y que avisarás al terminar. ",
     "Constitución de privacidad, sin excepciones: tienes PROHIBIDO de forma ABSOLUTA leer, ",
     "listar, buscar, copiar, mover, modificar o borrar cualquier cosa dentro de ~/Imágenes/, ",
     "~/Images/, ~/Pictures/, ~/Documentos/, ~/Documents/, ~/Videos/, ~/Música/, ~/Music/, ",
@@ -625,6 +630,12 @@ mod tests {
         }
         // La prohibición vieja hacía que el LLM se negara a escribir.
         assert!(!SYSTEM_PROMPT.contains("NUNCA intentes ejecutar comandos de consola"));
+    }
+
+    #[test]
+    fn system_prompt_exposes_background_dev_dispatch() {
+        assert!(SYSTEM_PROMPT.contains("fokkus-jarvis dev run"));
+        assert!(SYSTEM_PROMPT.contains("segundo plano"));
     }
 
     #[test]

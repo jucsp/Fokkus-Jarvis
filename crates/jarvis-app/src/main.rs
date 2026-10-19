@@ -51,7 +51,7 @@ use jarvis_core::{
     sphere_size_for_pct, FullscreenBehavior, JarvisConfig, JarvisCore, Opacity, SharedCore,
 };
 use jarvis_ipc::{
-    speech_priority, IpcError, IpcServer, ServerState, SpeechSink, TaskPort, Utterance,
+    speech_priority, IpcClient, IpcError, IpcServer, ServerState, SpeechSink, TaskPort, Utterance,
 };
 use jarvis_shell::{
     HeadlessSurface, OverlayOptions, OverlaySurface, ShellCommand, SurfaceError, SurfaceSize,
@@ -80,6 +80,8 @@ enum CliAction {
     Input(InputAction),
     /// `capture [ruta]`: guarda la pantalla activa como PNG (HU-38).
     Capture(PathBuf),
+    /// `dev run <tarea>`: despacha un desarrollo al gestor de tareas (HU-37).
+    DevRun(String),
 }
 
 /// Resultado de una sonda de salud sobre un subsistema.
@@ -165,11 +167,8 @@ impl TaskPort for VoiceTaskPort {
         } else {
             title
         };
-        self.0.submit(
-            title,
-            jarvis_audio::tasks::task_prompt(&prompt),
-            TaskOrigin::Ipc,
-        )
+        let prompt = ipc_task_prompt(&title, &prompt);
+        self.0.submit(title, prompt, TaskOrigin::Ipc)
     }
 
     fn list(&self) -> Vec<serde_json::Value> {
@@ -192,6 +191,17 @@ impl TaskPort for VoiceTaskPort {
             .get(id)
             .is_some_and(|r| matches!(r.status, TaskStatus::Queued | TaskStatus::Running));
         active && self.0.cancel(id)
+    }
+}
+
+/// Elige el *prompt* del subagente según el título de la tarea despachada por
+/// IPC: los desarrollos usan el prompt de ingeniería (que sí ejecuta), el resto
+/// conserva el prompt de solo lectura (HU-37).
+fn ipc_task_prompt(title: &str, prompt: &str) -> String {
+    if title == jarvis_audio::tasks::DEV_TASK_TITLE {
+        jarvis_audio::tasks::dev_task_prompt(prompt, None)
+    } else {
+        jarvis_audio::tasks::task_prompt(prompt)
     }
 }
 
@@ -221,6 +231,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Run) => run(),
         Ok(CliAction::Input(action)) => run_input(action),
         Ok(CliAction::Capture(path)) => run_capture(&path),
+        Ok(CliAction::DevRun(task)) => run_dev_task(&task),
         Err(message) => {
             eprintln!("{message}");
             print_usage();
@@ -238,6 +249,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         Some("-h" | "--help") => Ok(CliAction::Help),
         Some("--set-api-key") => Ok(CliAction::SetApiKey),
         Some("input") => parse_input(&args[1..]).map(CliAction::Input),
+        Some("dev") => parse_dev(&args[1..]).map(CliAction::DevRun),
         Some("capture") => match &args[1..] {
             [] => Ok(CliAction::Capture(PathBuf::from(DEFAULT_CAPTURE_PATH))),
             [path] => Ok(CliAction::Capture(PathBuf::from(path))),
@@ -285,6 +297,22 @@ fn parse_input(args: &[String]) -> Result<InputAction, String> {
     }
 }
 
+/// `dev run <palabras…>`: une la tarea con espacios y la despacha en segundo
+/// plano. La tarea viaja cruda; el servidor construye el *prompt* (HU-37).
+fn parse_dev(args: &[String]) -> Result<String, String> {
+    match args.split_first() {
+        Some((verb, rest)) if verb == "run" => {
+            let task = rest.join(" ").trim().to_string();
+            if task.is_empty() {
+                Err("uso: dev run <tarea>".into())
+            } else {
+                Ok(task)
+            }
+        }
+        _ => Err("uso: dev run <tarea>".into()),
+    }
+}
+
 /// Texto de ayuda del binario.
 fn print_usage() {
     println!("Uso: jarvis [OPCIONES]");
@@ -302,6 +330,9 @@ fn print_usage() {
     println!("  input click [x y]           Clic en (x, y) o donde esté el puntero.");
     println!("  capture [ruta.png]          Captura la pantalla activa (por defecto");
     println!("                              {DEFAULT_CAPTURE_PATH}).");
+    println!();
+    println!("Desarrollo en segundo plano:");
+    println!("  dev run <tarea>             Despacha un desarrollo al gestor de tareas.");
     println!();
     println!("Sin opciones, arranca Fokkus-Jarvis, levanta el servidor IPC y deja");
     println!("el socket listo para conexiones de Fokkus IDE.");
@@ -399,6 +430,31 @@ fn run_capture(path: &std::path::Path) -> ExitCode {
     }
     println!("{}", path.display());
     ExitCode::SUCCESS
+}
+
+/// `fokkus-jarvis dev run <tarea>`: despacha el desarrollo al gestor de tareas
+/// del orquestador a través del socket IPC y cierra el turno en segundos.
+fn run_dev_task(task: &str) -> ExitCode {
+    let mut client = match IpcClient::connect_default() {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("No se pudo conectar con Jarvis (¿está corriendo?): {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match client.dispatch_task(jarvis_audio::tasks::DEV_TASK_TITLE, task) {
+        Ok(result) => {
+            println!(
+                "Desarrollo #{} despachado en segundo plano ({}).",
+                result.id, result.status
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("No se pudo despachar el desarrollo: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Recarga `config.toml` tras guardar el formulario y aplica en caliente el
@@ -1387,5 +1443,30 @@ mod tests {
             Ok(CliAction::Capture(PathBuf::from("/home/x/p.png")))
         );
         assert!(parse_args(&args(&["capture", "a.png", "b.png"])).is_err());
+    }
+
+    #[test]
+    fn dev_run_parses_joined_task() {
+        assert_eq!(
+            parse_args(&args(&["dev", "run", "refactoriza", "el", "parser"])),
+            Ok(CliAction::DevRun("refactoriza el parser".into()))
+        );
+    }
+
+    #[test]
+    fn dev_run_rejects_bad_usage() {
+        for bad in [&["dev"][..], &["dev", "run"], &["dev", "foo", "x"]] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ipc_task_prompt_selects_dev_or_read_only_prompt() {
+        let dev = ipc_task_prompt(jarvis_audio::tasks::DEV_TASK_TITLE, "x");
+        assert!(dev.contains("subagente de ingeniería"), "{dev}");
+        assert!(!dev.contains("Solo lees"), "{dev}");
+
+        let read_only = ipc_task_prompt("tus correos", "x");
+        assert!(read_only.contains("Solo lees"), "{read_only}");
     }
 }

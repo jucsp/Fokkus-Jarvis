@@ -326,10 +326,16 @@ impl SpeechQueueHandle {
     }
 }
 
+/// Título estable de las tareas de desarrollo (Issue #7). Lo comparten la
+/// heurística de voz y el puerto IPC, de modo que el servidor reconoce un
+/// desarrollo despachado por `fokkus-jarvis dev run` y elige el *prompt* de
+/// ingeniería.
+pub const DEV_TASK_TITLE: &str = "el desarrollo";
+
 /// Título corto para el encabezado hablado ("Sobre tus correos: …").
 pub fn task_title(query: &str) -> String {
     if is_dev_task(query) {
-        return "el desarrollo".to_string();
+        return DEV_TASK_TITLE.to_string();
     }
     let lower = query.to_lowercase();
     let known: &[(&[&str], &str)] = &[
@@ -1067,8 +1073,8 @@ mod tests {
 
     #[test]
     fn dev_task_title_is_stable() {
-        assert_eq!(task_title("Lanza el desarrollo"), "el desarrollo");
-        assert_eq!(task_title("Perfecto, lánzalo nomás"), "el desarrollo");
+        assert_eq!(task_title("Lanza el desarrollo"), DEV_TASK_TITLE);
+        assert_eq!(task_title("Perfecto, lánzalo nomás"), DEV_TASK_TITLE);
     }
 
     #[test]

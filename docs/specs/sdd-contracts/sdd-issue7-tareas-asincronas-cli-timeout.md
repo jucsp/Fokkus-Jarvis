@@ -224,3 +224,50 @@ Habiendo revisado las observaciones de arquitectura de Claude PM/QA, se definen 
 - ⚠️ **Seguridad (B-2):** `dev_task_prompt` permite al subagente ejecutar acciones con efecto, y basta una frase de voz para dispararlo. La propuesta previa del asistente puede incluir contenido que vino de datos externos (inyección indirecta). El riesgo lo aceptó el PO; se recomienda una confirmación hablada o una lista blanca de repositorios en una iteración siguiente.
 - ℹ️ Si el usuario interrumpe la respuesta (barge-in), `last_assistant_response` conserva la respuesta anterior completa y no la propuesta interrumpida.
 - ⏳ **Commit, tag `v0.2.26` y release:** pendientes de autorización explícita del usuario (C-7, regla de protección de git).
+
+---
+
+## 7. Addendum: Fallback de Despacho Desacoplado vía Tool (`fokkus-jarvis dev run`)
+
+### 7.1. Motivación y Alcance
+Si el usuario emite una instrucción de desarrollo usando modismos o frases no contempladas en las listas de `is_dev_task` (por ejemplo: *"vamos con esa idea"*, *"arranca la refactorización acordada"*, *"haz los cambios que me propusiste"*), el turno no es interceptado por la heurística y llega al cerebro conversacional (`converse()`).
+
+Para evitar que el agente ejecute la tarea de forma síncrona y sobrepase el timeout del turno conversacional, se introduce un mecanismo de **fallback cognitivo asistido por herramientas**:
+
+1. **Tool / Subcomando CLI (`fokkus-jarvis dev run <tarea...>`):**
+   - El binario `fokkus-jarvis` expone `dev run <tarea...>`.
+   - Se conecta al servidor IPC local de Jarvis (`~/.fokkus/jarvis.sock`) vía `JarvisClient::connect_default()`.
+   - Despacha la tarea mediante `client.dispatch_task("el desarrollo", &dev_prompt)` hacia el `TaskManager` en segundo plano.
+   - Imprime la confirmación del despacho por stdout.
+
+2. **Instrucción en el Prompt Base (`SYSTEM_PROMPT`):**
+   - Se instruye al cerebro conversacional:
+     > *"Pueden existir frases o indicaciones donde el usuario te solicite realizar desarrollos, construir software, ejecutar pipelines, refactorizaciones o tareas técnicas de programación (pueden ser breves o extensas). En dicho caso, NUNCA ejecutes el desarrollo de forma síncrona en este turno conversacional ni bloquees la respuesta: despáchalo de inmediato en segundo plano ejecutando la herramienta: `fokkus-jarvis dev run \"<descripción clara y completa de la tarea a desarrollar>\"`; y responde al usuario confirmando de inmediato en una frase breve que el desarrollo fue iniciado en segundo plano y que le avisarás apenas termine."*
+
+3. **Cierre del Turno Conversacional:**
+   - Al ejecutar `fokkus-jarvis dev run "..."`, el subproceso CLI o la tool delega la tarea a `TaskManager`.
+   - El turno conversacional termina en 2–3 segundos confirmando al usuario verbalmente.
+   - `TaskManager` ejecuta el desarrollo de fondo en su worker desacoplado (con límite de 15 min y permisos plenos de `dev_task_prompt`), notificando el resultado al concluir vía `SpeechQueue`.
+
+
+## 8. Reporte QA del Addendum (Claude PM/QA — 2026-10-19)
+
+**Implementación:** DeepSeek V4 Pro (`--model pro`), con corrección menor de QA.
+
+| Punto | Estado |
+|---|---|
+| `fokkus-jarvis dev run <tarea...>` (`CliAction::DevRun`, `parse_dev`, `run_dev_task`, ayuda) | ✅ |
+| Despacho vía `IpcClient::connect_default()` + `dispatch_task(DEV_TASK_TITLE, tarea)` | ✅ |
+| `SYSTEM_PROMPT` instruye despacho en segundo plano con `fokkus-jarvis dev run` | ✅ |
+| Re-export de `dev_task_prompt`, `task_title` y `DEV_TASK_TITLE` en `jarvis-audio/src/lib.rs` | ✅ |
+| Tests unitarios (parseo, enrutamiento de prompt, SYSTEM_PROMPT, título) | ✅ 5 nuevos/ajustados |
+
+**Hallazgo QA corregido en el briefing (bloqueante):** `VoiceTaskPort::dispatch` envolvía todo prompt IPC con `task_prompt` (solo lectura: "no ejecutes acciones con efecto"), así que un `dev run` nunca habría desarrollado nada. Se agregó `ipc_task_prompt()`: si el título es `DEV_TASK_TITLE` ("el desarrollo") usa `dev_task_prompt`, si no conserva `task_prompt`. El CLI envía la tarea cruda para no envolverla dos veces. No cambian el trait `TaskPort` ni el protocolo IPC.
+
+**Corrección QA directa:** la entrega de DeepSeek no compilaba (E0382, `title` movido antes de `ipc_task_prompt(&title, …)`); también se corrigió el formato con `make fmt`.
+
+**Resultados:** `make test` ✅ 632 pass / 0 fail / 3 ignored · `make lint` ✅ (cargo deny ok; clippy `-D warnings` ok, solo avisos del crate externo `whisper-rs-sys`) · `make fmt-check` ✅.
+
+**Smoke CLI:** `dev run` sin tarea → `uso: dev run <tarea>` (exit 2) ✅ · con Jarvis apagado → "No se pudo conectar con Jarvis (¿está corriendo?)" (exit 1) ✅.
+
+**Pendiente:** E2E con Jarvis corriendo (frase no heurística → el LLM ejecuta `dev run` → `TaskManager` → aviso por `SpeechQueue`). Queda abierto que el LLM obedezca la instrucción: depende del modelo y no se cubre con tests unitarios.

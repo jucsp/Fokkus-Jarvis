@@ -72,8 +72,8 @@ pub use speech_queue::{
 };
 pub use stt::{SttError, Transcriber, WhisperEngine};
 pub use tasks::{
-    classify_workload, split_task_output, summarize, BrainFactory, TaskConfig, TaskId, TaskManager,
-    TaskOrigin, TaskRecord, TaskStatus, Workload,
+    classify_workload, dev_task_prompt, split_task_output, summarize, task_title, BrainFactory,
+    TaskConfig, TaskId, TaskManager, TaskOrigin, TaskRecord, TaskStatus, Workload, DEV_TASK_TITLE,
 };
 pub use tts::{EdgeTtsEngine, FillerCategory, PcmAudio, PhraseSplitter, TtsBackend, TtsError};
 pub use vad::{EndpointConfig, Endpointer, VadDetector};
