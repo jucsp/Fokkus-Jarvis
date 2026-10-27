@@ -665,7 +665,7 @@ fn run() -> ExitCode {
     }
 
     // Orquestador de voz (HU-9).
-    let mut orchestrator = engine.as_ref().and_then(|engine| {
+    let orchestrator = engine.as_ref().and_then(|engine| {
         let deps = VoiceDeps {
             core: core.clone(),
             playback: playback.clone(),
@@ -729,6 +729,11 @@ fn run() -> ExitCode {
         _ => None,
     };
 
+    // El orquestador lo comparten el `source` (estado de la esfera, carga del
+    // STT) y `on_command` (interrupción manual, HU-56): con `RefCell` ambos
+    // closures pueden consultarlo y el clic puede pedirle `&mut self`.
+    let orchestrator = RefCell::new(orchestrator);
+
     let backend = surface.backend();
     let initial_side = view.size();
     let mut on_first_frame = || {
@@ -762,7 +767,7 @@ fn run() -> ExitCode {
     // restablece el anclaje de la esfera en el siguiente frame.
     let reset_position = AtomicBool::new(false);
     let mut source = || {
-        if let Some(orchestrator) = &orchestrator {
+        if let Some(orchestrator) = orchestrator.borrow().as_ref() {
             runtime::poll_stt_loader(&mut stt_pending, |engine: WhisperEngine| {
                 orchestrator.set_transcriber(Box::new(engine))
             });
@@ -772,7 +777,8 @@ fn run() -> ExitCode {
             quick_panel.borrow_mut().take();
             match outcome {
                 settings::PanelOutcome::Saved => {
-                    if let Some(config) = apply_config(&core, orchestrator.as_ref(), &task_factory)
+                    if let Some(config) =
+                        apply_config(&core, orchestrator.borrow().as_ref(), &task_factory)
                     {
                         persisted_look.set(SphereLook::from_config(&config));
                         sphere_look.set(persisted_look.get());
@@ -815,14 +821,16 @@ fn run() -> ExitCode {
             match outcome {
                 settings::FormOutcome::Saved => {
                     // El TOML es la fuente de verdad: se relee y se aplica.
-                    if let Some(config) = apply_config(&core, orchestrator.as_ref(), &task_factory)
+                    if let Some(config) =
+                        apply_config(&core, orchestrator.borrow().as_ref(), &task_factory)
                     {
                         persisted_look.set(SphereLook::from_config(&config));
                     }
                 }
                 settings::FormOutcome::ResetPosition => {
                     // "Volver a posición inicial" también guarda el resto.
-                    if let Some(config) = apply_config(&core, orchestrator.as_ref(), &task_factory)
+                    if let Some(config) =
+                        apply_config(&core, orchestrator.borrow().as_ref(), &task_factory)
                     {
                         persisted_look.set(SphereLook::from_config(&config));
                     }
@@ -834,7 +842,16 @@ fn run() -> ExitCode {
             sphere_look.set(persisted_look.get());
         }
         let level = audio_shared.as_ref().map_or(0.0, |shared| shared.level());
-        (core.state(), level)
+        let state = core.state();
+        // Color de la esfera (HU-55): el orquestador sabe si hay un turno en
+        // captura y si quedan tareas en segundo plano; sin voz, solo el ciclo
+        // de vida.
+        let (active_turn, background) =
+            orchestrator.borrow().as_ref().map_or((false, false), |o| {
+                (o.is_active_turn(), o.has_background_tasks())
+            });
+        let visual = runtime::sphere_visual_state(state, active_turn, background);
+        (state, visual, level)
     };
     // Menú contextual de la esfera: "Salir" lo resuelve el propio bucle. El
     // orquestador aplica el silencio (micrófono liberado) en ≤ 50 ms.
@@ -872,6 +889,15 @@ fn run() -> ExitCode {
             let mut panel = quick_panel.borrow_mut();
             if panel.is_none() {
                 *panel = settings::QuickPanel::open(&config_path, None, server_state.is_muted());
+            }
+        }
+        // Interrupción manual (HU-56): un clic simple en la esfera corta la
+        // locución en el acto, sin esperar a que Jarvis termine.
+        ShellCommand::Interrupt => {
+            if let Some(orchestrator) = orchestrator.borrow_mut().as_mut() {
+                if orchestrator.interrupt() {
+                    println!("[voz] interrupción manual: locución detenida por clic en la esfera.");
+                }
             }
         }
         // Los resuelve el propio bucle.
@@ -916,7 +942,7 @@ fn run() -> ExitCode {
     drop(tray);
     surface.set_visible(false);
     drop(surface);
-    if let Some(orchestrator) = orchestrator.as_mut() {
+    if let Some(orchestrator) = orchestrator.borrow_mut().as_mut() {
         let abandoned = orchestrator.shutdown(Duration::from_millis(300));
         if !abandoned.is_empty() {
             eprintln!("[voz] hilos ocupados al salir: {}", abandoned.join(", "));

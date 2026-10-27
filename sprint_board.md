@@ -1,15 +1,42 @@
 # Sprint Board — Fokkus-Jarvis
 
-**Épica:** Épica 9 (E-12) Conversación Natural: Turn-Taking Humano y Voz Expresiva
-**Sprint:** E-12 Fase 1 (HU-41 a HU-46) — CÓDIGO COMPLETO (HU-41..46 ✅; pendientes solo pruebas manuales 🧪)
+**Épica Actual:** Épica 13 (E-13) Observabilidad Visual del Asistente y Robustez en Segundo Plano
+**Sprint:** E-13 (HU-55 a HU-58) — EN PLANIFICACIÓN / IMPLEMENTACIÓN
 **Actualizado:** 2026-10-27 · **PM/QA:** Claude · **PO:** Antigravity · **Dev:** DeepSeek
-**Contratos:** [Investigación Turn-Taking y Voz Expresiva](docs/specs/sdd-contracts/investigacion-turn-taking-voz-expresiva.md)
 
 Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere prueba manual
 
 ---
 
-## 🏃 EN CURSO: E-12 FASE 1 (Quick Wins Conversacionales y Prosodia)
+## 🏃 EN CURSO: ÉPICA 13 (E-13) — Observabilidad Visual y Robustez en Segundo Plano
+
+### HU-55 — Estados visuales de la esfera (Escucha Activa y Background Tasks) ✅
+> Verificado 2026-10-27: `make test` **740 pasados, 0 fallidos, 3 ignorados**; `make lint` (clippy `-D warnings`) y `make fmt-check` limpios. 🧪 Pendiente solo validar de vista los colores con la esfera real.
+- [x] 55.1 `jarvis-core`: `SphereVisualState` (`Idle`, `PassiveListening`, `ActiveListening`, `Thinking`, `Speaking`, `BackgroundActive`, `Muted`) con `#[default] Idle`, `From<JarvisState>` (Listening → `PassiveListening`), `ALL`, `is_listening()`/`is_background()` y re-export en `lib.rs` [Responsable: DeepSeek · fix de inferencia de tipos en el test `visual_state_default_is_idle`: Claude]
+- [x] 55.2 `jarvis-render`: `palette_for(SphereVisualState)` (Verde `#4CAF50` pasiva, Ámbar `#FFC107` activa, Naranja `#FF7043` background), `render_into(state: impl Into<SphereVisualState>)` compatible con `JarvisState`, `ActiveListening` a ×1.5 de velocidad angular [Responsable: DeepSeek]
+- [x] 55.3 `jarvis-audio`: `VoiceOrchestrator::is_active_turn()` (frase retenida tras conector o continuación esperada —publicada por `ControlLoop::reconcile` en un `AtomicBool`—, turno despachado en curso o ventana de seguimiento abierta), `active_tasks_count()` / `has_background_tasks()`; `TaskManager::active_count()` / `has_active_tasks()` sin clonar registros [Responsable: Claude]
+- [x] 55.4 `jarvis-app`: `FrameSource` devuelve `(JarvisState, SphereVisualState, AudioLevel)`; la esfera se dibuja con el estado visual y silencio/presencia/HUD/cadencia siguen con `JarvisState`. Mapeo puro `runtime::sphere_visual_state(state, active_turn, background)` usado por la clausura `source` de `main.rs` [Responsable: Claude]
+- [x] 55.5 Tests: tabla de mapeo completa (`sphere_visual_state_table_matches_hu55`), turno activo con frase retenida y ventana de seguimiento (`active_turn_tracks_held_phrase_and_follow_up_window`), tareas vivas (`background_tasks_are_reported_while_alive`, `without_task_manager_there_are_no_background_tasks`) y conteo en `TaskManager` [Responsable: Claude]
+
+### HU-56 — Calibración anti-eco en Barge-In e interrupción manual inmediata ✅
+> Verificado 2026-10-27 junto a HU-57/58: `cargo test --workspace` **747 pasados, 0 fallidos, 3 ignorados**; clippy `-D warnings` y `fmt --check` limpios. 🧪 Pendiente probar con parlante real la sensibilidad del nuevo umbral.
+- [x] 56.1 `jarvis-audio`: `evaluate_candidate` acepta voz humana con 2 frames con voz o un tercio de la ventana (antes la mitad) [Responsable: DeepSeek]
+- [x] 56.2 `jarvis-shell` / `jarvis-app`: clic simple en la esfera → `ShellCommand::Interrupt` → `VoiceOrchestrator::interrupt()` (corte acústico, cancelación del LLM, vuelta a `Listening`, `ControlMsg::Interrupt` al hilo de voz) [Responsable: Claude]
+- [x] 56.3 Tests: `simple_click_on_the_sphere_interrupts_the_utterance`, `headless_delivers_the_interrupt_command`, `manual_interrupt_cuts_the_utterance_and_returns_to_listening_hu56` (idempotente, sin efecto en reposo); regresión de eco (`own_echo_pauses_briefly_then_resumes_and_is_not_transcribed`, `without_continuation_window_the_same_voice_is_discarded_as_echo`) en verde [Responsable: Claude]
+
+### HU-57 — Subagentes ejecutores de tareas OS en segundo plano
+- [x] 57.1 `jarvis-audio`: `is_operational_task()` (`OPS_VERBS` corre/ejecuta/lanza/inicia/monitorea/deja/pon + `OPS_NOUNS` monitor/ping/contador/script/proceso/daemon/segundo plano/bash/comando) dentro de `is_dev_task()` → usan `dev_task_prompt` (ejecuta en el equipo, sin `setsid`/`disown`/`nohup` para que la cancelación mate el grupo). Título propio ("el monitor"/"el proceso") y acuse "Dejo el proceso corriendo… dime «detén el proceso»" [Responsable: Claude]
+- [ ] 57.2 `jarvis-audio`: persistencia y seguimiento de PIDs en `running_processes.json` para matar procesos hijos al cancelar [Responsable: DeepSeek]
+- [x] 57.3 `jarvis-audio`: `CancelTarget { All, Latest, Named }`; verbos cancela/detén/para/termina/aborta/mata (los no-"cancela" solo al inicio, tras muletillas) + sustantivos tarea/proceso/trabajo/monitor/ping/contador (plurales = todas). "detén el proceso" → la más reciente; "… de X" → por título. La cancelación se evalúa antes que listar tareas [Responsable: Claude]
+- [x] 57.4 Tests: `operational_tasks_use_the_executing_prompt`, `flexible_cancel_phrases_are_recognized_hu57` (incluye negativos "compra un cable para el monitor", "para qué sirve el ping"), e2e `operational_task_runs_with_the_executing_prompt_and_stops_by_voice_hu57` [Responsable: Claude]
+
+### HU-58 — Aislamiento headless de herramientas MCP
+- [x] 58.1 `jarvis-audio` (`brain/cli.rs`): `spawn` inyecta `BROWSER=/bin/true` y `NO_BROWSER=1` al CLI hijo (y por herencia a MCPs y scripts) [Responsable: Claude]
+- [x] 58.2 Test `child_runs_headless_without_browser_hu58` (el hijo ve `/bin/true|1`). 🧪 Pendiente validar con workspace-mcp real que no abre el navegador [Responsable: Claude]
+
+---
+
+## 🏁 COMPLETADO RECIENTEMENTE: E-12 FASE 1 (Quick Wins Conversacionales y Prosodia)
 
 ### HU-41 — Endpointing configurable y observable
 - [x] 41.1 Campos en `jarvis-core`: tabla `[voice_endpoint]` (`voice_open`, `voice_hold`, `silence_ms`, `extended_silence_ms`, `max_segment_ms`, `connector_grace_ms`) con serde y saturación de rangos [Responsable: DeepSeek · fix serialización `f32` corta: Claude]

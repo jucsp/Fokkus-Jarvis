@@ -26,7 +26,7 @@ pub use fullscreen::{
 };
 pub use paths::{state_dir, tasks_dir};
 pub use shared::SharedCore;
-pub use state::{JarvisState, StateMachine, StateTransition, TransitionError};
+pub use state::{JarvisState, SphereVisualState, StateMachine, StateTransition, TransitionError};
 
 /// Orquestador mínimo del núcleo: estado + configuración + bus de eventos.
 pub struct JarvisCore {
@@ -200,5 +200,13 @@ mod tests {
         core.transition(JarvisState::Speaking).unwrap();
         core.transition(JarvisState::Idle).unwrap();
         assert_eq!(core.state(), JarvisState::Idle);
+    }
+
+    #[test]
+    fn sphere_visual_state_is_reexported() {
+        // Accesible desde la raíz del crate, que es lo que consumen
+        // `jarvis-render` y `jarvis-app` (HU-55).
+        let visual: SphereVisualState = crate::SphereVisualState::from(JarvisState::Listening);
+        assert_eq!(visual, SphereVisualState::PassiveListening);
     }
 }

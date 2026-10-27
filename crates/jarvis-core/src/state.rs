@@ -51,6 +51,82 @@ impl JarvisState {
     }
 }
 
+/// Estados visuales de la esfera líquida (HU-55).
+///
+/// [`JarvisState`] describe el ciclo de vida del asistente; este enum describe
+/// lo que el usuario debe *ver*. Son dos ejes distintos a propósito: el ciclo
+/// de vida tiene cinco estados, pero visualmente hay que distinguir, por un
+/// lado, la espera pasiva de la captura de un turno (`PassiveListening` frente
+/// a `ActiveListening`) y, por otro, la presencia de tareas en segundo plano
+/// (`BackgroundActive`), que no cambia el estado de la máquina pero sí lo que
+/// conviene mostrar.
+///
+/// La conversión [`From<JarvisState>`] cubre el mapeo directo (identidad en
+/// `Idle`, `Thinking`, `Speaking` y `Muted`; `Listening` → `PassiveListening`).
+/// Los dos estados que *no* se deducen del ciclo de vida los decide quien
+/// conoce el contexto: el orquestador sabe si hay un turno abierto
+/// (`ActiveListening`) y si quedan tareas activas (`BackgroundActive`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SphereVisualState {
+    /// Sin actividad; esperando wake-word / atajo. Cian.
+    #[default]
+    Idle,
+    /// Escuchando en reposo, sin turno abierto (verde esmeralda).
+    PassiveListening,
+    /// Capturando un turno en vivo tras el wake-word o en ventana de
+    /// seguimiento (amarillo ámbar).
+    ActiveListening,
+    /// Procesando el comando con el LLM o herramientas (púrpura).
+    Thinking,
+    /// Reproduciendo la respuesta por voz (azul).
+    Speaking,
+    /// Hay subagentes o tareas activas en segundo plano (naranja cálido).
+    BackgroundActive,
+    /// Silenciado globalmente (gris).
+    Muted,
+}
+
+impl SphereVisualState {
+    /// Todos los estados, útil para recorridos exhaustivos en tests y render.
+    pub const ALL: [SphereVisualState; 7] = [
+        SphereVisualState::Idle,
+        SphereVisualState::PassiveListening,
+        SphereVisualState::ActiveListening,
+        SphereVisualState::Thinking,
+        SphereVisualState::Speaking,
+        SphereVisualState::BackgroundActive,
+        SphereVisualState::Muted,
+    ];
+
+    /// `true` si el estado representa escucha, pasiva o activa.
+    pub fn is_listening(self) -> bool {
+        matches!(
+            self,
+            SphereVisualState::PassiveListening | SphereVisualState::ActiveListening
+        )
+    }
+
+    /// `true` si el estado anuncia trabajo en segundo plano.
+    pub fn is_background(self) -> bool {
+        matches!(self, SphereVisualState::BackgroundActive)
+    }
+}
+
+impl From<JarvisState> for SphereVisualState {
+    fn from(state: JarvisState) -> Self {
+        match state {
+            JarvisState::Idle => SphereVisualState::Idle,
+            // El ciclo de vida solo sabe que se está capturando voz; que el
+            // turno esté abierto (y por tanto que la escucha sea activa) es
+            // contexto del orquestador.
+            JarvisState::Listening => SphereVisualState::PassiveListening,
+            JarvisState::Thinking => SphereVisualState::Thinking,
+            JarvisState::Speaking => SphereVisualState::Speaking,
+            JarvisState::Muted => SphereVisualState::Muted,
+        }
+    }
+}
+
 /// Transición de estado observada por el bus de eventos.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StateTransition {
@@ -179,5 +255,99 @@ mod tests {
             assert_eq!(s.is_speaking(), s == Speaking);
             assert_eq!(s.is_muted(), s == Muted);
         }
+    }
+
+    /// Tabla de conversión esperada, en el orden de [`JarvisState::ALL`]:
+    /// Idle, Listening, Thinking, Speaking, Muted.
+    const EXPECTED_VISUAL: [SphereVisualState; 5] = [
+        SphereVisualState::Idle,
+        SphereVisualState::PassiveListening,
+        SphereVisualState::Thinking,
+        SphereVisualState::Speaking,
+        SphereVisualState::Muted,
+    ];
+
+    #[test]
+    fn visual_state_default_is_idle() {
+        assert_eq!(SphereVisualState::default(), SphereVisualState::Idle);
+        let s: SphereVisualState = JarvisState::default().into();
+        assert_eq!(s, SphereVisualState::Idle);
+    }
+
+    #[test]
+    fn from_jarvis_state_table_is_fully_covered() {
+        for (state, expected) in JarvisState::ALL.into_iter().zip(EXPECTED_VISUAL) {
+            let got = SphereVisualState::from(state);
+            assert_eq!(got, expected, "conversión de {state:?}");
+            // La conversión debe funcionar también por `Into` (lo que consume
+            // `SphereRenderer::render_into`).
+            let via_into: SphereVisualState = state.into();
+            assert_eq!(via_into, expected);
+        }
+    }
+
+    #[test]
+    fn from_jarvis_state_never_invents_turn_or_background() {
+        // `ActiveListening` y `BackgroundActive` dependen de contexto que la
+        // máquina de estados no tiene: la conversión no debe fabricarlos.
+        for state in JarvisState::ALL {
+            let visual = SphereVisualState::from(state);
+            assert_ne!(visual, SphereVisualState::ActiveListening, "{state:?}");
+            assert!(!visual.is_background(), "{state:?} -> {visual:?}");
+        }
+    }
+
+    #[test]
+    fn visual_states_are_unique_and_complete() {
+        let mut seen = std::collections::HashSet::new();
+        for state in SphereVisualState::ALL {
+            assert!(seen.insert(state), "estado duplicado en ALL: {state:?}");
+        }
+        assert_eq!(seen.len(), SphereVisualState::ALL.len());
+        // Un representante por variante: si se añade una variante y se olvida
+        // en `ALL`, este conteo deja de cuadrar.
+        let all_variants = [
+            SphereVisualState::Idle,
+            SphereVisualState::PassiveListening,
+            SphereVisualState::ActiveListening,
+            SphereVisualState::Thinking,
+            SphereVisualState::Speaking,
+            SphereVisualState::BackgroundActive,
+            SphereVisualState::Muted,
+        ];
+        assert_eq!(all_variants.len(), SphereVisualState::ALL.len());
+        for state in all_variants {
+            assert!(seen.contains(&state), "variante fuera de ALL: {state:?}");
+        }
+    }
+
+    #[test]
+    fn visual_state_predicates_match_state() {
+        // (estado, es escucha, es background)
+        let cases = [
+            (SphereVisualState::Idle, false, false),
+            (SphereVisualState::PassiveListening, true, false),
+            (SphereVisualState::ActiveListening, true, false),
+            (SphereVisualState::Thinking, false, false),
+            (SphereVisualState::Speaking, false, false),
+            (SphereVisualState::BackgroundActive, false, true),
+            (SphereVisualState::Muted, false, false),
+        ];
+        for (state, listening, background) in cases {
+            assert_eq!(state.is_listening(), listening, "{state:?}");
+            assert_eq!(state.is_background(), background, "{state:?}");
+        }
+        // Un caso por variante: si se añade una y se olvida aquí, no cuadra.
+        assert_eq!(cases.len(), SphereVisualState::ALL.len());
+    }
+
+    #[test]
+    fn visual_states_are_hashable_and_copyable() {
+        let mut counts = std::collections::HashMap::new();
+        for state in SphereVisualState::ALL {
+            *counts.entry(state).or_insert(0u32) += 1;
+        }
+        assert_eq!(counts.len(), SphereVisualState::ALL.len());
+        assert!(counts.values().all(|&c| c == 1));
     }
 }

@@ -307,6 +307,11 @@ impl CliBrain {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("NO_COLOR", "1")
+            // HU-58: el subagente corre sin interfaz. Ningún MCP (p. ej. el de
+            // Google Workspace) ni script hijo debe abrir un navegador
+            // (`xdg-open`, `webbrowser.open`) en medio de la pantalla.
+            .env("BROWSER", "/bin/true")
+            .env("NO_BROWSER", "1")
             .spawn()
             .map_err(|e| BrainError::Cli(format!("no se pudo ejecutar `{}`: {e}", self.program)))
     }
@@ -476,6 +481,14 @@ mod tests {
         let second = brain.stream("y mañana", &mut |_| {}).unwrap();
         assert!(second.text.contains("Conversación previa:"));
         assert!(second.text.contains("Usuario: qué hora es"));
+    }
+
+    #[test]
+    fn child_runs_headless_without_browser_hu58() {
+        // El prompt va como `$0`: el script solo imprime el entorno del hijo.
+        let brain = CliBrain::new("sh -c 'echo \"$BROWSER|$NO_BROWSER\"' {prompt}").unwrap();
+        let completion = brain.stream("hola", &mut |_| {}).expect("sh responde");
+        assert_eq!(completion.text.trim(), "/bin/true|1");
     }
 
     #[test]

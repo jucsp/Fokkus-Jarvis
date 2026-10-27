@@ -141,6 +141,39 @@ const DEV_NOUNS: &[&str] = &[
     "feature",
 ];
 
+/// Verbos de una tarea operacional del sistema (HU-57): dejar algo corriendo
+/// en el equipo. Sin tildes, por palabra completa.
+const OPS_VERBS: &[&str] = &[
+    "corre",
+    "correr",
+    "ejecuta",
+    "ejecutar",
+    "lanza",
+    "lanzar",
+    "inicia",
+    "iniciar",
+    "monitorea",
+    "monitorear",
+    "deja",
+    "dejar",
+    "pon",
+    "ponle",
+];
+
+/// Objetos operacionales (HU-57): junto a un verbo de [`OPS_VERBS`] piden
+/// ejecutar procesos reales en vez de describirlos.
+const OPS_NOUNS: &[&str] = &[
+    "monitor",
+    "ping",
+    "contador",
+    "script",
+    "proceso",
+    "daemon",
+    "segundo plano",
+    "bash",
+    "comando",
+];
+
 /// Aprobaciones explícitas de lanzamiento/desarrollo (Issue #7). Todo en
 /// minúsculas y sin tildes: se comparan contra el texto normalizado. No se
 /// incluyen "dale no más" ni "procede no más" aislados (afirmaciones genéricas).
@@ -222,10 +255,27 @@ fn contains_phrase(normalized: &str, needles: &[&str]) -> bool {
 /// `true` si la consulta es una tarea de desarrollo o una aprobación de
 /// lanzamiento (Issue #7): una aprobación explícita, o un verbo y un objeto de
 /// desarrollo juntos.
+///
+/// Incluye las tareas operacionales del sistema (HU-57, ver
+/// [`is_operational_task`]): ambas usan [`dev_task_prompt`], que permite al
+/// subagente ejecutar comandos.
 pub fn is_dev_task(query: &str) -> bool {
+    is_development_task(query) || is_operational_task(query)
+}
+
+/// Desarrollo propiamente tal (Issue #7): aprobación explícita o verbo y
+/// objeto de desarrollo. Es lo que recibe el título [`DEV_TASK_TITLE`].
+fn is_development_task(query: &str) -> bool {
     let normalized = normalize_words(query);
     contains_phrase(&normalized, DEV_OVERRIDES)
         || (contains_phrase(&normalized, DEV_VERBS) && contains_phrase(&normalized, DEV_NOUNS))
+}
+
+/// `true` si la consulta pide dejar corriendo un proceso del sistema (HU-57):
+/// "deja un monitor ping corriendo en segundo plano", "ejecuta el script".
+pub fn is_operational_task(query: &str) -> bool {
+    let normalized = normalize_words(query);
+    contains_phrase(&normalized, OPS_VERBS) && contains_phrase(&normalized, OPS_NOUNS)
 }
 
 /// Estado del ciclo de vida de una tarea.
@@ -335,7 +385,7 @@ pub const DEV_TASK_TITLE: &str = "el desarrollo";
 
 /// Título corto para el encabezado hablado ("Sobre tus correos: …").
 pub fn task_title(query: &str) -> String {
-    if is_dev_task(query) {
+    if is_development_task(query) {
         return DEV_TASK_TITLE.to_string();
     }
     let lower = query.to_lowercase();
@@ -344,6 +394,8 @@ pub fn task_title(query: &str) -> String {
         (&["slack"], "Slack"),
         (&["pull request", "prs"], "los pull requests"),
         (&["log"], "los logs"),
+        (&["monitor", "ping", "contador"], "el monitor"),
+        (&["proceso", "daemon", "script", "comando"], "el proceso"),
         (&["drive", "documento"], "tus documentos"),
         (&["datos"], "los datos"),
     ];
@@ -385,7 +437,11 @@ pub fn dev_task_prompt(query: &str, proposal_context: Option<&str>) -> String {
     let mut prompt = String::from(
         "Eres un subagente de ingeniería y desarrollo de Jarvis. Ejecuta la tarea \
          técnica solicitada por el usuario (análisis, modificación de código, \
-         ejecución de pruebas o pipelines según corresponda).",
+         ejecución de pruebas o pipelines según corresponda). Si te piden un \
+         proceso del sistema (monitor, ping, contador, script o comando), \
+         ejecútalo de verdad en el equipo en vez de describirlo, sin `setsid`, \
+         `disown` ni `nohup`, para que Jarvis pueda detenerlo al cancelar la \
+         tarea.",
     );
     if let Some(context) = proposal_context.map(str::trim) {
         if !context.is_empty() {
@@ -667,6 +723,25 @@ impl TaskManager {
             .into_iter()
             .filter(|r| matches!(r.status, TaskStatus::Queued | TaskStatus::Running))
             .collect()
+    }
+
+    /// Número de tareas aún vivas (`Queued` o `Running`).
+    ///
+    /// Lo consulta la esfera en cada frame (HU-55): cuenta sin clonar los
+    /// registros, a diferencia de [`active`](Self::active).
+    pub fn active_count(&self) -> usize {
+        self.inner
+            .registry
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|r| matches!(r.status, TaskStatus::Queued | TaskStatus::Running))
+            .count()
+    }
+
+    /// `true` si hay alguna tarea en cola o en curso (HU-55).
+    pub fn has_active_tasks(&self) -> bool {
+        self.active_count() > 0
     }
 
     /// Cancela todo y espera a los trabajadores hasta `deadline`; los que
@@ -1046,6 +1121,34 @@ mod tests {
     }
 
     #[test]
+    fn operational_tasks_use_the_executing_prompt() {
+        for query in [
+            "deja un monitor ping corriendo en segundo plano",
+            "puedes dejar un monitor, un simple ping corriendo en segundo plano, ponle un contador",
+            "ejecuta el comando uptime",
+            "corre un comando en bash",
+            "monitorea el proceso del servidor",
+        ] {
+            assert!(is_operational_task(query), "{query}");
+            assert!(is_dev_task(query), "{query}");
+            assert_eq!(classify_workload(query), Workload::Heavy, "{query}");
+            assert_ne!(task_title(query), DEV_TASK_TITLE, "{query}");
+        }
+        assert_eq!(
+            task_title("deja un monitor ping corriendo en segundo plano"),
+            "el monitor"
+        );
+        for query in [
+            "qué es un ping",
+            "el proceso de selección",
+            "pon música",
+            "corre la voz",
+        ] {
+            assert!(!is_operational_task(query), "{query}");
+        }
+    }
+
+    #[test]
     fn dev_task_prompt_with_and_without_context() {
         let query = "Lanza el desarrollo";
         let plain = dev_task_prompt(query, None);
@@ -1214,8 +1317,15 @@ mod tests {
             spawned: AtomicU64::new(0),
         });
         let (m, queue, dir) = manager("done", factory, 2);
+        assert!(!m.has_active_tasks());
         let id = m.submit("tus correos".into(), "p".into(), TaskOrigin::Voice);
+        // `submit` registra la tarea antes de lanzar el hilo: ya cuenta como
+        // activa (en cola o en curso) para la esfera (HU-55).
+        assert_eq!(m.active_count(), 1);
+        assert!(m.has_active_tasks());
         wait_for("done", || status(&m, id) == TaskStatus::Done);
+        assert_eq!(m.active_count(), 0);
+        assert!(!m.has_active_tasks());
         let record = m.get(id).unwrap();
         assert_eq!(
             record.spoken_summary.as_deref(),

@@ -215,6 +215,9 @@ pub enum ShellCommand {
     /// Mostrar u ocultar la esfera (clic en el icono de la bandeja). Si está
     /// oculta por cualquier motivo, la vuelve a mostrar.
     ToggleVisibility,
+    /// Interrumpir la locución en curso (HU-56): un clic simple sobre la
+    /// esfera la corta en el acto, sin esperar a que Jarvis termine.
+    Interrupt,
     /// Cerrar Fokkus-Jarvis.
     Quit,
 }

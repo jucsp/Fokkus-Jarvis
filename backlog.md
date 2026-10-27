@@ -163,6 +163,43 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
+## 🔮 Épica 13 (E-13): Observabilidad Visual del Asistente y Robustez Operativa en Segundo Plano
+
+### HU-55: Estados visuales de la esfera para Escucha Activa y Procesos en Background
+- _Contexto de negocio:_ La esfera se mantenía en verde plano tanto en espera como al capturar un turno, generando incertidumbre sobre si Jarvis estaba ignorando la frase, grabando activamente o ejecutando procesos de fondo.
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-core`, `crates/jarvis-render`, `crates/jarvis-audio`, `crates/jarvis-app`.
+- 📌 _Objetivo técnico:_
+  - Escucha Pasiva (Standby): Verde Esmeralda suave (`#4CAF50`).
+  - Escucha Activa (Turno en vivo/Follow-up): Amarillo eléctrico / Ámbar brillante (`#FFC107`).
+  - Procesos en Segundo Plano (`active_tasks > 0`): Naranja cálido (`#FF7043`).
+
+### HU-56: Calibración anti-eco en Barge-In e interrupción manual inmediata
+- _Contexto de negocio:_ Durante locuciones largas, el habla del usuario era confundida por el VAD/AEC con eco de los parlantes y descartada, impidiendo interrumpir a Jarvis con facilidad. Tampoco existía mecanismo manual para callarlo de inmediato.
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-audio/src/orchestrator.rs`, `crates/jarvis-shell`, `crates/jarvis-app`.
+- 📌 _Objetivo técnico:_
+  - Ponderación de energía vocal humana sobre retroalimentación de altavoces en `barge_in`.
+  - Soporte de corte manual instantáneo: clic izquierdo sobre la esfera durante `Speaking` (o tecla de interrupción) detiene `playback` en $\le 10$ ms.
+
+### HU-57: Subagentes ejecutores reales de procesos OS en segundo plano con control de ciclo de vida
+- _Contexto de negocio:_ Al pedirle a Jarvis monitores, contadores o pings en segundo plano, el subagente solo redactaba explicaciones teóricas en vez de ejecutar el proceso, debido a un prompt restrictivo. Además no se podían detener con la voz.
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-audio/src/tasks.rs`, `crates/jarvis-app`.
+- 📌 _Objetivo técnico:_
+  - Reconocimiento de tareas OS / scripts / monitores para no inyectar prompt descriptivo pasivo.
+  - Registro y persistencia de PIDs en `running_processes.json`.
+  - Comando verbal de terminación (*"detén el proceso"*, *"cancela la tarea"*).
+
+### HU-58: Aislamiento headless de herramientas MCP en subagentes de fondo
+- _Contexto de negocio:_ La invocación de `agy` en segundo plano cargaba MCPs sin autenticar que abrían el navegador por sorpresa en la pantalla del usuario.
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-audio/src/tasks.rs`.
+- 📌 _Objetivo técnico:_
+  - Aislamiento o flags en subagentes headless para silenciar la apertura espontánea de navegadores o interactividad gráfica no solicitada.
+
+---
+
 ## 🧾 Deuda técnica
 
 - [ ] **Cablear el pipeline de voz en el binario** (hallazgo QA v0.2.1, bloqueante para "escucha y habla"): `jarvis-app` nunca abre streams `cpal` ni lanza `spawn_dsp_thread`/VAD/`WhisperEngine`/`ClaudeClient`/salida TTS. `start_listening()` solo cambia la máquina de estados. Los componentes existen y están testeados en `jarvis-audio`; falta el orquestador captura → DSP → VAD/endpointing → STT → activación → `run_turn_streaming` → playback. Brief listo para DeepSeek V4 Pro: [`docs/specs/brief-hu9-orquestador-voz.md`](docs/specs/brief-hu9-orquestador-voz.md) (HU-ORQ-1 a HU-ORQ-5).

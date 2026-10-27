@@ -10,7 +10,7 @@ use std::f32::consts::TAU;
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use jarvis_core::{JarvisState, Opacity};
+use jarvis_core::Opacity;
 use tiny_skia::{
     Color, FillRule, GradientStop, Paint, PathBuilder, Point, RadialGradient, Shader, SpreadMode,
     Stroke, Transform,
@@ -20,6 +20,10 @@ mod hud;
 
 /// Buffer RGBA premultiplicado reutilizable con [`SphereRenderer::render_into`].
 pub use tiny_skia::Pixmap;
+
+/// Estado visual de la esfera, re-exportado para que los llamadores no tengan
+/// que depender de `jarvis-core` solo por esto (HU-55).
+pub use jarvis_core::SphereVisualState;
 
 pub use hud::{
     bubble_ttl, Bubble, BubbleStack, HudRenderer, Speaker, TextRasterizer, TurnId, FADE_IN,
@@ -39,6 +43,13 @@ const HALO_RINGS: usize = 10;
 
 /// Velocidad angular base del blob (rad/s) para la animación continua.
 const BLOB_ANIMATION_SPEED: f32 = 2.0;
+
+/// Multiplicador de velocidad cuando el turno está en captura activa (HU-55).
+///
+/// La escucha activa reutiliza la animación de `Listening`, pero gira 1.5× más
+/// rápido: a simple vista se distingue de la espera pasiva sin cambiar de
+/// paleta ni añadir elementos nuevos al render.
+const ACTIVE_LISTENING_ANIMATION_BOOST: f32 = 1.5;
 
 /// Velocidad de pulsación de la onda interna (rad/s).
 const WAVE_ANIMATION_SPEED: f32 = 3.0;
@@ -90,13 +101,20 @@ impl Palette {
     }
 }
 
-fn palette_for(state: JarvisState) -> Palette {
+/// Paleta de la esfera para cada estado visual (HU-55).
+///
+/// Los dos colores nuevos (`ActiveListening` y `BackgroundActive`) salen del
+/// pedido del usuario: el verde plano permanente no permitía saber si Jarvis
+/// estaba grabando o ignorando la frase, ni si había subagentes trabajando.
+fn palette_for(state: SphereVisualState) -> Palette {
     match state {
-        JarvisState::Idle => Palette::rgb(0, 188, 212), // cian
-        JarvisState::Listening => Palette::rgb(76, 175, 80), // verde
-        JarvisState::Thinking => Palette::rgb(156, 39, 176), // púrpura
-        JarvisState::Speaking => Palette::rgb(33, 150, 243), // azul
-        JarvisState::Muted => Palette::rgb(158, 158, 158), // gris
+        SphereVisualState::Idle => Palette::rgb(0, 188, 212), // cian
+        SphereVisualState::PassiveListening => Palette::rgb(76, 175, 80), // verde esmeralda
+        SphereVisualState::ActiveListening => Palette::rgb(255, 193, 7), // ámbar brillante
+        SphereVisualState::Thinking => Palette::rgb(156, 39, 176), // púrpura
+        SphereVisualState::Speaking => Palette::rgb(33, 150, 243), // azul
+        SphereVisualState::BackgroundActive => Palette::rgb(255, 112, 67), // naranja cálido
+        SphereVisualState::Muted => Palette::rgb(158, 158, 158), // gris
     }
 }
 
@@ -156,7 +174,17 @@ impl SphereRenderer {
     ///
     /// Conveniente para tests, snapshots y el arranque. En el bucle principal
     /// se debe usar [`SphereRenderer::render_into`] para evitar asignaciones.
-    pub fn render(&self, level: f32, state: JarvisState, t: f32) -> Result<Pixmap, RenderError> {
+    ///
+    /// `state` acepta tanto un [`SphereVisualState`] como el
+    /// [`jarvis_core::JarvisState`] de la máquina de estados: se convierte con
+    /// `Into`, así que los llamadores que solo conocen el ciclo de vida siguen
+    /// funcionando sin cambios.
+    pub fn render(
+        &self,
+        level: f32,
+        state: impl Into<SphereVisualState>,
+        t: f32,
+    ) -> Result<Pixmap, RenderError> {
         let mut pixmap = Pixmap::new(self.size, self.size)
             .ok_or(RenderError::AllocFailed { size: self.size })?;
         self.render_into(&mut pixmap, level, state, t)?;
@@ -167,11 +195,17 @@ impl SphereRenderer {
     ///
     /// El buffer debe tener exactamente `size x size` píxeles. Se limpia al
     /// inicio para que no queden restos de frames anteriores.
+    ///
+    /// `state` es `impl Into<SphereVisualState>`, de modo que se le puede pasar
+    /// directamente el `JarvisState` de la máquina de estados (conversión
+    /// transparente, HU-55) o un [`SphereVisualState`] explícito cuando el
+    /// llamador sabe más que el ciclo de vida (turno abierto, tareas en
+    /// segundo plano).
     pub fn render_into(
         &self,
         pixmap: &mut Pixmap,
         level: f32,
-        state: JarvisState,
+        state: impl Into<SphereVisualState>,
         t: f32,
     ) -> Result<(), RenderError> {
         if pixmap.width() != self.size || pixmap.height() != self.size {
@@ -181,6 +215,7 @@ impl SphereRenderer {
             });
         }
 
+        let state: SphereVisualState = state.into();
         let level = level.clamp(0.0, 1.0);
         let palette = palette_for(state);
 
@@ -205,17 +240,26 @@ impl SphereRenderer {
         Ok(())
     }
 
-    fn phase_for(state: JarvisState, t: f32) -> f32 {
-        let base = match state {
-            JarvisState::Idle => 0.0,
-            JarvisState::Listening => 0.55,
-            JarvisState::Thinking => 1.25,
-            JarvisState::Speaking => 0.95,
-            JarvisState::Muted => 0.0,
+    fn phase_for(state: SphereVisualState, t: f32) -> f32 {
+        // (fase base, velocidad angular) por estado.
+        let (base, speed) = match state {
+            SphereVisualState::Idle => (0.0, BLOB_ANIMATION_SPEED),
+            SphereVisualState::PassiveListening => (0.55, BLOB_ANIMATION_SPEED),
+            // Turno en vivo: misma base que la escucha pasiva, pero la rotación
+            // se acelera para que se note que está capturando.
+            SphereVisualState::ActiveListening => (
+                0.55,
+                BLOB_ANIMATION_SPEED * ACTIVE_LISTENING_ANIMATION_BOOST,
+            ),
+            SphereVisualState::Thinking => (1.25, BLOB_ANIMATION_SPEED),
+            SphereVisualState::Speaking => (0.95, BLOB_ANIMATION_SPEED),
+            // Tareas en segundo plano: rotación continua a velocidad base.
+            SphereVisualState::BackgroundActive => (0.35, BLOB_ANIMATION_SPEED),
+            SphereVisualState::Muted => (0.0, BLOB_ANIMATION_SPEED),
         };
         // El tiempo desplaza la fase de forma continua: los armónicos rotan y
         // la esfera "respira" incluso con nivel de audio constante (H1).
-        base + t * BLOB_ANIMATION_SPEED
+        base + t * speed
     }
 
     fn blob_radius(&self, angle: f32, level: f32, phase: f32) -> f32 {
@@ -231,7 +275,7 @@ impl SphereRenderer {
     fn build_blob_path(
         &self,
         level: f32,
-        state: JarvisState,
+        state: SphereVisualState,
         t: f32,
     ) -> Result<tiny_skia::Path, RenderError> {
         let phase = Self::phase_for(state, t);
@@ -393,10 +437,196 @@ impl OpacityFade {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jarvis_core::JarvisState;
 
     fn alpha_at(pixmap: &Pixmap, x: u32, y: u32) -> u8 {
         let idx = ((y * pixmap.width() + x) * 4 + 3) as usize;
         pixmap.data()[idx]
+    }
+
+    fn rgba_at(pixmap: &Pixmap, x: u32, y: u32) -> [u8; 4] {
+        let idx = ((y * pixmap.width() + x) * 4) as usize;
+        pixmap.data()[idx..idx + 4].try_into().unwrap()
+    }
+
+    /// Frame de `state` a `level` y tiempo `t`, con el renderer por defecto.
+    fn render_state(state: SphereVisualState, level: f32, t: f32) -> Pixmap {
+        SphereRenderer::new().render(level, state, t).unwrap()
+    }
+
+    /// Avance de fase respecto a `t = 0` (independiente de la fase base).
+    fn phase_advance(state: SphereVisualState, t: f32) -> f32 {
+        SphereRenderer::phase_for(state, t) - SphereRenderer::phase_for(state, 0.0)
+    }
+
+    /// Color RGB que la spec (HU-55) exige para cada estado visual.
+    fn expected_rgb(state: SphereVisualState) -> (u8, u8, u8) {
+        match state {
+            // cian
+            SphereVisualState::Idle => (0, 188, 212),
+            // verde esmeralda
+            SphereVisualState::PassiveListening => (76, 175, 80),
+            // ámbar brillante #FFC107
+            SphereVisualState::ActiveListening => (255, 193, 7),
+            // púrpura
+            SphereVisualState::Thinking => (156, 39, 176),
+            // azul
+            SphereVisualState::Speaking => (33, 150, 243),
+            // naranja cálido #FF7043
+            SphereVisualState::BackgroundActive => (255, 112, 67),
+            // gris
+            SphereVisualState::Muted => (158, 158, 158),
+        }
+    }
+
+    #[test]
+    fn palette_matches_spec_for_every_visual_state() {
+        for state in SphereVisualState::ALL {
+            let (r, g, b) = expected_rgb(state);
+            let p = palette_for(state);
+            let got = (p.r, p.g, p.b, p.a);
+            assert_eq!(got, (r, g, b, 255), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn active_listening_palette_is_bright_amber() {
+        let p = palette_for(SphereVisualState::ActiveListening);
+        assert_eq!((p.r, p.g, p.b), (0xFF, 0xC1, 0x07), "#FFC107");
+    }
+
+    #[test]
+    fn background_active_palette_is_warm_orange() {
+        let p = palette_for(SphereVisualState::BackgroundActive);
+        assert_eq!((p.r, p.g, p.b), (0xFF, 0x70, 0x43), "#FF7043");
+    }
+
+    #[test]
+    fn passive_listening_stays_emerald_green() {
+        // Regresión: la paleta que ya existía para `Listening` no cambia, así
+        // que un usuario con la versión anterior no ve colores distintos.
+        let p = palette_for(SphereVisualState::PassiveListening);
+        assert_eq!((p.r, p.g, p.b), (0x4C, 0xAF, 0x50), "#4CAF50");
+    }
+
+    #[test]
+    fn every_visual_state_has_a_distinct_palette() {
+        let all = SphereVisualState::ALL;
+        for (i, a) in all.into_iter().enumerate() {
+            for b in all.into_iter().skip(i + 1) {
+                let (pa, pb) = (palette_for(a), palette_for(b));
+                let ca = (pa.r, pa.g, pa.b);
+                let cb = (pb.r, pb.g, pb.b);
+                assert_ne!(ca, cb, "{a:?} y {b:?} comparten color");
+            }
+        }
+    }
+
+    #[test]
+    fn jarvis_state_conversion_keeps_previous_colours() {
+        // El mapeo transparente `JarvisState -> SphereVisualState` no puede
+        // alterar los colores que ya se veían antes de HU-55.
+        for state in JarvisState::ALL {
+            let direct = palette_for(state.into());
+            let (r, g, b) = match state {
+                JarvisState::Idle => (0, 188, 212),
+                JarvisState::Listening => (76, 175, 80),
+                JarvisState::Thinking => (156, 39, 176),
+                JarvisState::Speaking => (33, 150, 243),
+                JarvisState::Muted => (158, 158, 158),
+            };
+            assert_eq!((direct.r, direct.g, direct.b), (r, g, b), "{state:?}");
+        }
+    }
+
+    #[test]
+    fn active_listening_animates_faster_than_passive() {
+        let t = 1.0;
+        let passive = phase_advance(SphereVisualState::PassiveListening, t);
+        let active = phase_advance(SphereVisualState::ActiveListening, t);
+        let expected = t * BLOB_ANIMATION_SPEED * ACTIVE_LISTENING_ANIMATION_BOOST;
+        assert!((active - expected).abs() < 1e-6, "{active} vs {expected}");
+        assert!(active > passive * 1.49, "{active} vs {passive}");
+
+        // Sin desplazamiento temporal no hay diferencia: la base es la de
+        // `Listening` para ambos.
+        let a0 = SphereRenderer::phase_for(SphereVisualState::ActiveListening, 0.0);
+        let p0 = SphereRenderer::phase_for(SphereVisualState::PassiveListening, 0.0);
+        assert_eq!(a0, p0);
+    }
+
+    #[test]
+    fn background_active_rotates_at_base_speed() {
+        let t = 0.7;
+        let advance = phase_advance(SphereVisualState::BackgroundActive, t);
+        let expected = t * BLOB_ANIMATION_SPEED;
+        assert!((advance - expected).abs() < 1e-6, "{advance} vs {expected}");
+
+        // Rota de verdad: dos instantes distintos dan píxeles distintos.
+        let a = render_state(SphereVisualState::BackgroundActive, 0.3, 0.0);
+        let b = render_state(SphereVisualState::BackgroundActive, 0.3, 0.4);
+        assert_ne!(a.data(), b.data());
+    }
+
+    #[test]
+    fn renders_every_sphere_visual_state_without_panicking() {
+        let renderer = SphereRenderer::new();
+        for state in SphereVisualState::ALL {
+            for level in [0.0, 0.5, 1.0] {
+                for t in [0.0, 0.5, 1.0] {
+                    let pixmap = renderer.render(level, state, t).unwrap();
+                    assert_eq!(pixmap.width(), 220);
+                    assert_eq!(pixmap.height(), 220);
+                    assert!(
+                        alpha_at(&pixmap, 110, 110) > 200,
+                        "centro opaco en {state:?} (nivel {level}, t {t})"
+                    );
+                    assert_eq!(alpha_at(&pixmap, 0, 0), 0, "esquina opaca en {state:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn render_into_accepts_jarvis_state_and_sphere_visual_state() {
+        let renderer = SphereRenderer::new();
+        let mut from_jarvis = Pixmap::new(220, 220).unwrap();
+        let mut from_visual = Pixmap::new(220, 220).unwrap();
+
+        // Conversión transparente: `JarvisState` y el `SphereVisualState`
+        // equivalente deben producir exactamente el mismo frame.
+        let visual = SphereVisualState::PassiveListening;
+        renderer
+            .render_into(&mut from_jarvis, 0.4, JarvisState::Listening, 0.3)
+            .unwrap();
+        renderer
+            .render_into(&mut from_visual, 0.4, visual, 0.3)
+            .unwrap();
+        assert_eq!(from_jarvis.data(), from_visual.data());
+    }
+
+    #[test]
+    fn active_listening_is_visually_distinct_from_passive() {
+        let passive = render_state(SphereVisualState::PassiveListening, 0.0, 0.0);
+        let active = render_state(SphereVisualState::ActiveListening, 0.0, 0.0);
+
+        // El centro toma casi el color plano de la paleta: verde frente ámbar.
+        let p = rgba_at(&passive, 110, 110);
+        let a = rgba_at(&active, 110, 110);
+        assert!(p[1] > p[0], "escucha pasiva, verde: {p:?}");
+        assert!(a[0] > a[1] && a[1] > a[2], "escucha activa, ámbar: {a:?}");
+        assert_ne!(passive.data(), active.data());
+    }
+
+    #[test]
+    fn background_active_is_visually_distinct_from_idle() {
+        let idle = render_state(SphereVisualState::Idle, 0.0, 0.0);
+        let bg = render_state(SphereVisualState::BackgroundActive, 0.0, 0.0);
+        let i = rgba_at(&idle, 110, 110);
+        let b = rgba_at(&bg, 110, 110);
+        assert!(i[2] > i[0], "idle debe dominar en cian: {i:?}");
+        assert!(b[0] > b[1] && b[1] > b[2], "background, naranja: {b:?}");
+        assert_ne!(idle.data(), bg.data());
     }
 
     #[test]

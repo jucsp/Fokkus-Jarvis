@@ -6,7 +6,9 @@
 //!
 //! Puntero: la región de entrada es el círculo de la esfera (las esquinas
 //! transparentes dejan pasar los clics). Arrastrar con el botón izquierdo
-//! reposiciona la capa ajustando sus márgenes; el clic derecho emite
+//! reposiciona la capa ajustando sus márgenes; un clic simple (sin arrastre)
+//! emite [`ShellCommand::Interrupt`] para cortar la locución en curso (HU-56);
+//! el clic derecho emite
 //! [`ShellCommand::QuickPanel`] para que la aplicación abra el Panel Rápido
 //! (PyQt6) en lugar del antiguo menú nativo.
 //!
@@ -436,6 +438,13 @@ fn backend_error(e: impl std::fmt::Display) -> SurfaceError {
     SurfaceError::Backend(e.to_string())
 }
 
+/// Orden de un `release` del botón izquierdo sobre la esfera (HU-56): si la
+/// pulsación no fue un arrastre es un clic simple y lo que pide es
+/// interrumpir la locución en curso.
+fn release_command(dragged: bool) -> Option<ShellCommand> {
+    (!dragged).then_some(ShellCommand::Interrupt)
+}
+
 /// Estado despachado por la cola de eventos Wayland.
 struct LayerState {
     registry: RegistryState,
@@ -792,7 +801,11 @@ impl PointerHandler for LayerState {
                 PointerEventKind::Release {
                     button: BTN_LEFT, ..
                 } => {
-                    self.gesture.release();
+                    // Clic simple (sin arrastre): interrumpe la locución en
+                    // curso (HU-56). Arrastrar solo mueve la esfera.
+                    if let Some(command) = release_command(self.gesture.release()) {
+                        self.commands.push_back(command);
+                    }
                 }
                 PointerEventKind::Press {
                     button: BTN_RIGHT, ..
@@ -1273,6 +1286,29 @@ mod tests {
         // Pulsar y soltar sin moverse no es arrastre.
         gesture.press((10.0, 10.0));
         assert!(!gesture.release());
+    }
+
+    #[test]
+    fn simple_click_on_the_sphere_interrupts_the_utterance() {
+        // HU-56: pulsar y soltar sin arrastrar pide la interrupción.
+        let mut gesture = DragGesture::default();
+        gesture.press((100.0, 100.0));
+        assert_eq!(
+            release_command(gesture.release()),
+            Some(ShellCommand::Interrupt)
+        );
+
+        // Un arrastre (mover la esfera) no interrumpe nada.
+        gesture.press((100.0, 100.0));
+        assert!(gesture.motion((130.0, 100.0)).is_some());
+        assert_eq!(release_command(gesture.release()), None);
+
+        // Un `release` sin `press` previo tampoco es arrastre: es un clic.
+        let mut gesture = DragGesture::default();
+        assert_eq!(
+            release_command(gesture.release()),
+            Some(ShellCommand::Interrupt)
+        );
     }
 
     #[test]

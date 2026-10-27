@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.2.28
+Version:        0.2.29
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,6 +23,12 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Tue Oct 27 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.29-1
+- HU-55: estados visuales de la esfera (escucha pasiva/activa, background) con paleta y velocidad propias.
+- HU-56: barge-in anti-eco más sensible e interrupción inmediata con clic simple en la esfera.
+- HU-57: subagentes ejecutores reales de tareas OS en segundo plano (monitor/ping/contador) y cancelación flexible por voz.
+- HU-58: aislamiento headless del CLI hijo y MCPs (BROWSER=/bin/true, NO_BROWSER=1).
+
 * Mon Oct 19 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.27-1
 - Feat (Issue #7 Fallback): tool nativa 'fokkus-jarvis dev run <tarea>' e instrucción en SYSTEM_PROMPT para despacho desacoplado cognitivo de tareas de desarrollo
 

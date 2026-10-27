@@ -297,4 +297,14 @@ mod tests {
             Ok(SurfaceStatus::Running)
         );
     }
+
+    #[test]
+    fn headless_delivers_the_interrupt_command() {
+        // HU-56: el modo headless también soporta la interrupción manual.
+        let mut surface = HeadlessSurface::new(SurfaceSize::new(2, 2).unwrap());
+        assert_eq!(surface.poll_command(), None, "sin comandos pendientes");
+        surface.push_command(ShellCommand::Interrupt);
+        assert_eq!(surface.poll_command(), Some(ShellCommand::Interrupt));
+        assert_eq!(surface.poll_command(), None, "se entrega una sola vez");
+    }
 }

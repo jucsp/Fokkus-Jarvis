@@ -58,8 +58,8 @@ use crate::playback::AudioPlayback;
 use crate::speech_queue::{Delivery, DeliveryGate, SpeechPriority};
 use crate::stt::Transcriber;
 use crate::tasks::{
-    classify_workload, dev_task_prompt, is_dev_task, task_prompt, task_title, BrainFactory,
-    SpeechQueueHandle, TaskConfig, TaskManager, TaskOrigin, Workload,
+    classify_workload, dev_task_prompt, is_dev_task, is_operational_task, task_prompt, task_title,
+    BrainFactory, SpeechQueueHandle, TaskConfig, TaskManager, TaskOrigin, Workload,
 };
 use crate::tts::{strip_directives, synth_chime, FillerCategory, PcmAudio};
 
@@ -448,11 +448,11 @@ pub enum LocalCommand {
         /// Cómo se nombra en la respuesta: "Cerrando {display_name}."
         display_name: String,
     },
-    /// Cancela una o todas las tareas pesadas en curso ("cancela la tarea de
-    /// los correos" / "cancela todas las tareas").
+    /// Cancela una, la más reciente o todas las tareas pesadas en curso
+    /// ("cancela la tarea de los correos" / "detén el proceso" / "cancela
+    /// todas las tareas").
     CancelTask {
-        /// Texto que identifica la tarea; `None` = cancelarlas todas.
-        spoken_target: Option<String>,
+        target: CancelTarget,
     },
     /// Lista las tareas pesadas ("¿qué tareas tengo?").
     ListTasks,
@@ -583,8 +583,65 @@ const TIME_PHRASES: &[&str] = &[
     "que hora tienes",
 ];
 
-/// Verbos que cancelan tareas pesadas (HU-37).
+/// Qué tareas cancela [`LocalCommand::CancelTask`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelTarget {
+    /// Todas las tareas en curso ("cancela todo", "detén los procesos").
+    All,
+    /// La tarea en curso más reciente ("detén el proceso", "para la tarea").
+    Latest,
+    /// La tarea cuyo título coincide con lo dicho tras "de" ("cancela la
+    /// tarea de los correos").
+    Named(String),
+}
+
+/// Verbos que cancelan tareas pesadas en cualquier posición (HU-37).
 const CANCEL_TASK_VERBS: &[&str] = &["cancela", "cancelar", "cancelame"];
+
+/// Verbos de cancelación que solo cuentan al inicio de la orden (HU-57.3):
+/// "para"/"termina" son demasiado comunes dentro de una frase ("un cable
+/// para el monitor").
+const CANCEL_TASK_LEADING_VERBS: &[&str] = &[
+    "cancela",
+    "cancelar",
+    "cancelame",
+    "deten",
+    "detener",
+    "detenme",
+    "para",
+    "parar",
+    "parame",
+    "termina",
+    "terminar",
+    "aborta",
+    "abortar",
+    "mata",
+    "matar",
+];
+
+/// Muletillas que pueden preceder al verbo de cancelación: "ok, detén el
+/// proceso", "oye Jarvis, por favor para la tarea".
+const CANCEL_TASK_LEAD_FILLERS: &[&str] = &[
+    "ok", "okay", "vale", "bueno", "listo", "oye", "jarvis", "por", "favor", "porfa", "ya",
+    "ahora", "y", "mejor", "puedes", "podrias", "quiero", "que",
+];
+
+/// Determinantes entre el verbo de cancelación y el sustantivo.
+const CANCEL_TASK_DETERMINERS: &[&str] = &[
+    "el", "la", "los", "las", "ese", "esa", "esos", "esas", "este", "esta", "estos", "estas", "mi",
+    "mis", "tu", "tus", "un", "una",
+];
+
+/// Sustantivos que nombran una tarea pesada; los plurales cancelan todas.
+const CANCEL_TASK_NOUNS: &[&str] = &["tarea", "proceso", "trabajo", "monitor", "ping", "contador"];
+const CANCEL_TASK_PLURAL_NOUNS: &[&str] = &[
+    "tareas",
+    "procesos",
+    "trabajos",
+    "monitores",
+    "pings",
+    "contadores",
+];
 
 /// Frases que piden listar las tareas pesadas.
 const LIST_TASK_PHRASES: &[&str] = &[
@@ -871,10 +928,10 @@ pub fn local_command(query: &str) -> Option<LocalCommand> {
         Some(LocalCommand::Standby)
     } else if has(TIME_PHRASES) {
         Some(LocalCommand::Time)
-    } else if has(LIST_TASK_PHRASES) {
-        Some(LocalCommand::ListTasks)
     } else if let Some(command) = cancel_task_command(&text) {
         Some(command)
+    } else if has(LIST_TASK_PHRASES) {
+        Some(LocalCommand::ListTasks)
     } else if let Some(command) = web_or_automation_command(query) {
         Some(command)
     } else {
@@ -902,33 +959,58 @@ fn is_priority_override(query: &str) -> bool {
     )
 }
 
-/// Reconoce "cancela la tarea de …" o "cancela todas las tareas".
+/// Reconoce "cancela la tarea de …", "detén el proceso" o "cancela todas
+/// las tareas" (HU-37, HU-57.3). "Cancela" vale en cualquier posición; el resto
+/// de verbos solo al inicio, tras muletillas.
 fn cancel_task_command(text: &str) -> Option<LocalCommand> {
     let folded = fold_accents(text);
     let words: Vec<&str> = folded.split_whitespace().collect();
-    let pos = words.iter().position(|w| CANCEL_TASK_VERBS.contains(w))?;
+    let lead = words
+        .iter()
+        .position(|w| !CANCEL_TASK_LEAD_FILLERS.contains(w))?;
+    let pos = if CANCEL_TASK_LEADING_VERBS.contains(&words[lead]) {
+        lead
+    } else {
+        words.iter().position(|w| CANCEL_TASK_VERBS.contains(w))?
+    };
+    // Tras el verbo solo caben determinantes antes del sustantivo: "detén
+    // el proceso" sí, "para qué sirve el ping" no.
     let rest = &words[pos + 1..];
-    if rest.iter().any(|w| *w == "todas" || *w == "todo") {
+    let i = rest
+        .iter()
+        .position(|w| !CANCEL_TASK_DETERMINERS.contains(w))?;
+    if rest[..=i]
+        .iter()
+        .any(|w| matches!(*w, "todas" | "todo" | "todos"))
+    {
         return Some(LocalCommand::CancelTask {
-            spoken_target: None,
+            target: CancelTarget::All,
         });
     }
-    let target = rest
-        .iter()
-        .position(|w| *w == "tarea" || *w == "tareas")
-        .and_then(|i| {
-            let after = &rest[i + 1..];
-            let mut j = 0;
-            while j < after.len()
-                && ["de", "del", "la", "las", "los", "el", "una", "un"].contains(&after[j])
-            {
+    let plural = if CANCEL_TASK_NOUNS.contains(&rest[i]) {
+        false
+    } else if CANCEL_TASK_PLURAL_NOUNS.contains(&rest[i]) {
+        true
+    } else {
+        return None;
+    };
+    let after = &rest[i + 1..];
+    let named = match after.first() {
+        Some(&"de") | Some(&"del") => {
+            let mut j = 1;
+            while j < after.len() && ["la", "las", "los", "el", "una", "un"].contains(&after[j]) {
                 j += 1;
             }
             (j < after.len()).then(|| after[j..].join(" "))
-        });
-    target.map(|spoken_target| LocalCommand::CancelTask {
-        spoken_target: Some(spoken_target),
-    })
+        }
+        _ => None,
+    };
+    let target = match named {
+        Some(name) => CancelTarget::Named(name),
+        None if plural => CancelTarget::All,
+        None => CancelTarget::Latest,
+    };
+    Some(LocalCommand::CancelTask { target })
 }
 
 /// Palabra hablada: la original (mayúsculas, tildes y puntuación, para la
@@ -1483,6 +1565,8 @@ pub struct VoiceOrchestrator {
     brain_tx: Sender<BrainJob>,
     tts_tx: Sender<TtsJob>,
     threads: Vec<(&'static str, JoinHandle<()>)>,
+    /// Núcleo compartido: la interrupción manual (HU-56) lo necesita aquí.
+    core: SharedCore,
     stats: Arc<VoiceStats>,
     playback: AudioPlayback,
     brain: BrainSlot,
@@ -1492,10 +1576,18 @@ pub struct VoiceOrchestrator {
     tasks: Option<TaskManager>,
     gaming_mode: Arc<AtomicBool>,
     queue: SpeechQueueHandle,
+    /// Turno de usuario despachado y aún en curso (HU-AUDIO-CONTINUITY).
+    pending_user_turn: PendingUserTurn,
+    /// El hilo de voz tiene un turno a medio capturar: frase retenida tras un
+    /// conector o continuación esperada (HU-55). Lo publica `ControlLoop`.
+    turn_open: Arc<AtomicBool>,
 }
 
 enum ControlMsg {
     Shutdown,
+    /// Interrupción manual (clic en la esfera, HU-56): el hilo de voz olvida
+    /// la confirmación pendiente y el segmento marcado como eco.
+    Interrupt,
 }
 
 enum SttJob {
@@ -1594,6 +1686,7 @@ impl VoiceOrchestrator {
         let last_voice_activity = Arc::new(Mutex::new(None::<Instant>));
         let pending_user_turn = PendingUserTurn::default();
         let stt_in_flight = Arc::new(AtomicUsize::new(0));
+        let turn_open = Arc::new(AtomicBool::new(false));
 
         let stats = Arc::new(VoiceStats::default());
         let stt_ready = Arc::new(AtomicBool::new(false));
@@ -1689,7 +1782,7 @@ impl VoiceOrchestrator {
         }
         {
             let control = ControlLoop {
-                core,
+                core: core.clone(),
                 playback: playback.clone(),
                 capture,
                 activation: Arc::clone(&activation),
@@ -1715,6 +1808,7 @@ impl VoiceOrchestrator {
                 continuation_expected: false,
                 chime_deadline: None,
                 last_voice_activity,
+                turn_open: Arc::clone(&turn_open),
             };
             threads.push(spawn(
                 "jarvis-voice",
@@ -1728,6 +1822,7 @@ impl VoiceOrchestrator {
             brain_tx,
             tts_tx,
             threads,
+            core,
             stats,
             playback,
             brain,
@@ -1737,6 +1832,8 @@ impl VoiceOrchestrator {
             tasks,
             gaming_mode,
             queue,
+            pending_user_turn,
+            turn_open,
         })
     }
 
@@ -1744,6 +1841,30 @@ impl VoiceOrchestrator {
     /// clonable: lo usa el servidor IPC (`jarvis.dispatchTask`…).
     pub fn tasks(&self) -> Option<TaskManager> {
         self.tasks.clone()
+    }
+
+    /// `true` si hay un turno de escucha activo (HU-55): la esfera pasa de la
+    /// escucha pasiva (verde) a la captura en vivo (ámbar).
+    ///
+    /// Cuenta como turno activo la ventana de seguimiento abierta (se aceptan
+    /// frases sin repetir "Jarvis"), una frase retenida tras un conector, una
+    /// continuación esperada o un turno despachado que aún no termina.
+    pub fn is_active_turn(&self) -> bool {
+        self.turn_open.load(Ordering::Acquire)
+            || self.pending_user_turn.is_some()
+            || self.activation.is_follow_up_open()
+    }
+
+    /// Número de tareas pesadas en cola o en curso (HU-37); 0 sin gestor.
+    pub fn active_tasks_count(&self) -> usize {
+        self.tasks.as_ref().map_or(0, TaskManager::active_count)
+    }
+
+    /// `true` si hay tareas en segundo plano vivas (HU-55).
+    pub fn has_background_tasks(&self) -> bool {
+        self.tasks
+            .as_ref()
+            .is_some_and(TaskManager::has_active_tasks)
     }
 
     /// Modo juego: retiene las locuciones no críticas (CA-37.8).
@@ -1767,6 +1888,51 @@ impl VoiceOrchestrator {
     /// Activa o desactiva la interrupción por voz en caliente.
     pub fn set_barge_in(&self, enabled: bool) {
         self.barge_in.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Interrupción manual de la locución en curso (HU-56). Un clic simple en
+    /// la esfera o un atajo la cortan en el acto, sin esperar la confirmación
+    /// del barge-in por voz ni la confirmación de eco.
+    ///
+    /// Hace lo mismo que el barge-in por voz cuando Jarvis habla
+    /// ([`barge_in`]: corte acústico instantáneo + cancelación del LLM +
+    /// vuelta a `Listening`), cancela el razonamiento si aún no había audio y
+    /// ordena al hilo de voz olvidar la confirmación pendiente y el segmento
+    /// marcado como eco. Es idempotente y no toca las tareas del Swarm
+    /// (CA-9.4).
+    ///
+    /// Devuelve `true` si había algo activo (locución o razonamiento) que
+    /// interrumpir.
+    pub fn interrupt(&mut self) -> bool {
+        let state = self.core.state();
+        let speaking = state == JarvisState::Speaking;
+        let thinking = state == JarvisState::Thinking;
+        if !speaking && !thinking {
+            // Nada en curso: el clic no tiene efecto.
+            return false;
+        }
+        let current = self.brain.get();
+        let client: &dyn TokenStream = match &current {
+            Some(client) => client.as_ref(),
+            None => &NoBrain,
+        };
+        if speaking {
+            barge_in(&self.core, &self.playback, client);
+        }
+        // Corte del audio aunque el núcleo ya hubiera salido de `Speaking`
+        // (fin natural en carrera): `stop` invalida la generación en curso.
+        self.playback.stop();
+        if thinking {
+            client.cancel();
+        }
+        // Red de seguridad ante la carrera `Speaking`↔`Thinking`: la esfera
+        // vuelve a escuchar en vez de quedarse pintando "pensando".
+        for from in [JarvisState::Speaking, JarvisState::Thinking] {
+            let _ = self.core.transition_from(from, JarvisState::Listening);
+        }
+        // El hilo de voz olvida la confirmación a medias y el eco marcado.
+        let _ = self.control_tx.try_send(ControlMsg::Interrupt);
+        true
     }
 
     /// Activa o desactiva la escucha continua en caliente (HU-13).
@@ -1901,6 +2067,9 @@ struct ControlLoop {
     /// Última voz del usuario: el *gate* de la cola hablada espera un hueco
     /// de silencio tras ella (CA-37.5).
     last_voice_activity: Arc<Mutex<Option<Instant>>>,
+    /// Publica si hay un turno a medio capturar (HU-55, ver
+    /// [`VoiceOrchestrator::is_active_turn`]).
+    turn_open: Arc<AtomicBool>,
 }
 
 /// Barge-in por confirmar (ver [`ControlLoop::on_voice`]).
@@ -1955,6 +2124,7 @@ impl ControlLoop {
                 }
                 recv(control) -> msg => match msg {
                     Ok(ControlMsg::Shutdown) | Err(_) => break,
+                    Ok(ControlMsg::Interrupt) => self.on_interrupt(),
                 },
                 default(self.tick()) => {}
             }
@@ -2053,6 +2223,12 @@ impl ControlLoop {
             }
         }
         self.flush_chime();
+        // `reconcile` corre tras cada evento y cada tick: es el punto único
+        // donde se publica el turno abierto para la esfera (HU-55).
+        self.turn_open.store(
+            self.pending.is_some() || self.continuation_expected,
+            Ordering::Release,
+        );
     }
 
     /// Emite el chime diferido si venció su retardo y Jarvis sigue callado
@@ -2308,6 +2484,19 @@ impl ControlLoop {
         }
     }
 
+    /// Interrupción manual desde la superficie (HU-56): la locución ya está
+    /// cortada por [`VoiceOrchestrator::interrupt`], así que aquí solo se
+    /// olvida lo que quedaba a medias en el hilo de voz: la confirmación del
+    /// barge-in pendiente (con su pausa) y el segmento marcado como eco.
+    fn on_interrupt(&mut self) {
+        self.candidate = None;
+        self.echo_segment = false;
+        self.continuation_expected = false;
+        // La pausa solo servía para confirmar la voz que disparó el barge-in;
+        // desde aquí la locución cortada no debe reanudarse.
+        self.playback.resume();
+    }
+
     /// Muestrea el VAD con Jarvis en pausa y, al cerrar la ventana, decide.
     fn evaluate_candidate(&mut self) {
         let Some(candidate) = &mut self.candidate else {
@@ -2332,7 +2521,11 @@ impl ControlLoop {
                 .as_micros(),
         )
         .unwrap_or(u64::MAX);
-        let user_spoke = candidate.samples > 0 && candidate.voiced * 2 >= candidate.samples;
+        // HU-56: el usuario puede hablar bajo o empezar tarde dentro de la
+        // ventana. Bastan 2 frames con voz (o un tercio de la ventana) para
+        // que su voz no se confunda con el eco del altavoz.
+        let user_spoke = candidate.samples > 0
+            && (candidate.voiced * 3 >= candidate.samples || candidate.voiced >= 2);
 
         if !user_spoke {
             self.playback.resume();
@@ -2838,7 +3031,12 @@ impl BrainLoop {
         };
         self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
         let title = task_title(query);
-        let (prompt, ack) = if is_dev_task(query) {
+        let (prompt, ack) = if is_operational_task(query) {
+            (
+                dev_task_prompt(query, self.last_assistant_response.as_deref()),
+                "Dejo el proceso corriendo en segundo plano. Dime «detén el proceso» para pararlo.",
+            )
+        } else if is_dev_task(query) {
             (
                 dev_task_prompt(query, self.last_assistant_response.as_deref()),
                 "Iniciando el desarrollo en segundo plano, te aviso cuando termine.",
@@ -2857,19 +3055,32 @@ impl BrainLoop {
     }
 
     /// "Cancela la tarea de los correos" / "cancela todas las tareas".
-    fn cancel_tasks(&mut self, target: Option<&str>) {
+    fn cancel_tasks(&mut self, target: &CancelTarget) {
         self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
         let Some(tasks) = self.tasks.clone() else {
             self.say(NO_TASKS_PHRASE, AfterSpeech::Listen);
             return;
         };
         let phrase = match target {
-            None => match tasks.cancel_all() {
+            CancelTarget::All => match tasks.cancel_all() {
                 0 => "No hay tareas en curso.".to_string(),
                 1 => "Cancelé la tarea en curso.".to_string(),
                 n => format!("Cancelé {n} tareas."),
             },
-            Some(target) => {
+            CancelTarget::Latest => {
+                let latest = tasks
+                    .active()
+                    .into_iter()
+                    .max_by_key(|r| (r.created_at_ms, r.id));
+                match latest {
+                    None => "No hay tareas en curso.".to_string(),
+                    Some(record) => {
+                        tasks.cancel(record.id);
+                        format!("Detuve la tarea sobre {}.", record.title)
+                    }
+                }
+            }
+            CancelTarget::Named(target) => {
                 let active: Vec<_> = tasks.active().into_iter().map(|r| r.id).collect();
                 let matches: Vec<_> = tasks
                     .find_by_title(target)
@@ -2995,9 +3206,7 @@ impl BrainLoop {
                     }
                 }
             }
-            Some(LocalCommand::CancelTask { spoken_target }) => {
-                self.cancel_tasks(spoken_target.as_deref());
-            }
+            Some(LocalCommand::CancelTask { target }) => self.cancel_tasks(&target),
             Some(LocalCommand::ListTasks) => self.list_tasks(),
             Some(LocalCommand::StopAutomation) => self.stop_automation(),
             Some(LocalCommand::OpenUrl { url, spoken }) => {

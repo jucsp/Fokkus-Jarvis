@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, TryRecvError};
 use jarvis_audio::models::{ModelManager, ModelStatus, WHISPER_BASE_Q5_1};
 use jarvis_audio::WhisperEngine;
-use jarvis_core::{AudioLevel, JarvisConfig, JarvisState, Opacity};
+use jarvis_core::{AudioLevel, JarvisConfig, JarvisState, Opacity, SphereVisualState};
 use jarvis_render::{OpacityFade, Pixmap, RenderError, SphereRenderer};
 use jarvis_shell::{FrameBuffer, OverlaySurface, ShellCommand, SurfaceSize, SurfaceStatus};
 
@@ -176,8 +176,35 @@ pub enum LoopExit {
     MaxFrames,
 }
 
-/// Fuente del estado a dibujar en cada frame: `(estado, nivel de audio)`.
-pub type FrameSource<'a> = dyn FnMut() -> (JarvisState, AudioLevel) + 'a;
+/// Fuente del estado a dibujar en cada frame: `(estado, estado visual, nivel
+/// de audio)`.
+///
+/// El ciclo de vida ([`JarvisState`]) gobierna silencio, presencia, HUD y
+/// cadencia; el estado visual ([`SphereVisualState`], HU-55) solo el color y
+/// la animación de la esfera.
+pub type FrameSource<'a> = dyn FnMut() -> (JarvisState, SphereVisualState, AudioLevel) + 'a;
+
+/// Estado visual de la esfera a partir del ciclo de vida y del contexto del
+/// orquestador (HU-55).
+///
+/// - `Listening`: turno en captura → `ActiveListening`; si no, tareas en
+///   segundo plano → `BackgroundActive`; si no, `PassiveListening`.
+/// - `Idle`: tareas en segundo plano → `BackgroundActive`; si no, `Idle`.
+/// - `Thinking`, `Speaking` y `Muted` se muestran tal cual: el silencio y la
+///   respuesta en curso prevalecen sobre las tareas.
+pub fn sphere_visual_state(
+    state: JarvisState,
+    active_turn: bool,
+    background_tasks: bool,
+) -> SphereVisualState {
+    match state {
+        JarvisState::Listening if active_turn => SphereVisualState::ActiveListening,
+        JarvisState::Listening | JarvisState::Idle if background_tasks => {
+            SphereVisualState::BackgroundActive
+        }
+        other => other.into(),
+    }
+}
 
 /// Ejecuta las acciones del menú contextual que no terminan el bucle.
 pub type CommandHandler<'a> = dyn FnMut(ShellCommand) + 'a;
@@ -272,7 +299,7 @@ pub fn run_loop(
             continue;
         }
 
-        let (state, level) = source();
+        let (state, visual, level) = source();
         surface.sync_muted(state == JarvisState::Muted);
 
         let target = look.get();
@@ -316,7 +343,7 @@ pub fn run_loop(
         surface.set_opacity(fade.value_at(now));
 
         if surface.wants_frame() {
-            match render_and_present(surface, view, level, state, clock.t(now)) {
+            match render_and_present(surface, view, level, visual, clock.t(now)) {
                 Ok(()) => {
                     presented += 1;
                     if presented == 1 {
@@ -390,7 +417,7 @@ fn render_and_present(
     surface: &mut dyn OverlaySurface,
     view: &mut SphereView,
     level: AudioLevel,
-    state: JarvisState,
+    state: SphereVisualState,
     t: f32,
 ) -> Result<(), (&'static str, Box<dyn std::error::Error>)> {
     let SphereView { renderer, pixmap } = view;
@@ -633,6 +660,44 @@ mod tests {
     }
 
     #[test]
+    fn sphere_visual_state_table_matches_hu55() {
+        use JarvisState as J;
+        use SphereVisualState as V;
+        // (ciclo de vida, turno activo, tareas en segundo plano, esperado)
+        let cases = [
+            (J::Listening, false, false, V::PassiveListening),
+            (J::Listening, true, false, V::ActiveListening),
+            // El turno en vivo prevalece sobre las tareas.
+            (J::Listening, true, true, V::ActiveListening),
+            (J::Listening, false, true, V::BackgroundActive),
+            (J::Idle, false, false, V::Idle),
+            (J::Idle, false, true, V::BackgroundActive),
+            // En reposo no hay turno que capturar: la bandera no aplica.
+            (J::Idle, true, false, V::Idle),
+            (J::Idle, true, true, V::BackgroundActive),
+        ];
+        for (state, turn, bg, expected) in cases {
+            assert_eq!(
+                sphere_visual_state(state, turn, bg),
+                expected,
+                "{state:?} turno={turn} tareas={bg}"
+            );
+        }
+        // Pensar, hablar y el silencio se muestran 1:1 pase lo que pase.
+        for (state, expected) in [
+            (J::Thinking, V::Thinking),
+            (J::Speaking, V::Speaking),
+            (J::Muted, V::Muted),
+        ] {
+            for turn in [false, true] {
+                for bg in [false, true] {
+                    assert_eq!(sphere_visual_state(state, turn, bg), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn frame_clock_does_not_catch_up_after_a_late_frame() {
         let start = Instant::now();
         let mut clock = FrameClock::new(start);
@@ -668,7 +733,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look(32),
-            &mut || (JarvisState::Speaking, 0.5),
+            &mut || (JarvisState::Speaking, JarvisState::Speaking.into(), 0.5),
             &shutdown,
             &AtomicBool::new(false),
             Some(5),
@@ -701,7 +766,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look(32),
-            &mut || (JarvisState::Idle, 0.0),
+            &mut || (JarvisState::Idle, JarvisState::Idle.into(), 0.0),
             &shutdown,
             &AtomicBool::new(false),
             None,
@@ -734,7 +799,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look(32),
-            &mut || (JarvisState::Idle, 0.0),
+            &mut || (JarvisState::Idle, JarvisState::Idle.into(), 0.0),
             &shutdown,
             &AtomicBool::new(false),
             None,
@@ -757,7 +822,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look(32),
-            &mut || (JarvisState::Muted, 0.0),
+            &mut || (JarvisState::Muted, JarvisState::Muted.into(), 0.0),
             &shutdown,
             &AtomicBool::new(false),
             Some(1),
@@ -799,7 +864,7 @@ mod tests {
                     });
                 }
             }
-            (JarvisState::Idle, 0.0)
+            (JarvisState::Idle, JarvisState::Idle.into(), 0.0)
         };
         let exit = run_loop(
             &mut surface,
@@ -848,7 +913,7 @@ mod tests {
             if frames == 2 {
                 look.set(persisted);
             }
-            (JarvisState::Idle, 0.0)
+            (JarvisState::Idle, JarvisState::Idle.into(), 0.0)
         };
         run_loop(
             &mut surface,
@@ -927,7 +992,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look,
-            &mut || (JarvisState::Idle, 0.0),
+            &mut || (JarvisState::Idle, JarvisState::Idle.into(), 0.0),
             &AtomicBool::new(false),
             &AtomicBool::new(false),
             Some(frames),
@@ -952,7 +1017,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look(32),
-            &mut || (JarvisState::Listening, 0.0),
+            &mut || (JarvisState::Listening, JarvisState::Listening.into(), 0.0),
             &shutdown,
             &AtomicBool::new(false),
             Some(5),
@@ -974,7 +1039,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look(32),
-            &mut || (JarvisState::Thinking, 0.0),
+            &mut || (JarvisState::Thinking, JarvisState::Thinking.into(), 0.0),
             &shutdown,
             &AtomicBool::new(false),
             Some(3),
@@ -1060,7 +1125,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look(32),
-            &mut || (JarvisState::Idle, 0.0),
+            &mut || (JarvisState::Idle, JarvisState::Idle.into(), 0.0),
             &shutdown,
             &AtomicBool::new(false),
             Some(36),
@@ -1087,7 +1152,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look(32),
-            &mut || (JarvisState::Idle, 0.0),
+            &mut || (JarvisState::Idle, JarvisState::Idle.into(), 0.0),
             &shutdown,
             &AtomicBool::new(false),
             Some(48),
@@ -1105,7 +1170,7 @@ mod tests {
             &mut surface,
             &mut view,
             &look(32),
-            &mut || (JarvisState::Idle, 0.0),
+            &mut || (JarvisState::Idle, JarvisState::Idle.into(), 0.0),
             &shutdown,
             &AtomicBool::new(false),
             None,

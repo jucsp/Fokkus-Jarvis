@@ -137,6 +137,8 @@ const SCRIPT: &[&str] = &[
     "el de la pega",                                         // 22: continuación
     "Jarvis, cuéntame un chiste de",                         // 23: preposición final (HU-43)
     "programadores",                                         // 24: continuación
+    "Jarvis, deja un monitor ping corriendo en segundo plano", // 25: tarea operacional (HU-57)
+    "Jarvis, detén el proceso",                              // 26: cancelación flexible (HU-57)
 ];
 
 struct ScriptTranscriber;
@@ -694,6 +696,37 @@ fn connector_chains_when_the_continuation_also_ends_in_connector() {
         brain.queries(),
         vec!["abre el menú y ajústalo y guárdalo".to_string()]
     );
+}
+
+#[test]
+fn active_turn_tracks_held_phrase_and_follow_up_window() {
+    // HU-55: la esfera distingue la escucha pasiva (verde) de la captura de
+    // un turno (ámbar) a partir de `is_active_turn`.
+    let brain = FakeBrain::new("Hecho.");
+    let config = VoiceConfig {
+        connector_grace: Duration::from_millis(500),
+        ..fast()
+    };
+    let h = harness("turno-activo", Some(brain.clone()), config);
+    assert!(
+        !h.orchestrator.is_active_turn(),
+        "escucha pasiva al arrancar"
+    );
+
+    // "Jarvis, abre el menú y": la frase queda retenida esperando el resto.
+    h.say_line(8);
+    wait_until("frase retenida", || h.orchestrator.is_active_turn());
+    h.say_line(10); // "guárdalo"
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(brain.queries(), vec!["abre el menú y guárdalo".to_string()]);
+
+    // Tras la respuesta, la ventana de seguimiento mantiene el turno activo.
+    assert!(h.activation.is_follow_up_open());
+    assert!(h.orchestrator.is_active_turn());
+    h.activation.close_follow_up();
+    wait_until("vuelta a escucha pasiva", || {
+        !h.orchestrator.is_active_turn()
+    });
 }
 
 /// Fragmento inacabado (HU-43) + continuación → una sola consulta.
@@ -1536,6 +1569,34 @@ fn heavy_turn_acks_fast_and_a_light_turn_runs_while_the_task_works() {
 }
 
 #[test]
+fn background_tasks_are_reported_while_alive() {
+    // HU-55: la esfera se pone naranja mientras haya tareas vivas.
+    use crate::tasks::TaskStatus;
+    let brain = FakeBrain::new("x");
+    let factory = FakeFactory::new(TASK_REPLY, Duration::from_millis(300));
+    let h = task_harness("task-visual", brain, factory);
+    assert!(!h.orchestrator.has_background_tasks());
+    assert_eq!(h.orchestrator.active_tasks_count(), 0);
+
+    h.say_line(13);
+    wait_until("tarea en curso", || h.orchestrator.has_background_tasks());
+    assert_eq!(h.orchestrator.active_tasks_count(), 1);
+
+    wait_until("tarea terminada", || {
+        h.task_status() == vec![TaskStatus::Done]
+    });
+    assert!(!h.orchestrator.has_background_tasks());
+    assert_eq!(h.orchestrator.active_tasks_count(), 0);
+}
+
+#[test]
+fn without_task_manager_there_are_no_background_tasks() {
+    let h = harness("sin-tareas", None, fast());
+    assert!(!h.orchestrator.has_background_tasks());
+    assert_eq!(h.orchestrator.active_tasks_count(), 0);
+}
+
+#[test]
 fn barge_in_cancels_the_reply_but_not_the_background_task() {
     use crate::tasks::TaskStatus;
     let brain = FakeBrain::new("x");
@@ -1612,6 +1673,38 @@ fn voice_commands_list_and_cancel_tasks() {
 }
 
 #[test]
+fn operational_task_runs_with_the_executing_prompt_and_stops_by_voice_hu57() {
+    use crate::tasks::TaskStatus;
+    let brain = FakeBrain::new("x");
+    let factory = FakeFactory::new(TASK_REPLY, Duration::from_secs(5));
+    let h = task_harness("task-ops", brain.clone(), factory.clone());
+
+    h.say_line(25);
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(h.task_status(), vec![TaskStatus::Running]);
+    wait_until("subagente lanzado", || {
+        !factory.spawned.lock().unwrap().is_empty()
+    });
+    wait_until("prompt recibido", || {
+        !factory.spawned.lock().unwrap()[0].queries().is_empty()
+    });
+    let prompt = factory.spawned.lock().unwrap()[0].queries()[0].clone();
+    assert!(
+        !prompt.contains("Solo lees y resumes"),
+        "una tarea operacional no usa el prompt de solo lectura: {prompt}"
+    );
+    assert!(prompt.contains("ejecútalo de verdad"), "{prompt}");
+
+    let (p, d) = (h.played().len(), h.drained());
+    h.say_line(26);
+    h.wait_spoken_and_listening(p, d);
+    wait_until("proceso detenido (HU-57.3)", || {
+        h.task_status() == vec![TaskStatus::Cancelled]
+    });
+    assert!(brain.queries().is_empty(), "comandos locales, sin LLM");
+}
+
+#[test]
 fn heavy_turn_without_task_manager_goes_to_the_conversational_brain() {
     let brain = FakeBrain::new("Respuesta.");
     let h = harness("task-off", Some(brain.clone()), fast());
@@ -1634,17 +1727,72 @@ fn queued_speech_reports_position_and_is_spoken_in_order() {
 }
 
 #[test]
+fn flexible_cancel_phrases_are_recognized_hu57() {
+    for query in [
+        "detén el proceso",
+        "Ok, detén el proceso",
+        "cancela el proceso",
+        "para la tarea",
+        "detén la tarea",
+        "para el monitor",
+        "mata el ping",
+        "termina el contador",
+        "aborta el trabajo",
+    ] {
+        assert_eq!(
+            local_command(query),
+            Some(LocalCommand::CancelTask {
+                target: CancelTarget::Latest
+            }),
+            "{query}"
+        );
+        assert!(is_priority_override(query), "{query}");
+    }
+    for query in [
+        "cancela todo",
+        "detén todos los procesos",
+        "para las tareas",
+        "cancela las tareas pendientes",
+    ] {
+        assert_eq!(
+            local_command(query),
+            Some(LocalCommand::CancelTask {
+                target: CancelTarget::All
+            }),
+            "{query}"
+        );
+    }
+    assert_eq!(
+        local_command("detén el proceso de los correos"),
+        Some(LocalCommand::CancelTask {
+            target: CancelTarget::Named("correos".into())
+        })
+    );
+    // "para"/"termina" dentro de una frase no cancelan nada.
+    for query in [
+        "compra un cable para el monitor",
+        "termina de explicarme el proceso",
+        "para qué sirve el ping",
+    ] {
+        assert!(
+            !matches!(local_command(query), Some(LocalCommand::CancelTask { .. })),
+            "{query}"
+        );
+    }
+}
+
+#[test]
 fn local_command_recognizes_task_commands() {
     assert_eq!(
         local_command("cancela todas las tareas"),
         Some(LocalCommand::CancelTask {
-            spoken_target: None
+            target: CancelTarget::All
         })
     );
     assert_eq!(
         local_command("cancela la tarea de los correos"),
         Some(LocalCommand::CancelTask {
-            spoken_target: Some("correos".into())
+            target: CancelTarget::Named("correos".into())
         })
     );
     assert_eq!(
@@ -1776,6 +1924,26 @@ fn hud_barge_in_emits_jarvis_interrupted() {
 }
 
 #[test]
+fn manual_interrupt_cuts_the_utterance_and_returns_to_listening_hu56() {
+    let brain = FakeBrain::new("x");
+    brain.set_reply(
+        "Mañana llueve por la mañana. Luego despeja. Y por la noche hiela. Fin.",
+        Duration::from_millis(30),
+    );
+    let mut h = harness("manual-interrupt", Some(brain), fast());
+    assert!(
+        !h.orchestrator.interrupt(),
+        "sin locución el clic no hace nada"
+    );
+
+    h.say_line(1);
+    h.wait_state(JarvisState::Speaking);
+    assert!(h.orchestrator.interrupt(), "el clic corta la locución");
+    assert_eq!(h.core.state(), JarvisState::Listening);
+    assert!(!h.orchestrator.interrupt(), "idempotente");
+}
+
+#[test]
 fn hud_ipc_speech_is_a_notice() {
     let h = harness("hud-ipc", None, fast());
     h.orchestrator.speaker().say("Tarea del swarm completada.");
@@ -1833,13 +2001,13 @@ fn stop_automation_is_recognized_with_priority() {
     assert_eq!(
         local_command("cancela todas las tareas"),
         Some(LocalCommand::CancelTask {
-            spoken_target: None
+            target: CancelTarget::All
         })
     );
     assert_eq!(
         local_command("cancela todo"),
         Some(LocalCommand::CancelTask {
-            spoken_target: None
+            target: CancelTarget::All
         })
     );
     assert!(matches!(
