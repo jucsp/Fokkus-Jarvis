@@ -331,6 +331,7 @@ impl QuickPanel {
             command.arg("--pos").arg(x.to_string()).arg(y.to_string());
         }
         command.arg("--muted").arg(if muted { "1" } else { "0" });
+        command.env("JARVIS_VERSION", env!("CARGO_PKG_VERSION"));
         // En KWin Wayland una ventana Qt nativa no puede ubicarse junto al
         // cursor (y puede quedar en mosaico): con Xwayland flota libre.
         if prefers_xcb(

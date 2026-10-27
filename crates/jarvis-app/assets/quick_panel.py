@@ -538,7 +538,10 @@ class QuickPanel(QWidget):
         wrap.addLayout(row)
 
         # Versión instalada, centrada y sutil (HU-32).
-        version = QLabel("v0.2.15")
+        v_str = os.environ.get("JARVIS_VERSION", "v0.2.28")
+        if not v_str.startswith("v"):
+            v_str = f"v{v_str}"
+        version = QLabel(v_str)
         version.setObjectName("version")
         version.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         wrap.addWidget(version)
