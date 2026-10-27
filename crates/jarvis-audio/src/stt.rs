@@ -25,6 +25,14 @@ pub const MIN_SAMPLES: usize = SAMPLE_RATE * 11 / 10;
 /// Idioma por defecto.
 pub const DEFAULT_LANGUAGE: &str = "es";
 
+/// *Prompt* inicial por defecto (HU-43). Sesga el decodificador hacia
+/// "Jarvis" y, sobre todo, hacia un estilo con disfluencias: whisper imita el
+/// prompt, así que con él conserva las muletillas ("eh", "o sea") y los
+/// puntos suspensivos en vez de borrarlas y cerrar la frase con un punto. Sin
+/// esas marcas el detector de incompletitud no puede ver que el usuario no
+/// terminó. Solo muletillas: palabras de contenido se alucinarían en silencio.
+pub const DEFAULT_INITIAL_PROMPT: &str = "Jarvis, eh... este, mmm, o sea, como que, igual...";
+
 /// Máximo de hilos de CPU para la inferencia.
 pub const MAX_THREADS: usize = 8;
 
@@ -105,7 +113,7 @@ impl WhisperEngine {
             model_id: spec.id,
             sha256: spec.sha256,
             language: DEFAULT_LANGUAGE.to_string(),
-            initial_prompt: None,
+            initial_prompt: Some(DEFAULT_INITIAL_PROMPT.to_string()),
             n_threads,
         })
     }
@@ -115,10 +123,21 @@ impl WhisperEngine {
         self
     }
 
-    /// *Prompt* inicial que sesga el decodificador (p. ej. hacia "Jarvis").
+    /// *Prompt* inicial que sesga el decodificador. Reemplaza al de
+    /// disfluencias por defecto ([`DEFAULT_INITIAL_PROMPT`]).
     pub fn with_initial_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.initial_prompt = Some(prompt.into());
         self
+    }
+
+    /// Transcribe sin *prompt* inicial.
+    pub fn without_initial_prompt(mut self) -> Self {
+        self.initial_prompt = None;
+        self
+    }
+
+    pub fn initial_prompt(&self) -> Option<&str> {
+        self.initial_prompt.as_deref()
     }
 
     pub fn with_threads(mut self, n_threads: usize) -> Self {
@@ -317,6 +336,19 @@ mod tests {
     }
 
     #[test]
+    fn default_prompt_biases_towards_jarvis_and_spanish_disfluencies() {
+        let prompt = DEFAULT_INITIAL_PROMPT;
+        assert!(prompt.starts_with("Jarvis"));
+        assert!(!prompt.contains('\0'));
+        for filler in ["eh", "este", "mmm", "o sea", "como que", "igual", "..."] {
+            assert!(prompt.contains(filler), "falta {filler:?}");
+        }
+        // El propio prompt termina abierto: whisper no debe aprender a cerrar
+        // cada frase con un punto.
+        assert!(crate::incompleteness::is_incomplete(prompt));
+    }
+
+    #[test]
     fn engine_is_shareable_across_threads() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<WhisperEngine>();
@@ -333,6 +365,7 @@ mod tests {
             .expect("modelo tiny");
         let engine = WhisperEngine::from_verified(model).expect("contexto whisper");
         assert_eq!(engine.language(), "es");
+        assert_eq!(engine.initial_prompt(), Some(DEFAULT_INITIAL_PROMPT));
         assert_eq!(engine.transcribe(&[]).unwrap(), "");
         let _ = engine.transcribe(&[0.0; 160]).unwrap();
         let noise: Vec<f32> = (0..SAMPLE_RATE * 30)

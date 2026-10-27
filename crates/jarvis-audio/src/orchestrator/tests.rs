@@ -70,6 +70,8 @@ struct FakeSink {
     drain: Duration,
     played: Mutex<Vec<(u64, usize)>>,
     drained: Mutex<Vec<u64>>,
+    /// Chimes reproducidos por la vía inmediata (HU-42).
+    chimes: AtomicUsize,
 }
 
 const SINK_RATE: u32 = 16_000;
@@ -91,6 +93,7 @@ impl AudioSink for FakeSink {
     }
 
     fn play_immediate(&self, _samples: &[f32]) -> PlayOutcome {
+        self.chimes.fetch_add(1, Ordering::SeqCst);
         PlayOutcome::Played
     }
 
@@ -130,6 +133,10 @@ const SCRIPT: &[&str] = &[
     "Jarvis, pausa el video",                                // 18: multimedia
     "Jarvis, escribe en pantalla Hola mundo.",               // 19: escribir
     "silencio",                                              // 20: reposo como continuación
+    "Jarvis, abre el correo, o sea",                         // 21: muletilla final (HU-43)
+    "el de la pega",                                         // 22: continuación
+    "Jarvis, cuéntame un chiste de",                         // 23: preposición final (HU-43)
+    "programadores",                                         // 24: continuación
 ];
 
 struct ScriptTranscriber;
@@ -297,6 +304,7 @@ fn harness_full(
         drain: Duration::from_millis(150),
         played: Mutex::new(Vec::new()),
         drained: Mutex::new(Vec::new()),
+        chimes: AtomicUsize::new(0),
     });
     let activation = Arc::new(ActivationDetector::new());
     let (events_tx, events_rx) = crossbeam_channel::unbounded();
@@ -360,6 +368,37 @@ impl Harness {
                     pcm: vec![line as f32; 1_600],
                     duration_ms,
                 },
+                partials: 0,
+                close_reason: CloseReason::Silence,
+            })
+            .unwrap();
+    }
+
+    /// Fragmento intermedio de un turno largo (HU-44) con la línea del guion.
+    fn say_partial(&self, line: usize, index: u32) {
+        self.events
+            .send(VoiceEvent::Partial {
+                at: Instant::now(),
+                segment: Segment {
+                    pcm: vec![line as f32; 1_600],
+                    duration_ms: 30_000,
+                },
+                index,
+            })
+            .unwrap();
+    }
+
+    /// Cierre de un turno largo tras `partials` fragmentos (HU-44).
+    fn end_long_turn(&self, line: usize, partials: u32, close_reason: CloseReason) {
+        self.events
+            .send(VoiceEvent::EndOfTurn {
+                at: Instant::now(),
+                segment: Segment {
+                    pcm: vec![line as f32; 1_600],
+                    duration_ms: 4_000,
+                },
+                partials,
+                close_reason,
             })
             .unwrap();
     }
@@ -389,6 +428,10 @@ impl Harness {
             self.sink.drained.lock().unwrap().len() > drained_before
         });
         self.wait_state(JarvisState::Listening);
+    }
+
+    fn chimes(&self) -> usize {
+        self.sink.chimes.load(Ordering::SeqCst)
     }
 
     fn drained(&self) -> usize {
@@ -465,7 +508,13 @@ fn task_harness(name: &str, brain: Arc<FakeBrain>, factory: Arc<FakeFactory>) ->
 #[test]
 fn wake_word_reply_barge_in_and_follow_up_question() {
     let brain = FakeBrain::new("Hoy está despejado. Máxima de veinte grados.");
-    let h = harness("flujo", Some(brain.clone()), fast());
+    // Sin fusión temprana (HU-42): el barge-in de este flujo abre una
+    // pregunta nueva; la fusión se prueba en sus propios tests.
+    let config = VoiceConfig {
+        speaking_merge_window: Duration::ZERO,
+        ..fast()
+    };
+    let h = harness("flujo", Some(brain.clone()), config);
     assert!(h.capture.enabled(), "el micrófono se abre al arrancar");
 
     // Sin "Jarvis" y sin ventana: no llega al LLM (CA-4.2).
@@ -647,6 +696,35 @@ fn connector_chains_when_the_continuation_also_ends_in_connector() {
     );
 }
 
+/// Fragmento inacabado (HU-43) + continuación → una sola consulta.
+fn incomplete_fragment_merges(name: &str, first: usize, second: usize) -> Vec<String> {
+    let brain = FakeBrain::new("Listo.");
+    let h = harness(name, Some(brain.clone()), fast());
+    h.say_line(first);
+    wait_until("transcripción", || h.stats().segments == 1);
+    std::thread::sleep(Duration::from_millis(20));
+    h.voice_start();
+    h.say_line(second);
+    h.wait_spoken_and_listening(0, 0);
+    brain.queries()
+}
+
+#[test]
+fn trailing_filler_holds_the_turn_and_merges_the_continuation() {
+    assert_eq!(
+        incomplete_fragment_merges("muletilla", 21, 22),
+        vec!["abre el correo, o sea el de la pega".to_string()]
+    );
+}
+
+#[test]
+fn trailing_preposition_holds_the_turn_and_merges_the_continuation() {
+    assert_eq!(
+        incomplete_fragment_merges("preposicion", 23, 24),
+        vec!["cuéntame un chiste de programadores".to_string()]
+    );
+}
+
 #[test]
 fn connector_without_continuation_is_sent_after_the_grace_period() {
     let brain = FakeBrain::new("Buscando.");
@@ -736,6 +814,12 @@ fn local_command_and_connector_parsing() {
     assert!(ends_with_connector("busca el archivo y"));
     assert!(ends_with_connector("quiero eso, pero..."));
     assert!(!ends_with_connector("busca el archivo"));
+    // HU-43: el detector ampliado también cubre muletillas, preposiciones,
+    // artículos y auxiliares colgados.
+    assert!(ends_with_connector("abre el correo, o sea"));
+    assert!(ends_with_connector("busca vuelos para"));
+    assert!(ends_with_connector("abre el"));
+    assert!(ends_with_connector("Jarvis, quiero"));
     assert!(!ends_with_connector(""));
 }
 
@@ -837,8 +921,10 @@ fn without_barge_in_speaker_echo_neither_pauses_nor_cuts_the_locution() {
 fn long_user_speech_during_speaker_echo_is_not_discarded() {
     let brain = FakeBrain::new("Uno. Dos. Tres. Cuatro.");
     brain.set_reply("Uno. Dos. Tres. Cuatro.", Duration::from_millis(20));
+    // Sin fusión temprana (HU-42): este test aísla la regla de eco (HU-29).
     let config = VoiceConfig {
         barge_in_enabled: false,
+        speaking_merge_window: Duration::ZERO,
         ..fast()
     };
     let h = harness("eco-largo", Some(brain.clone()), config);
@@ -910,6 +996,275 @@ fn silence_during_thinking_overrides_without_merging() {
     assert!(!h.activation.is_follow_up_open(), "la ventana se cierra");
     assert!(h.capture.enabled(), "el micrófono sigue abierto en reposo");
     assert!(!h.activation.is_muted(), "el reposo no mutea el detector");
+}
+
+// ------------------------------------------------- HU-42: continuación
+
+/// Transcriptor del guion que tarda `delay` (carrera STT/`VoiceStart`, H-T6).
+struct SlowScriptTranscriber(Duration);
+
+impl Transcriber for SlowScriptTranscriber {
+    fn transcribe(&self, pcm: &[f32]) -> Result<String, SttError> {
+        std::thread::sleep(self.0);
+        ScriptTranscriber.transcribe(pcm)
+    }
+}
+
+#[test]
+fn deferred_chime_plays_after_the_delay_when_nobody_resumes() {
+    let brain = FakeBrain::new("Voy con eso.");
+    brain.set_reply("Voy con eso.", Duration::from_millis(400));
+    let config = VoiceConfig {
+        chime_delay: Duration::from_millis(150),
+        ..fast()
+    };
+    let h = harness("chime-diferido", Some(brain.clone()), config);
+
+    h.say_line(1);
+    let dispatched = Instant::now();
+    wait_until("turno en el LLM", || brain.queries().len() == 1);
+    assert_eq!(h.chimes(), 0, "el chime no suena al despachar");
+    wait_until("chime diferido", || h.chimes() == 1);
+    assert!(
+        dispatched.elapsed() >= Duration::from_millis(140),
+        "el chime respetó el retardo: {:?}",
+        dispatched.elapsed()
+    );
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(h.chimes(), 1, "un solo chime por turno");
+}
+
+#[test]
+fn voice_during_chime_delay_cancels_it_and_continues_the_turn() {
+    let brain = FakeBrain::new("Voy con eso.");
+    brain.set_reply("Voy con eso.", Duration::from_millis(500));
+    let config = VoiceConfig {
+        chime_delay: Duration::from_millis(200),
+        ..fast()
+    };
+    let h = harness("chime-cancelado", Some(brain.clone()), config);
+
+    h.say_line(1);
+    wait_until("turno en el LLM", || brain.queries().len() == 1);
+    // El usuario retoma antes de que venza el retardo: nada lo pisa.
+    h.voice_start();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(h.chimes(), 0, "el chime se canceló al retomar la voz");
+
+    // Su continuación se fusiona con el turno despachado.
+    h.say_line(2);
+    wait_until("turno fusionado", || brain.queries().len() == 2);
+    assert_eq!(brain.queries()[1], "¿qué tal el clima? ¿y mañana?");
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(h.chimes(), 1, "solo suena el chime del turno completo");
+}
+
+/// Responde una pregunta, despacha un seguimiento justo tras la locución (en
+/// la cola de eco) y retoma con una frase corta. Devuelve las consultas.
+fn short_continuation_right_after_speech(name: &str, window: Duration) -> Vec<String> {
+    let brain = FakeBrain::new("Despejado.");
+    let config = VoiceConfig {
+        barge_in_enabled: false,
+        continuation_window: window,
+        ..fast()
+    };
+    let h = harness(name, Some(brain.clone()), config);
+    h.say_line(1);
+    h.wait_spoken_and_listening(0, 0);
+
+    // Seguimiento lento, dicho dentro de `ECHO_TAIL` tras la locución.
+    brain.set_reply("Mañana llueve.", Duration::from_millis(400));
+    h.say_line(2);
+    wait_until("seguimiento en el LLM", || brain.queries().len() == 2);
+    // "cuéntame otra cosa" dura 100 ms (≤ ECHO_MAX_MS).
+    h.voice_start();
+    h.say_line(3);
+    wait_until("segmento procesado", || h.stats().segments == 3);
+    h.wait_spoken_and_listening(h.played().len(), h.drained());
+    brain.queries()
+}
+
+#[test]
+fn voice_in_continuation_window_is_never_echo() {
+    let queries = short_continuation_right_after_speech("ventana", CONTINUATION_WINDOW);
+    assert_eq!(
+        queries.last().map(String::as_str),
+        Some("¿y mañana? cuéntame otra cosa"),
+        "la continuación se transcribió y fusionó: {queries:?}"
+    );
+}
+
+#[test]
+fn without_continuation_window_the_same_voice_is_discarded_as_echo() {
+    // Control negativo: demuestra que el test anterior ejercita la ventana.
+    let queries = short_continuation_right_after_speech("sin-ventana", Duration::ZERO);
+    assert_eq!(
+        queries,
+        vec!["¿qué tal el clima?".to_string(), "¿y mañana?".to_string()]
+    );
+}
+
+#[test]
+fn long_continuation_in_early_speaking_merges_into_one_turn() {
+    let brain = FakeBrain::new("Uno. Dos. Tres. Cuatro.");
+    brain.set_reply("Uno. Dos. Tres. Cuatro.", Duration::from_millis(20));
+    let config = VoiceConfig {
+        barge_in_enabled: false,
+        ..fast()
+    };
+    let h = harness("fusion-speaking", Some(brain.clone()), config);
+    h.say_line(1);
+    h.wait_state(JarvisState::Speaking);
+
+    // Retoma en los primeros ms de `Speaking`: una sola consulta completa.
+    h.voice_start();
+    h.say_line_with_duration(3, 1_500);
+    wait_until("turno fusionado", || brain.queries().len() == 2);
+    assert_eq!(brain.queries()[1], "¿qué tal el clima? cuéntame otra cosa");
+}
+
+/// Respuesta con varias frases: la locución dura más que la ventana de
+/// confirmación del barge-in.
+const LONG_REPLY: &str = "Mañana llueve por la mañana. Luego despeja. Y por la noche hiela. Fin.";
+
+#[test]
+fn barge_in_in_early_speaking_keeps_the_turn_for_merging() {
+    let brain = FakeBrain::new("Uno. Dos. Tres. Cuatro.");
+    brain.set_reply(LONG_REPLY, Duration::from_millis(30));
+    let config = VoiceConfig {
+        barge_in_window: Duration::from_millis(60),
+        ..fast()
+    };
+    let h = harness("barge-temprano", Some(brain.clone()), config);
+    h.say_line(1);
+    h.wait_state(JarvisState::Speaking);
+
+    h.capture.set_vad(0.9);
+    h.voice_start();
+    wait_until("barge-in", || h.stats().barge_ins == 1);
+    h.capture.set_vad(0.0);
+    h.say_line(3);
+    wait_until("turno fusionado", || brain.queries().len() == 2);
+    assert_eq!(brain.queries()[1], "¿qué tal el clima? cuéntame otra cosa");
+}
+
+#[test]
+fn late_barge_in_starts_a_new_question() {
+    let brain = FakeBrain::new("Uno. Dos. Tres. Cuatro.");
+    brain.set_reply(LONG_REPLY, Duration::from_millis(30));
+    let config = VoiceConfig {
+        speaking_merge_window: Duration::from_millis(1),
+        barge_in_window: Duration::from_millis(60),
+        ..fast()
+    };
+    let h = harness("barge-tardio", Some(brain.clone()), config);
+    h.say_line(1);
+    h.wait_state(JarvisState::Speaking);
+    std::thread::sleep(Duration::from_millis(20));
+
+    h.capture.set_vad(0.9);
+    h.voice_start();
+    wait_until("barge-in", || h.stats().barge_ins == 1);
+    h.capture.set_vad(0.0);
+    h.say_line(3);
+    wait_until("turno nuevo", || brain.queries().len() == 2);
+    assert_eq!(brain.queries()[1], "cuéntame otra cosa");
+}
+
+#[test]
+fn continuation_while_whisper_transcribes_is_not_split() {
+    let brain = FakeBrain::new("Abierto.");
+    let h = harness("stt-en-vuelo", Some(brain.clone()), fast());
+    // STT más lento que `connector_grace` (60 ms): sin H-T6 el fragmento con
+    // conector vencería y se despacharía solo.
+    h.orchestrator
+        .set_transcriber(Box::new(SlowScriptTranscriber(Duration::from_millis(120))));
+
+    h.say_line(6); // "Jarvis, busca el archivo y"
+    std::thread::sleep(Duration::from_millis(30));
+    h.voice_start(); // retoma mientras whisper transcribe el fragmento 1
+    wait_until("señal al DSP", || h.capture.connector.is_pending());
+    h.say_line(7); // "ábrelo"
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(
+        brain.queries(),
+        vec!["busca el archivo y ábrelo".to_string()]
+    );
+}
+
+// ------------------------------------------------- HU-44: turnos largos
+
+#[test]
+fn long_turn_partials_accumulate_into_one_query() {
+    let brain = FakeBrain::new("Anotado.");
+    let h = harness("turno-largo", Some(brain.clone()), fast());
+
+    // Dos fragmentos de 30 s y el cierre por silencio real.
+    h.say_partial(1, 0); // "Jarvis, ¿qué tal el clima?"
+    h.say_partial(2, 1); // "¿y mañana?"
+    wait_until("fragmentos contados", || h.stats().partials == 2);
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(
+        brain.queries().is_empty(),
+        "ningún fragmento parcial se despacha"
+    );
+    assert_eq!(h.stats().segments, 0, "los parciales no cierran turno");
+
+    h.end_long_turn(3, 2, CloseReason::Silence); // "cuéntame otra cosa"
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(
+        brain.queries(),
+        vec!["¿qué tal el clima? ¿y mañana? cuéntame otra cosa".to_string()]
+    );
+    assert_eq!(h.stats().turns, 1);
+}
+
+#[test]
+fn long_turn_hitting_the_ceiling_is_dispatched_whole() {
+    let brain = FakeBrain::new("Anotado.");
+    let h = harness("turno-techo", Some(brain.clone()), fast());
+    h.say_partial(23, 0); // "Jarvis, cuéntame un chiste de"
+    h.end_long_turn(24, 1, CloseReason::MaxTimeout); // "programadores"
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(
+        brain.queries(),
+        vec!["cuéntame un chiste de programadores".to_string()]
+    );
+    assert_eq!(h.stats().close_max_timeout, 1);
+}
+
+#[test]
+fn normal_turn_after_a_lost_long_turn_does_not_inherit_its_text() {
+    let brain = FakeBrain::new("Anotado.");
+    let h = harness("turno-huerfano", Some(brain.clone()), fast());
+    // Un fragmento cuyo cierre nunca llegó (p. ej. descartado por atraso).
+    h.say_partial(13, 0);
+    wait_until("fragmento contado", || h.stats().partials == 1);
+    std::thread::sleep(Duration::from_millis(40));
+    // El siguiente turno normal no arrastra el texto huérfano.
+    h.say_line(1);
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(brain.queries(), vec!["¿qué tal el clima?".to_string()]);
+}
+
+#[test]
+fn partial_keeps_a_held_connector_turn_waiting() {
+    let brain = FakeBrain::new("Abierto.");
+    let h = harness("parcial-conector", Some(brain.clone()), fast());
+    h.say_line(6); // "Jarvis, busca el archivo y"
+    wait_until("transcripción", || h.stats().segments == 1);
+    // El usuario retoma con un monólogo largo: el fragmento parcial impide
+    // que el turno retenido venza a los 60 ms de gracia.
+    h.voice_start();
+    h.say_partial(7, 0); // "ábrelo"
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(brain.queries().is_empty(), "lo retenido no venció");
+    h.end_long_turn(10, 1, CloseReason::Silence); // "guárdalo"
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(
+        brain.queries(),
+        vec!["busca el archivo y ábrelo guárdalo".to_string()]
+    );
 }
 
 /// `(argv[0] sin ruta, display_name)` de la orden, o `None` si no es OpenApp.

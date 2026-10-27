@@ -7,14 +7,20 @@
 //! clave de caché.
 
 pub mod decode;
+pub mod directive;
 pub mod edge;
+pub mod grouping;
 pub mod phrase;
 pub mod piper;
+pub mod prosody;
 
 pub use decode::{decode_mp3, PcmAudio};
-pub use edge::synthesize_edge_native;
+pub use directive::{strip_directives, DirectedPhrase, Mood, SpeechDirective};
+pub use edge::{synthesize_edge_native, synthesize_edge_with};
+pub use grouping::PhraseGrouper;
 pub use phrase::PhraseSplitter;
 pub use piper::{parse_wav_pcm, synthesize_local_fallback};
+pub use prosody::apply_directive_pcm;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -365,11 +371,19 @@ impl EdgeTtsEngine {
     /// Sintetiza una frase en memoria con Edge-TTS nativo y, si falla la red,
     /// degrada al fallback local de `espeak-ng`.
     pub fn synthesize_phrase_native(&self, text: &str) -> Result<PcmAudio, TtsError> {
-        match synthesize_edge_native(text, &self.voice_id) {
-            Ok(audio) => Ok(audio),
-            Err(TtsError::Network(_)) => synthesize_local_fallback(text, &self.voice_lang),
-            Err(e) => Err(e),
-        }
+        self.synthesize_directed(&DirectedPhrase::plain(text))
+    }
+
+    /// Sintetiza una frase con su prosodia (HU-46): Edge aplica ritmo, tono y
+    /// volumen; las pausas y la respiración se añaden en local, también
+    /// sobre el fallback de `espeak-ng`.
+    pub fn synthesize_directed(&self, phrase: &DirectedPhrase) -> Result<PcmAudio, TtsError> {
+        let pcm = match synthesize_edge_with(&phrase.text, &self.voice_id, &phrase.directive) {
+            Ok(audio) => audio,
+            Err(TtsError::Network(_)) => synthesize_local_fallback(&phrase.text, &self.voice_lang)?,
+            Err(e) => return Err(e),
+        };
+        Ok(apply_directive_pcm(pcm, &phrase.directive))
     }
 
     fn audio_extension(&self) -> &'static str {

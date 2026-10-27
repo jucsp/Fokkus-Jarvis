@@ -109,6 +109,60 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
+## 🗣️ Épica 9 (E-12): Conversación Natural: Turn-Taking Humano y Voz Expresiva con Guión
+- _SDD / Propuesta Técnica:_ [`docs/specs/sdd-contracts/investigacion-turn-taking-voz-expresiva.md`](docs/specs/sdd-contracts/investigacion-turn-taking-voz-expresiva.md)
+- _Objetivo:_ Eliminar cortes prematuros al hablar y pausas reflexivas/tomas de aire, introduciendo además prosodia, entonación, respiraciones y pausas dirigidas por el LLM.
+
+### ⚡ Fase 1: Quick Wins Conversacionales y Prosodia (EN CURSO - PRIORIDAD MÁXIMA)
+- [x] **HU-41: Endpointing configurable y observable** (✅ 652 tests pasando)
+  - _Contexto de negocio:_ El usuario necesita que el tiempo de espera no sea fijo ni arbitrario, y poder auditar cómo corta el fin de turno.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa:_ `crates/jarvis-audio/src/vad/`, `io/engine.rs`, `crates/jarvis-app/src/config.rs`, `main.rs`.
+  - 📌 _Objetivo técnico:_ Exponer `EndpointConfig` y `connector_grace` en `config.toml` (`[voice_endpoint]`) con validación de rangos. Registrar histograma de pausas intra-turno (P50/P90), razón de cierre y flag `--diag-turns`.
+- [x] **HU-42: Ventana de continuación sin eco falso** (✅ 679 tests pasando)
+  - _Contexto de negocio:_ Al hablar con pausas o respirar, Jarvis no debe interpretar la continuación como eco del chime ni responder en dos fragmentos separados. Chime con retraso controlado.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa:_ `crates/jarvis-audio/src/orchestrator.rs`, `conversation.rs`.
+  - 📌 _Objetivo técnico:_ Ventana de continuación post-despacho (~1.5s) que nunca se descarte como eco, chime con leve retraso configurable, y fusión de turnos en `Speaking` temprano.
+- [x] **HU-43: Detector léxico de incompletitud** (✅ tabla de verdad 65 casos)
+  - _Contexto de negocio:_ Cuando el usuario deja frases a medias ("y...", "o sea...", "para..."), Jarvis debe esperar y no precipitarse.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa:_ `crates/jarvis-audio/src/orchestrator.rs`, `stt.rs`.
+  - 📌 _Objetivo técnico:_ Reemplazar `ends_with_connector` por evaluador de incompletitud en español chileno (muletillas, preposiciones, artículos finales) y prompt de Whisper con disfluencias.
+- [x] **HU-44: Turnos largos sin corte duro** (✅ parciales + techo `max_turn_ms` 120 s)
+  - _Contexto de negocio:_ Si el usuario habla o dicta más de 30 segundos, Jarvis no debe cortar ni despachar la mitad.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa:_ `crates/jarvis-audio/src/vad/endpoint.rs`, `events.rs`, `orchestrator.rs`.
+  - 📌 _Objetivo técnico:_ Fragmentación parcial acumulada al alcanzar `max_segment_ms` sin despachar, con techo total configurable hasta 120 s.
+- [x] **HU-45: Protocolo de directivas de prosodia ("Director de Escena")** (✅ parser incremental + fuzzing, 705 tests)
+  - _Contexto de negocio:_ El cerebro (LLM) debe poder indicar cómo decir cada frase para no sonar plano (`[ánimo:...]`, `[pausa:...]`, `[respira]`).
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa:_ `crates/jarvis-audio/src/tts/phrase.rs`, `brain/client.rs`.
+  - 📌 _Objetivo técnico:_ Gramática de directivas, parser incremental inmune a tags cortados, extensión de `SYSTEM_PROMPT` y remoción limpia de directivas del HUD y audio.
+- [x] **HU-46: Render expresivo sobre Edge-TTS** (✅ prosodia Edge + pausas PCM + respiración; 🧪 medición F0 pendiente)
+  - _Contexto de negocio:_ Jarvis debe entonar con variaciones de tono, ritmo y pausas/respiraciones audibles naturales.
+  - 📁 _Repositorio:_ `Fokkus-Jarvis`
+  - 🎯 _Capa:_ `crates/jarvis-audio/src/tts/edge.rs`, `tts/mod.rs`, `speech_queue.rs`, `playback.rs`.
+  - 📌 _Objetivo técnico:_ Mapeo de directivas a `rate/pitch/volume` en Edge-TTS, silencios PCM y clips cacheados de respiración/inhalación.
+
+### 🧠 Fase 2: Turn-Taking Inteligente con ML Acústico
+- [ ] **HU-47: Fin de turno en dos etapas con Smart Turn v3 (Tract Rust)**
+  - 📌 Integrar Smart Turn v3 (ONNX 8 MB, BSD-2) ejecutado con `tract` en Rust puro para arbitraje inteligente de silencios.
+- [ ] **HU-48: Perfil de pausas adaptativo**
+  - 📌 Auto-ajuste de umbrales según el ritmo habitual del usuario.
+- [ ] **HU-49: Indicador "sigo escuchando" en esfera y modo dictado**
+  - 📌 Feedback visual continuo y modo "toma nota" con cierre explícito.
+- [ ] **HU-50: Continuidad de entonación**
+  - 📌 Agrupación inteligente de frases por directiva para entonación armónica completa.
+
+### 🔬 Fase 3 & QA Transversal
+- [ ] **HU-51: Backend Azure Speech con SSML completo (Opcional/Key)**
+- [ ] **HU-52: TTS local neural Kokoro-82M (Reemplazo offline)**
+- [ ] **HU-53: STT especulativo y pre-generación**
+- [ ] **HU-54: Corpus y suite QA de turn-taking y expresividad**
+
+---
+
 ## 🧾 Deuda técnica
 
 - [ ] **Cablear el pipeline de voz en el binario** (hallazgo QA v0.2.1, bloqueante para "escucha y habla"): `jarvis-app` nunca abre streams `cpal` ni lanza `spawn_dsp_thread`/VAD/`WhisperEngine`/`ClaudeClient`/salida TTS. `start_listening()` solo cambia la máquina de estados. Los componentes existen y están testeados en `jarvis-audio`; falta el orquestador captura → DSP → VAD/endpointing → STT → activación → `run_turn_streaming` → playback. Brief listo para DeepSeek V4 Pro: [`docs/specs/brief-hu9-orquestador-voz.md`](docs/specs/brief-hu9-orquestador-voz.md) (HU-ORQ-1 a HU-ORQ-5).

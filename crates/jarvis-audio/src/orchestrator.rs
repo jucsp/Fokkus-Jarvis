@@ -39,7 +39,7 @@
 //! [`ConnectorSignal::signal`] (el turno nuevo espera el silencio extendido)
 //! y ambos textos se unen en una sola consulta.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -52,7 +52,7 @@ use crate::activation::{Activation, ActivationDetector};
 use crate::brain::{BrainError, Completion};
 use crate::conversation::{barge_in, ConversationCoordinator, ConversationError, TokenStream};
 use crate::dsp::ConnectorSignal;
-use crate::events::{HudEvent, TurnId, VoiceEvent};
+use crate::events::{CloseReason, HudEvent, TurnId, VoiceEvent};
 use crate::io::{to_output_pcm, AudioEngine, EngineShared, PlayOutcome, Player};
 use crate::playback::AudioPlayback;
 use crate::speech_queue::{Delivery, DeliveryGate, SpeechPriority};
@@ -61,7 +61,7 @@ use crate::tasks::{
     classify_workload, dev_task_prompt, is_dev_task, task_prompt, task_title, BrainFactory,
     SpeechQueueHandle, TaskConfig, TaskManager, TaskOrigin, Workload,
 };
-use crate::tts::{synth_chime, FillerCategory, PcmAudio};
+use crate::tts::{strip_directives, synth_chime, FillerCategory, PcmAudio};
 
 /// Lo que dice Jarvis cuando no hay cerebro (ni CLI ni API key) y la
 /// consulta lo necesita.
@@ -198,6 +198,18 @@ pub struct VoiceConfig {
     /// empieza mientras Jarvis suena se trata como eco: no pausa, no corta y
     /// no se transcribe.
     pub barge_in_enabled: bool,
+    /// Retardo del chime de confirmación (HU-42, H-T4). El chime ya no suena al
+    /// despachar: si el usuario retoma la voz antes de que venza, se cancela y
+    /// nunca lo pisa.
+    pub chime_delay: Duration,
+    /// Ventana de continuación post-despacho (HU-42, H-T4). La voz que llega
+    /// dentro de ella es del usuario: jamás se descarta como eco, aunque
+    /// Jarvis acabe de empezar a sonar.
+    pub continuation_window: Duration,
+    /// Ventana de locución temprana (HU-42, H-T5). Una continuación que llega
+    /// en los primeros milisegundos de `Speaking` se fusiona con el turno
+    /// pendiente y cancela la locución, en vez de responderse por separado.
+    pub speaking_merge_window: Duration,
     /// Gestión de tareas pesadas (HU-37). `None` = desactivada.
     pub tasks: Option<TaskConfig>,
     /// Kill switch por voz de la automatización (HU-38). `None` = sin
@@ -219,6 +231,9 @@ impl Default for VoiceConfig {
             barge_in_window: Duration::from_millis(250),
             vad_threshold: crate::vad::EndpointConfig::default().voice_open,
             barge_in_enabled: false,
+            chime_delay: CHIME_DELAY,
+            continuation_window: CONTINUATION_WINDOW,
+            speaking_merge_window: SPEAKING_MERGE_WINDOW,
             tasks: None,
             automation_kill: None,
             automation_input: None,
@@ -321,6 +336,14 @@ impl PendingUserTurn {
             .take()
     }
 
+    /// `true` si hay un turno despachado y aún en curso.
+    fn is_some(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
     fn clear(&self) {
         *self
             .0
@@ -333,6 +356,8 @@ impl PendingUserTurn {
 #[derive(Debug, Default)]
 pub struct VoiceStats {
     pub segments: AtomicU64,
+    /// Fragmentos parciales de turnos largos (HU-44).
+    pub partials: AtomicU64,
     pub rejected: AtomicU64,
     pub turns: AtomicU64,
     pub local_commands: AtomicU64,
@@ -344,12 +369,19 @@ pub struct VoiceStats {
     /// Fin de turno → filler en cola, en ms (último turno con filler).
     pub last_filler_ms: AtomicU64,
     pub speech_errors: AtomicU64,
+    /// Turnos cerrados por silencio normal (HU-41).
+    pub close_silence: AtomicU64,
+    /// Turnos cerrados por duración máxima (HU-41).
+    pub close_max_timeout: AtomicU64,
+    /// Turnos cerrados tras el silencio extendido por conector (HU-41).
+    pub close_connector: AtomicU64,
 }
 
 /// Fotografía de [`VoiceStats`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VoiceStatsSnapshot {
     pub segments: u64,
+    pub partials: u64,
     pub rejected: u64,
     pub turns: u64,
     pub local_commands: u64,
@@ -358,6 +390,9 @@ pub struct VoiceStatsSnapshot {
     pub last_barge_in_us: u64,
     pub last_filler_ms: u64,
     pub speech_errors: u64,
+    pub close_silence: u64,
+    pub close_max_timeout: u64,
+    pub close_connector: u64,
 }
 
 impl VoiceStats {
@@ -365,6 +400,7 @@ impl VoiceStats {
         let get = |a: &AtomicU64| a.load(Ordering::Relaxed);
         VoiceStatsSnapshot {
             segments: get(&self.segments),
+            partials: get(&self.partials),
             rejected: get(&self.rejected),
             turns: get(&self.turns),
             local_commands: get(&self.local_commands),
@@ -373,7 +409,20 @@ impl VoiceStats {
             last_barge_in_us: get(&self.last_barge_in_us),
             last_filler_ms: get(&self.last_filler_ms),
             speech_errors: get(&self.speech_errors),
+            close_silence: get(&self.close_silence),
+            close_max_timeout: get(&self.close_max_timeout),
+            close_connector: get(&self.close_connector),
         }
+    }
+
+    /// Anota por qué se cerró un turno (HU-41, base de `--diag-turns`).
+    pub fn count_close(&self, reason: CloseReason) {
+        let counter = match reason {
+            CloseReason::Silence => &self.close_silence,
+            CloseReason::MaxTimeout => &self.close_max_timeout,
+            CloseReason::Connector => &self.close_connector,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1371,22 +1420,10 @@ pub fn time_phrase(hour: u32, minute: u32) -> String {
     format!("{verb} {article} {hour}:{minute:02}.")
 }
 
-const CONNECTORS: &[&str] = &[
-    "y", "e", "o", "u", "pero", "que", "porque", "entonces", "aunque", "ni", "sino", "pues",
-    "como", "cuando", "donde", "si",
-];
-
-/// `true` si el texto termina en una palabra de enlace (el usuario no acabó).
+/// `true` si el texto termina inacabado: conector, muletilla, preposición,
+/// artículo o auxiliar colgado (HU-43). Se conserva el nombre histórico.
 pub fn ends_with_connector(text: &str) -> bool {
-    text.split_whitespace()
-        .last()
-        .map(|w| {
-            w.chars()
-                .filter(|c| c.is_alphanumeric())
-                .flat_map(char::to_lowercase)
-                .collect::<String>()
-        })
-        .is_some_and(|w| CONNECTORS.contains(&w.as_str()))
+    crate::incompleteness::is_incomplete(text)
 }
 
 /// Envía locuciones al orquestador (IPC `jarvis.speak`, avisos).
@@ -1468,14 +1505,33 @@ enum SttJob {
         /// Duración del segmento en ms, para calcular cuándo empezó la voz
         /// (HU-29) y comprobar la ventana de seguimiento contra ese instante.
         duration_ms: u32,
+        /// Qué parte del turno es (HU-44).
+        part: TurnPart,
     },
     SetTranscriber(Box<dyn Transcriber + Send>),
     Shutdown,
 }
 
+/// Parte de un turno que llega al STT (HU-44).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnPart {
+    /// Fragmento intermedio de un turno largo: se transcribe y acumula.
+    Partial(u32),
+    /// Cierre del turno tras `n` fragmentos parciales (0 = turno normal).
+    Final(u32),
+}
+
+/// Texto acumulado de un turno largo mientras sigue abierto (HU-44). Solo
+/// guarda texto: el audio de cada fragmento se libera al transcribirlo.
+struct LongTurnText {
+    text: String,
+    started_at: Instant,
+}
+
 struct SttOutcome {
     activation: Activation,
-    connector: bool,
+    /// La frase quedó a medias (HU-43): se espera la continuación.
+    incomplete: bool,
     at: Instant,
 }
 
@@ -1537,6 +1593,7 @@ impl VoiceOrchestrator {
         let gaming_mode = Arc::new(AtomicBool::new(false));
         let last_voice_activity = Arc::new(Mutex::new(None::<Instant>));
         let pending_user_turn = PendingUserTurn::default();
+        let stt_in_flight = Arc::new(AtomicUsize::new(0));
 
         let stats = Arc::new(VoiceStats::default());
         let stt_ready = Arc::new(AtomicBool::new(false));
@@ -1572,9 +1629,18 @@ impl VoiceOrchestrator {
         {
             let activation = Arc::clone(&activation);
             let stt_ready = Arc::clone(&stt_ready);
+            let stt_in_flight = Arc::clone(&stt_in_flight);
             threads.push(spawn(
                 "jarvis-stt",
-                Box::new(move || stt_loop(&stt_rx, &stt_out_tx, &activation, &stt_ready)),
+                Box::new(move || {
+                    stt_loop(
+                        &stt_rx,
+                        &stt_out_tx,
+                        &activation,
+                        &stt_ready,
+                        &stt_in_flight,
+                    );
+                }),
             )?);
         }
         {
@@ -1631,8 +1697,10 @@ impl VoiceOrchestrator {
                 barge_in: Arc::clone(&barge_in),
                 stt: stt_tx.clone(),
                 brain: brain_tx.clone(),
+                tts: tts_tx.clone(),
                 stats: Arc::clone(&stats),
                 stt_ready: Arc::clone(&stt_ready),
+                stt_in_flight,
                 ready,
                 config,
                 capture_enabled: None,
@@ -1642,6 +1710,10 @@ impl VoiceOrchestrator {
                 candidate: None,
                 echo_segment: false,
                 last_sounding: None,
+                last_turn_end: None,
+                speech_started: None,
+                continuation_expected: false,
+                chime_deadline: None,
                 last_voice_activity,
             };
             threads.push(spawn(
@@ -1794,8 +1866,13 @@ struct ControlLoop {
     barge_in: Arc<AtomicBool>,
     stt: Sender<SttJob>,
     brain: Sender<BrainJob>,
+    /// Salida TTS directa para el chime diferido (HU-42): no pasa por el
+    /// cerebro, que puede estar ocupado con un turno.
+    tts: Sender<TtsJob>,
     stats: Arc<VoiceStats>,
     stt_ready: Arc<AtomicBool>,
+    /// Segmentos que whisper está transcribiendo ahora mismo (HU-42, H-T6).
+    stt_in_flight: Arc<AtomicUsize>,
     /// Micrófono + DSP + STT listos (lo lee el cerebro al cerrar un turno).
     ready: Arc<AtomicBool>,
     config: VoiceConfig,
@@ -1810,6 +1887,17 @@ struct ControlLoop {
     echo_segment: bool,
     /// Último instante en que Jarvis sonaba (cola de eco sin barge-in).
     last_sounding: Option<Instant>,
+    /// Instante del último despacho: origen de la ventana de continuación
+    /// (HU-42, H-T4). Dentro de ella la voz nunca es eco.
+    last_turn_end: Option<Instant>,
+    /// Instante en que empezó la locución en curso (HU-42, H-T5).
+    speech_started: Option<Instant>,
+    /// La voz que empieza continúa el turno recién despachado: no es eco ni
+    /// una consulta nueva (HU-42, H-T5).
+    continuation_expected: bool,
+    /// Cuándo debe sonar el chime de confirmación si nadie retoma la voz
+    /// (HU-42, H-T4). `None` = no hay chime pendiente.
+    chime_deadline: Option<Instant>,
     /// Última voz del usuario: el *gate* de la cola hablada espera un hueco
     /// de silencio tras ella (CA-37.5).
     last_voice_activity: Arc<Mutex<Option<Instant>>>,
@@ -1834,6 +1922,16 @@ const ECHO_TAIL: Duration = Duration::from_millis(400);
 /// eco dura más, es voz real del usuario que empezó a hablar encima de Jarvis
 /// (HU-29). Nunca se descarta ciegamente un segmento más largo que esto.
 const ECHO_MAX_MS: u32 = 700;
+
+/// Retardo por defecto del chime de confirmación (HU-42, H-T4): el tiempo que
+/// se le da al usuario para retomar su frase antes de que suene nada.
+pub const CHIME_DELAY: Duration = Duration::from_millis(450);
+
+/// Ventana de continuación por defecto tras un despacho (HU-42, H-T4).
+pub const CONTINUATION_WINDOW: Duration = Duration::from_millis(1_500);
+
+/// Ventana de locución temprana por defecto (HU-42, H-T5).
+pub const SPEAKING_MERGE_WINDOW: Duration = Duration::from_millis(800);
 
 impl ControlLoop {
     fn run(
@@ -1869,9 +1967,14 @@ impl ControlLoop {
 
     fn tick(&self) -> Duration {
         if self.candidate.is_some() {
-            CONFIRM_TICK
-        } else {
-            self.config.poll
+            return CONFIRM_TICK;
+        }
+        let tick = self.config.poll;
+        // El chime diferido (HU-42) necesita despertar a su hora aunque no
+        // llegue ningún evento de voz.
+        match self.chime_deadline {
+            Some(deadline) => tick.min(deadline.saturating_duration_since(Instant::now())),
+            None => tick,
         }
     }
 
@@ -1881,7 +1984,15 @@ impl ControlLoop {
     fn reconcile(&mut self) {
         let muted = self.core.is_muted();
         if self.is_sounding() {
-            self.last_sounding = Some(Instant::now());
+            let now = Instant::now();
+            self.last_sounding = Some(now);
+            // Inicio de la locución: base de la ventana de fusión temprana
+            // (HU-42, H-T5).
+            if self.speech_started.is_none() {
+                self.speech_started = Some(now);
+            }
+        } else {
+            self.speech_started = None;
         }
         if self.capture_enabled != Some(!muted) {
             self.capture_enabled = Some(!muted);
@@ -1892,6 +2003,8 @@ impl ControlLoop {
                 self.pending = None;
                 self.candidate = None;
                 self.echo_segment = false;
+                self.continuation_expected = false;
+                self.chime_deadline = None;
             } else {
                 self.activation.unmute();
             }
@@ -1926,10 +2039,36 @@ impl ControlLoop {
         }) = &self.pending
         {
             if Instant::now() >= *deadline {
-                if let Some(turn) = self.pending.take() {
+                if self.stt_in_flight.load(Ordering::Acquire) > 0 {
+                    // Carrera STT/`VoiceStart` (HU-42, H-T6): hay una
+                    // transcripción en vuelo, así que la continuación del
+                    // usuario puede estar a punto de llegar. Se aplaza el
+                    // despacho en vez de cortar su frase en dos.
+                    if let Some(pending) = &mut self.pending {
+                        pending.deadline = Some(Instant::now() + self.config.connector_grace);
+                    }
+                } else if let Some(turn) = self.pending.take() {
                     self.dispatch(turn.query, turn.at);
                 }
             }
+        }
+        self.flush_chime();
+    }
+
+    /// Emite el chime diferido si venció su retardo y Jarvis sigue callado
+    /// (HU-42, H-T4). Cualquier voz del usuario lo cancela antes.
+    fn flush_chime(&mut self) {
+        let Some(deadline) = self.chime_deadline else {
+            return;
+        };
+        if self.core.is_muted() || self.is_sounding() {
+            // Silencio pedido o Jarvis ya habla: el chime sobra.
+            self.chime_deadline = None;
+            return;
+        }
+        if Instant::now() >= deadline {
+            self.chime_deadline = None;
+            let _ = self.tts.send(TtsJob::Chime { pcm: synth_chime() });
         }
     }
 
@@ -1946,7 +2085,11 @@ impl ControlLoop {
                 // voz sigue, es el usuario; si desaparece, era eco (CA-2.1).
                 let sounding = self.is_sounding();
                 if sounding {
-                    self.last_sounding = Some(Instant::now());
+                    let now = Instant::now();
+                    self.last_sounding = Some(now);
+                    // La locución pudo empezar después del último tick: sin
+                    // esto la ventana de fusión temprana no existiría aún.
+                    self.speech_started.get_or_insert(now);
                 }
                 // El usuario empezó a hablar: mantén viva la ventana de
                 // seguimiento para que una frase larga no caduque a mitad de
@@ -1956,13 +2099,28 @@ impl ControlLoop {
                 if self.activation.is_follow_up_open() {
                     self.activation.open_follow_up();
                 }
+                // Ventana de continuación (HU-42, H-T4): la voz que llega
+                // justo después de un despacho es del usuario, nunca eco del
+                // chime ni de la cola de la respuesta anterior. Además, el
+                // chime diferido se cancela: nadie pisa al que retoma.
+                let in_window = self.in_continuation_window(at);
+                if in_window {
+                    self.chime_deadline = None;
+                }
+                // Si Jarvis ya suena con la respuesta a ESTE turno, la ventana
+                // no exime: sin barge-in, esa voz puede ser eco del parlante
+                // (HU-29); un segmento largo igual se rescata por ECHO_MAX_MS.
+                let continuing = in_window && !self.sounded_since_dispatch();
+                if continuing {
+                    self.echo_segment = false;
+                }
                 if !self.barge_in.load(Ordering::Relaxed) {
                     // Sin barge-in, todo lo que empieza con Jarvis sonando
                     // (o en su cola) es eco: la locución sigue intacta.
                     let in_tail = self
                         .last_sounding
                         .is_some_and(|last| at.saturating_duration_since(last) < ECHO_TAIL);
-                    if sounding || in_tail {
+                    if !continuing && (sounding || in_tail) {
                         self.echo_segment = true;
                         return;
                     }
@@ -1975,17 +2133,66 @@ impl ControlLoop {
                         voiced: 0,
                     });
                 }
-                if let Some(pending) = &mut self.pending {
-                    // El usuario retoma tras un conector: silencio extendido.
+                // La voz en curso continúa el turno recién despachado (Jarvis
+                // piensa o acaba de empezar a hablar): lo que transcriba se
+                // fusiona en vez de responderse por separado (HU-42, H-T5).
+                if self.starts_continuation() {
+                    self.continuation_expected = true;
+                    self.chime_deadline = None;
+                }
+                // Carrera STT/`VoiceStart` (HU-42, H-T6): si el usuario retoma
+                // mientras whisper transcribe el fragmento anterior, se avisa
+                // al DSP (silencio extendido) y no se despacha la mitad.
+                let transcribing = self.stt_in_flight.load(Ordering::Acquire) > 0;
+                if self.pending.is_some() || transcribing {
                     if let Some(connector) = self.capture.connector() {
                         connector.signal();
                     }
+                    self.continuation_expected = true;
+                }
+                if let Some(pending) = &mut self.pending {
+                    // El usuario retoma tras un conector: silencio extendido.
                     pending.deadline = None;
                 }
             }
-            VoiceEvent::EndOfTurn { at, segment } => {
+            VoiceEvent::Partial { at, segment, index } => {
+                // Turno largo (HU-44): el usuario sigue hablando. Un fragmento
+                // de `max_segment_ms` jamás es eco, y lo retenido no vence
+                // mientras tanto.
+                self.mark_voice(at);
+                self.stats.partials.fetch_add(1, Ordering::Relaxed);
+                self.echo_segment = false;
+                self.chime_deadline = None;
+                if self.activation.is_follow_up_open() {
+                    self.activation.open_follow_up();
+                }
+                if let Some(pending) = &mut self.pending {
+                    pending.deadline = None;
+                }
+                if !self.stt_ready.load(Ordering::Acquire) {
+                    return;
+                }
+                let job = SttJob::Segment {
+                    pcm: segment.pcm,
+                    at,
+                    duration_ms: segment.duration_ms,
+                    part: TurnPart::Partial(index),
+                };
+                if self.stt.try_send(job).is_err() {
+                    eprintln!("[voz] fragmento descartado: la transcripción va atrasada.");
+                }
+            }
+            VoiceEvent::EndOfTurn {
+                at,
+                segment,
+                partials,
+                close_reason,
+            } => {
                 self.mark_voice(at);
                 self.stats.segments.fetch_add(1, Ordering::Relaxed);
+                // Razón del cierre (HU-41): se cuenta siempre, incluso si el
+                // turno luego se descarta como eco o sin transcriptor.
+                self.stats.count_close(close_reason);
                 if std::mem::take(&mut self.echo_segment) && segment.duration_ms <= ECHO_MAX_MS {
                     // Eco corto de la voz de Jarvis: no se transcribe. Un eco
                     // físico nunca supera ~700 ms; si dura más es voz real del
@@ -2003,6 +2210,7 @@ impl ControlLoop {
                     pcm: segment.pcm,
                     at,
                     duration_ms: segment.duration_ms,
+                    part: TurnPart::Final(partials),
                 };
                 if self.stt.try_send(job).is_err() {
                     eprintln!("[voz] turno descartado: la transcripción va atrasada.");
@@ -2017,6 +2225,9 @@ impl ControlLoop {
         }
         match outcome.activation {
             Activation::Accepted { query } => {
+                // Hubo voz del usuario que continúa el turno recién
+                // despachado (HU-42, H-T5).
+                let continuation = std::mem::take(&mut self.continuation_expected);
                 // Órdenes de anulación prioritaria (silencio, kill switch,
                 // cancelar tareas): cortan cualquier razonamiento en curso y se
                 // despachan en el acto. Jamás se fusionan con una continuación
@@ -2031,7 +2242,7 @@ impl ControlLoop {
                 }
                 if let Some(held) = self.pending.take() {
                     let merged = format!("{} {query}", held.query);
-                    if outcome.connector {
+                    if outcome.incomplete {
                         // La continuación también termina en conector: se
                         // encadena y se vuelve a esperar la siguiente parte
                         // antes de despachar (HU-29).
@@ -2044,20 +2255,26 @@ impl ControlLoop {
                         self.dispatch(merged, held.at);
                     }
                 } else {
-                    let is_thinking = self.core.state() == JarvisState::Thinking;
-                    let continuation = if is_thinking {
+                    // Fusión en `Thinking` (HU-AUDIO-CONTINUITY) y también en
+                    // los primeros milisegundos de `Speaking` (HU-42, H-T5):
+                    // una respuesta local rápida no debe partir la frase del
+                    // usuario en dos turnos.
+                    let may_merge = continuation
+                        || self.core.state() == JarvisState::Thinking
+                        || self.in_early_speech();
+                    let previous = if may_merge {
                         self.pending_user_turn.take()
                     } else {
                         self.pending_user_turn.clear();
                         None
                     };
-                    if let Some(previous) = continuation {
+                    if let Some(previous) = previous {
                         // El usuario pausó, Jarvis empezó a procesar y siguió
                         // hablando: se fusiona con el turno en curso y se vuelve a
                         // despachar completo (HU-AUDIO-CONTINUITY).
                         let merged = format!("{previous} {query}");
                         self.cancel_in_flight();
-                        if outcome.connector {
+                        if outcome.incomplete {
                             self.pending = Some(PendingTurn {
                                 query: merged,
                                 at: outcome.at,
@@ -2066,7 +2283,7 @@ impl ControlLoop {
                         } else {
                             self.dispatch_with_fragment(merged, Some(query), outcome.at);
                         }
-                    } else if outcome.connector {
+                    } else if outcome.incomplete {
                         self.pending = Some(PendingTurn {
                             query,
                             at: outcome.at,
@@ -2081,7 +2298,9 @@ impl ControlLoop {
                 if matches!(outcome.activation, Activation::Rejected) {
                     self.stats.rejected.fetch_add(1, Ordering::Relaxed);
                 }
-                // La continuación no fue voz útil: sale lo retenido.
+                // La continuación no fue voz útil: se olvida la fusión y sale
+                // lo retenido.
+                self.continuation_expected = false;
                 if let Some(held) = self.pending.take() {
                     self.dispatch(held.query, held.at);
                 }
@@ -2118,6 +2337,7 @@ impl ControlLoop {
         if !user_spoke {
             self.playback.resume();
             self.echo_segment = true;
+            self.continuation_expected = false;
             let n = self.stats.echo_rejected.fetch_add(1, Ordering::Relaxed) + 1;
             println!("[voz] voz descartada como eco de Jarvis ({n} en la sesión).");
             return;
@@ -2128,6 +2348,8 @@ impl ControlLoop {
             Some(client) => client.as_ref(),
             None => &NoBrain,
         };
+        // Se evalúa antes del barge-in, que saca al núcleo de `Speaking`.
+        let early = self.in_early_speech();
         let interrupted = match self.core.state() {
             JarvisState::Speaking => barge_in(&self.core, &self.playback, client),
             _ => {
@@ -2140,9 +2362,18 @@ impl ControlLoop {
             self.stats
                 .last_barge_in_us
                 .store(silence_us, Ordering::Relaxed);
-            // La respuesta interrumpida deja de ser el turno pendiente: lo que
-            // diga ahora es una pregunta nueva, no una continuación.
-            self.pending_user_turn.clear();
+            if early {
+                // La respuesta apenas había empezado: lo que diga ahora es la
+                // continuación de su propia frase, así que el turno pendiente
+                // se conserva para fusionarse (HU-42, H-T5).
+                self.continuation_expected = true;
+                println!("[voz] barge-in temprano: el turno se fusionará.");
+            } else {
+                // La respuesta interrumpida deja de ser el turno pendiente: lo
+                // que diga ahora es una pregunta nueva, no una continuación.
+                self.pending_user_turn.clear();
+                self.continuation_expected = false;
+            }
             // Lo que diga ahora se acepta sin repetir "Jarvis".
             self.activation.open_follow_up();
             println!(
@@ -2164,6 +2395,37 @@ impl ControlLoop {
         self.core.state() == JarvisState::Speaking
     }
 
+    /// `true` si `at` cae en la ventana de continuación post-despacho
+    /// (HU-42, H-T4): la voz de ahí es del usuario, nunca eco.
+    fn in_continuation_window(&self, at: Instant) -> bool {
+        self.last_turn_end
+            .is_some_and(|end| at.saturating_duration_since(end) < self.config.continuation_window)
+    }
+
+    /// `true` si Jarvis sonó después del último despacho, es decir, con la
+    /// respuesta al turno en curso (HU-42): esa voz sí puede ser eco.
+    fn sounded_since_dispatch(&self) -> bool {
+        match (self.last_sounding, self.last_turn_end) {
+            (Some(sounding), Some(end)) => sounding > end,
+            _ => false,
+        }
+    }
+
+    /// `true` si la locución en curso apenas empezó (HU-42, H-T5).
+    fn in_early_speech(&self) -> bool {
+        self.core.state() == JarvisState::Speaking
+            && self
+                .speech_started
+                .is_some_and(|started| started.elapsed() < self.config.speaking_merge_window)
+    }
+
+    /// `true` si la voz que empieza continúa el turno recién despachado: Jarvis
+    /// aún piensa o acaba de empezar a hablar (HU-42, H-T5).
+    fn starts_continuation(&self) -> bool {
+        self.pending_user_turn.is_some()
+            && (self.core.state() == JarvisState::Thinking || self.in_early_speech())
+    }
+
     /// Entrega un turno al cerebro, cancelando el que esté en curso.
     fn dispatch(&mut self, query: String, at: Instant) {
         self.dispatch_with_fragment(query, None, at);
@@ -2179,6 +2441,13 @@ impl ControlLoop {
         ) {
             self.cancel_in_flight();
         }
+        // Origen de la ventana de continuación (HU-42, H-T4): lo que diga el
+        // usuario a partir de ahora no es eco.
+        self.last_turn_end = Some(Instant::now());
+        self.continuation_expected = false;
+        // El chime ya no suena al aceptar el turno: se difiere para no pisar
+        // una continuación (HU-42, H-T4). Si nadie retoma, sonará al vencer.
+        self.chime_deadline = Some(Instant::now() + self.config.chime_delay);
         self.pending_user_turn.set(query.clone());
         let _ = self.brain.send(BrainJob::Turn {
             query,
@@ -2217,8 +2486,11 @@ fn stt_loop(
     out: &Sender<SttOutcome>,
     activation: &ActivationDetector,
     ready: &AtomicBool,
+    in_flight: &AtomicUsize,
 ) {
     let mut transcriber: Option<Box<dyn Transcriber + Send>> = None;
+    // Texto de un turno largo aún abierto (HU-44).
+    let mut long_turn: Option<LongTurnText> = None;
     for job in jobs {
         match job {
             SttJob::SetTranscriber(t) => {
@@ -2229,36 +2501,93 @@ fn stt_loop(
                 pcm,
                 at,
                 duration_ms,
+                part,
             } => {
-                let Some(t) = transcriber.as_deref() else {
-                    continue;
+                // El hilo de voz consulta este contador para no despachar un
+                // turno retenido mientras la continuación se transcribe
+                // (HU-42, H-T6).
+                in_flight.fetch_add(1, Ordering::AcqRel);
+                // `at` marca el cierre del segmento: restamos su duración para
+                // saber cuándo empezó la voz (HU-29).
+                let duration = Duration::from_millis(u64::from(duration_ms));
+                let segment_start = at.checked_sub(duration).unwrap_or(at);
+                let text = match transcriber.as_deref() {
+                    None => None,
+                    // En silencio ni siquiera se transcribe (CA-4.3).
+                    Some(_) if activation.is_muted() => None,
+                    Some(t) => t
+                        .transcribe(&pcm)
+                        .inspect_err(|e| eprintln!("[stt] falló la transcripción: {e}"))
+                        .ok(),
                 };
-                // En silencio ni siquiera se transcribe (CA-4.3).
-                if activation.is_muted() {
-                    continue;
-                }
-                match t.transcribe(&pcm) {
-                    Ok(text) => {
+                drop(pcm);
+                let outcome = match (part, text) {
+                    (TurnPart::Partial(index), Some(text)) => {
+                        println!("[stt] fragmento {} de un turno largo: {text}", index + 1);
+                        // El primer fragmento abre el acumulador; si se perdió,
+                        // se abre con el que llegue (mejor media frase que nada).
+                        let acc = match long_turn.as_mut() {
+                            Some(acc) if index > 0 => acc,
+                            _ => long_turn.insert(LongTurnText {
+                                text: String::new(),
+                                started_at: segment_start,
+                            }),
+                        };
+                        push_words(&mut acc.text, &text);
+                        None
+                    }
+                    (TurnPart::Final(partials), Some(text)) => {
+                        // Un cierre sin parciales nunca hereda texto viejo.
+                        let previous = long_turn.take().filter(|_| partials > 0);
+                        let (text, started_at) = match previous {
+                            Some(mut acc) => {
+                                push_words(&mut acc.text, &text);
+                                (acc.text, acc.started_at)
+                            }
+                            None => (text, segment_start),
+                        };
                         println!("[stt] escuchado: {text}");
-                        // `at` marca el cierre del turno: restamos la duración
-                        // del segmento para saber cuándo empezó la voz (HU-29).
-                        let duration = Duration::from_millis(u64::from(duration_ms));
-                        let started_at = at.checked_sub(duration).unwrap_or(at);
-                        let outcome = SttOutcome {
-                            connector: ends_with_connector(&text),
+                        let cue = crate::incompleteness::incompleteness(&text);
+                        if let Some(cue) = cue {
+                            println!(
+                                "[stt] frase incompleta ({}): se espera la continuación.",
+                                cue.as_str()
+                            );
+                        }
+                        Some(SttOutcome {
+                            incomplete: cue.is_some(),
                             activation: activation.process_text_started_at(&text, started_at),
                             at,
-                        };
-                        if out.send(outcome).is_err() {
-                            break;
-                        }
+                        })
                     }
-                    Err(e) => eprintln!("[stt] falló la transcripción: {e}"),
+                    (_, None) => {
+                        // Silencio, sin transcriptor o fallo: el turno largo
+                        // en curso ya no puede completarse con coherencia.
+                        long_turn = None;
+                        None
+                    }
+                };
+                let sent = outcome.is_none_or(|outcome| out.send(outcome).is_ok());
+                in_flight.fetch_sub(1, Ordering::AcqRel);
+                if !sent {
+                    break;
                 }
             }
             SttJob::Shutdown => break,
         }
     }
+}
+
+/// Añade `words` a `text` separándolos con un espacio.
+fn push_words(text: &mut String, words: &str) {
+    let words = words.trim();
+    if words.is_empty() {
+        return;
+    }
+    if !text.is_empty() {
+        text.push(' ');
+    }
+    text.push_str(words);
 }
 
 // ------------------------------------------------------------------ jarvis-tts
@@ -2623,9 +2952,8 @@ impl BrainLoop {
         let _ = self
             .core
             .transition_from(JarvisState::Speaking, JarvisState::Listening);
-        // Feedback inmediato sin palabras: chime suave en lugar del filler
-        // hablado (HU-18). Se reproduce en cuanto el turno es aceptado.
-        self.play_chime();
+        // El chime de confirmación (HU-18) ya no se reproduce aquí: el hilo de
+        // voz lo difiere y lo cancela si el usuario retoma su frase (HU-42).
 
         match local_command(query) {
             Some(LocalCommand::Time) => {
@@ -2784,11 +3112,6 @@ impl BrainLoop {
         }
     }
 
-    /// Encola el chime de confirmación para que suene sin bloquear el turno.
-    fn play_chime(&self) {
-        let _ = self.tts.send(TtsJob::Chime { pcm: synth_chime() });
-    }
-
     /// Cambia la voz del coordinador y recalienta su caché de fillers.
     fn set_voice(&mut self, voice_id: &str) {
         self.coordinator.set_voice(voice_id);
@@ -2843,8 +3166,9 @@ impl BrainLoop {
         }
         match result {
             Ok(completion) => {
-                if !completion.text.trim().is_empty() {
-                    self.last_assistant_response = Some(completion.text);
+                let spoken = strip_directives(&completion.text);
+                if !spoken.trim().is_empty() {
+                    self.last_assistant_response = Some(spoken);
                 }
                 if self.core.state() == JarvisState::Speaking {
                     self.finish_after(generation, AfterSpeech::Listen);

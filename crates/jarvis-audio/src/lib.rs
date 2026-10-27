@@ -13,6 +13,8 @@
 //!   `jarvis-audio-dsp`).
 //! - [`vad`]: detección de voz con `earshot` y *endpointing* de turno.
 //! - [`events`]: eventos de voz hacia el coordinador.
+//! - [`incompleteness`]: detector léxico de frases inacabadas en español
+//!   (HU-43).
 //! - [`activation`]: palabra de activación "Jarvis", ventana de seguimiento y
 //!   modo silencio (HU-4).
 //! - [`models`]: descarga y verificación segura de modelos whisper (HU-7).
@@ -29,6 +31,7 @@ pub mod brain;
 pub mod conversation;
 pub mod dsp;
 pub mod events;
+pub mod incompleteness;
 pub mod io;
 pub mod models;
 pub mod orchestrator;
@@ -53,7 +56,8 @@ pub use dsp::{
     spawn_dsp_thread, ConnectorSignal, DspError, DspHandle, DspMetrics, DspMetricsSnapshot,
     DspThreadConfig, LatencyProbe, ProcessorConfig,
 };
-pub use events::{HudEvent, Segment, TurnId, VoiceEvent};
+pub use events::{CloseReason, HudEvent, Segment, TurnId, VoiceEvent};
+pub use incompleteness::{incompleteness, incompleteness_score, is_incomplete, IncompleteCue};
 pub use io::{
     AudioEngine, AudioError, AudioMetrics, AudioMetricsSnapshot, EngineConfig, EngineStatus,
     PlayOutcome, Player,
@@ -75,8 +79,11 @@ pub use tasks::{
     classify_workload, dev_task_prompt, split_task_output, summarize, task_title, BrainFactory,
     TaskConfig, TaskId, TaskManager, TaskOrigin, TaskRecord, TaskStatus, Workload, DEV_TASK_TITLE,
 };
-pub use tts::{EdgeTtsEngine, FillerCategory, PcmAudio, PhraseSplitter, TtsBackend, TtsError};
-pub use vad::{EndpointConfig, Endpointer, VadDetector};
+pub use tts::{
+    strip_directives, DirectedPhrase, EdgeTtsEngine, FillerCategory, Mood, PcmAudio, PhraseGrouper,
+    PhraseSplitter, SpeechDirective, TtsBackend, TtsError,
+};
+pub use vad::{EndpointConfig, Endpointer, TurnPauseStats, TurnPauseSummary, VadDetector};
 pub use voices::{resolve_voice, Gender, VoiceInfo, DEFAULT_VOICE_ID, DEFAULT_VOICE_LANG, VOICES};
 
 #[cfg(test)]

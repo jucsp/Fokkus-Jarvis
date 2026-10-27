@@ -77,7 +77,15 @@ pub const SYSTEM_PROMPT: &str = concat!(
     "Si una petición requiere tocar algo de eso, niégate brevemente. ",
     "Nunca uses markdown, listas, negritas, viñetas ni bloques de código: ",
     "tu respuesta se lee en voz alta. Sé conciso: una o dos frases salvo que te ",
-    "pidan más detalle."
+    "pidan más detalle. ",
+    "Habla con calidez y naturalidad, apoyándote en la puntuación expresiva ",
+    "(¡!, ¿?, …). Si aporta expresividad, puedes guiar tu voz con directivas entre ",
+    "corchetes que nunca se leen en voz alta: [ánimo:alegre|serio|empático|entusiasta|",
+    "calmo|curioso] antes de la frase, [ritmo:lento|normal|rápido], [pausa:300] ",
+    "(milisegundos), [respira] antes de una frase emotiva o larga, ",
+    "[énfasis]palabra[/énfasis] y [susurro]texto[/susurro]. Son opcionales: usa como ",
+    "máximo una o dos por respuesta y ningún otro texto entre corchetes. ",
+    "Ejemplo: [ánimo:entusiasta]¡Listo, ya quedó! [pausa:300]Te aviso cuando termine."
 );
 
 /// Error del cerebro conversacional.
@@ -636,6 +644,28 @@ mod tests {
     fn system_prompt_exposes_background_dev_dispatch() {
         assert!(SYSTEM_PROMPT.contains("fokkus-jarvis dev run"));
         assert!(SYSTEM_PROMPT.contains("segundo plano"));
+    }
+
+    #[test]
+    fn system_prompt_teaches_prosody_directives() {
+        for directive in [
+            "[ánimo:",
+            "[ritmo:",
+            "[pausa:300]",
+            "[respira]",
+            "[énfasis]",
+            "[susurro]",
+        ] {
+            assert!(SYSTEM_PROMPT.contains(directive), "{directive}");
+        }
+        assert!(SYSTEM_PROMPT.contains("una o dos por respuesta"));
+        // El ejemplo del prompt se limpia por completo antes de hablarse.
+        let example = "[ánimo:entusiasta]¡Listo, ya quedó! [pausa:300]Te aviso cuando termine.";
+        assert!(SYSTEM_PROMPT.contains(example));
+        assert_eq!(
+            crate::tts::strip_directives(example),
+            "¡Listo, ya quedó! Te aviso cuando termine."
+        );
     }
 
     #[test]

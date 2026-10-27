@@ -19,7 +19,9 @@ pub mod thread;
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use crate::vad::TurnPauseStats;
 
 pub use delay::{stream_delay_ms, DelayTerms, LatencyProbe};
 pub use processor::{EchoProcessor, ProcessorConfig, SonoraProcessor};
@@ -95,6 +97,9 @@ pub struct DspMetrics {
     /// `f64::to_bits` del ERLE; `u64::MAX` = sin dato.
     erle_db: AtomicU64,
     diagnostics: AtomicBool,
+    /// Pausas intra-turno de los turnos ya cerrados (HU-41). El hilo DSP lo
+    /// bloquea una vez por turno, nunca por frame.
+    pauses: Mutex<TurnPauseStats>,
 }
 
 /// Fotografía de [`DspMetrics`].
@@ -141,6 +146,25 @@ impl DspMetrics {
 
     pub(crate) fn set_stream_delay(&self, ms: i32) {
         self.stream_delay_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Suma las pausas de un turno recién cerrado al histograma (HU-41).
+    pub(crate) fn absorb_pauses(&self, turn: &TurnPauseStats) {
+        if turn.recorded() == 0 {
+            return;
+        }
+        self.pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .absorb(turn);
+    }
+
+    /// Copia del histograma de pausas intra-turno (base de `--diag-turns`).
+    pub fn pause_stats(&self) -> TurnPauseStats {
+        self.pauses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub fn snapshot(&self) -> DspMetricsSnapshot {

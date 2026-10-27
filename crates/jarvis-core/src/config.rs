@@ -46,6 +46,32 @@ pub const CLI_TIMEOUT_RANGE: std::ops::RangeInclusive<u32> = 30..=1_800;
 /// Hueco de silencio para entregar resultados de tareas, en milisegundos (HU-37).
 pub const TASKS_QUIET_GAP_RANGE: std::ops::RangeInclusive<u32> = 500..=5_000;
 
+/// Rango válido del umbral VAD que ABRE un turno (HU-41).
+///
+/// Por debajo de 0,1 el ruido estacionario abriría turnos; por encima de 0,95
+/// casi ninguna voz real lo superaría.
+pub const VOICE_OPEN_RANGE: std::ops::RangeInclusive<f32> = 0.1..=0.95;
+
+/// Rango válido del umbral VAD que MANTIENE el turno abierto (HU-41).
+pub const VOICE_HOLD_RANGE: std::ops::RangeInclusive<f32> = 0.05..=0.8;
+
+/// Rango válido del silencio de cierre normal, en milisegundos (HU-41).
+pub const SILENCE_MS_RANGE: std::ops::RangeInclusive<u32> = 300..=5_000;
+
+/// Rango válido del silencio de cierre extendido por conector (HU-41).
+pub const EXTENDED_SILENCE_MS_RANGE: std::ops::RangeInclusive<u32> = 500..=8_000;
+
+/// Rango válido de la duración máxima de un segmento (HU-41, techo de HU-44).
+pub const MAX_SEGMENT_MS_RANGE: std::ops::RangeInclusive<u32> = 5_000..=120_000;
+
+/// Rango válido del techo total de un turno largo, en milisegundos (HU-44).
+/// Nunca queda por debajo de `max_segment_ms` (ver
+/// [`VoiceEndpointConfig::max_turn_ms`]).
+pub const MAX_TURN_MS_RANGE: std::ops::RangeInclusive<u32> = 5_000..=120_000;
+
+/// Rango válido de la espera extra tras un turno que termina en conector (HU-41).
+pub const CONNECTOR_GRACE_MS_RANGE: std::ops::RangeInclusive<u32> = 100..=3_000;
+
 /// Lado de la esfera en píxeles lógicos para un porcentaje de escala,
 /// saturado a [`SPHERE_SCALE_RANGE`] (lo usa también la vista previa en vivo).
 pub fn sphere_size_for_pct(pct: u16) -> u32 {
@@ -110,11 +136,145 @@ pub enum BrainMode {
     Api,
 }
 
+/// Configuración del *endpointing* de turno (HU-41), tabla `[voice_endpoint]`.
+///
+/// Los seis valores son los que el DSP usa para decidir cuándo cierra el turno
+/// y cuánto espera cuando la transcripción termina en conector. Cada getter
+/// satura al rango documentado en sus constantes, así un TOML editado a mano
+/// nunca deja el detector en un estado absurdo (p. ej. `silence_ms = 0`).
+///
+/// Se conserva `Copy` y `PartialEq` (sin `Eq`) porque los umbrales VAD son
+/// `f32`; la comparación se hace por valor exacto, sin tolerancia.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceEndpointConfig {
+    /// Puntaje VAD mínimo para ABRIR el turno (histéresis alta).
+    #[serde(serialize_with = "serialize_f32_short")]
+    pub voice_open: f32,
+    /// Puntaje VAD mínimo para MANTENER el turno abierto (histéresis baja).
+    #[serde(serialize_with = "serialize_f32_short")]
+    pub voice_hold: f32,
+    /// Silencio continuo que cierra el turno, en milisegundos.
+    pub silence_ms: u32,
+    /// Silencio de cierre cuando hay un conector pendiente, en milisegundos.
+    pub extended_silence_ms: u32,
+    /// Duración máxima de un segmento, en milisegundos. Desde HU-44 no cierra
+    /// el turno: al alcanzarla se transcribe un fragmento parcial y se sigue.
+    pub max_segment_ms: u32,
+    /// Techo total de un turno largo (suma de fragmentos), en milisegundos
+    /// (HU-44). Al alcanzarlo el turno sí se cierra.
+    pub max_turn_ms: u32,
+    /// Espera extra tras un turno que termina en conector, en milisegundos.
+    pub connector_grace_ms: u32,
+}
+
+impl Default for VoiceEndpointConfig {
+    fn default() -> Self {
+        Self {
+            voice_open: 0.45,
+            voice_hold: 0.25,
+            silence_ms: 1_200,
+            extended_silence_ms: 2_000,
+            max_segment_ms: 30_000,
+            max_turn_ms: 120_000,
+            connector_grace_ms: 500,
+        }
+    }
+}
+
+/// Serializa un `f32` con su representación decimal más corta: TOML solo
+/// conoce `f64`, y el ensanchamiento directo escribiría `0.6000000238418579`
+/// en el `config.toml` que edita el usuario.
+fn serialize_f32_short<S: serde::Serializer>(
+    value: &f32,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    let short = value
+        .to_string()
+        .parse::<f64>()
+        .unwrap_or(f64::from(*value));
+    serializer.serialize_f64(short)
+}
+
+fn saturate_f32(value: f32, range: std::ops::RangeInclusive<f32>) -> f32 {
+    // Un `f32::NAN` no es comparable: `clamp` lo propagaría y el detector
+    // nunca abriría turno. Se cae al mínimo del rango.
+    if value.is_nan() {
+        return *range.start();
+    }
+    value.clamp(*range.start(), *range.end())
+}
+
+impl VoiceEndpointConfig {
+    /// Umbral de apertura, saturado a [`VOICE_OPEN_RANGE`].
+    pub fn voice_open(&self) -> f32 {
+        saturate_f32(self.voice_open, VOICE_OPEN_RANGE)
+    }
+
+    /// Umbral de mantenimiento, saturado a [`VOICE_HOLD_RANGE`].
+    pub fn voice_hold(&self) -> f32 {
+        saturate_f32(self.voice_hold, VOICE_HOLD_RANGE)
+    }
+
+    /// Silencio de cierre normal en ms, saturado a [`SILENCE_MS_RANGE`].
+    pub fn silence_ms(&self) -> u32 {
+        self.silence_ms
+            .clamp(*SILENCE_MS_RANGE.start(), *SILENCE_MS_RANGE.end())
+    }
+
+    /// Silencio de cierre extendido en ms, saturado a
+    /// [`EXTENDED_SILENCE_MS_RANGE`].
+    pub fn extended_silence_ms(&self) -> u32 {
+        self.extended_silence_ms.clamp(
+            *EXTENDED_SILENCE_MS_RANGE.start(),
+            *EXTENDED_SILENCE_MS_RANGE.end(),
+        )
+    }
+
+    /// Duración máxima del segmento en ms, saturada a [`MAX_SEGMENT_MS_RANGE`].
+    pub fn max_segment_ms(&self) -> u32 {
+        self.max_segment_ms
+            .clamp(*MAX_SEGMENT_MS_RANGE.start(), *MAX_SEGMENT_MS_RANGE.end())
+    }
+
+    /// Techo total del turno en ms, saturado a [`MAX_TURN_MS_RANGE`] y nunca
+    /// menor que [`max_segment_ms`](Self::max_segment_ms) (HU-44).
+    pub fn max_turn_ms(&self) -> u32 {
+        self.max_turn_ms
+            .clamp(*MAX_TURN_MS_RANGE.start(), *MAX_TURN_MS_RANGE.end())
+            .max(self.max_segment_ms())
+    }
+
+    /// Espera extra por conector en ms, saturada a
+    /// [`CONNECTOR_GRACE_MS_RANGE`].
+    pub fn connector_grace_ms(&self) -> u32 {
+        self.connector_grace_ms.clamp(
+            *CONNECTOR_GRACE_MS_RANGE.start(),
+            *CONNECTOR_GRACE_MS_RANGE.end(),
+        )
+    }
+
+    /// Copia con todos los valores saturados a su rango válido.
+    pub fn saturated(&self) -> Self {
+        Self {
+            voice_open: self.voice_open(),
+            voice_hold: self.voice_hold(),
+            silence_ms: self.silence_ms(),
+            extended_silence_ms: self.extended_silence_ms(),
+            max_segment_ms: self.max_segment_ms(),
+            max_turn_ms: self.max_turn_ms(),
+            connector_grace_ms: self.connector_grace_ms(),
+        }
+    }
+}
+
 /// Configuración persistente de Jarvis.
 ///
 /// `#[serde(default)]` hace que un archivo TOML parcial (p. ej. que solo
 /// defina `voice_id`) se complete con los valores por defecto del resto.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// No deriva `Eq`: la tabla `[voice_endpoint]` lleva umbrales `f32`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct JarvisConfig {
     /// Voz neuronal por defecto.
@@ -176,6 +336,9 @@ pub struct JarvisConfig {
     /// Automatización de escritorio (HU-38, tabla `[automation]`). Va al final:
     /// en TOML las tablas se emiten después de los valores simples.
     pub automation: AutomationConfig,
+    /// *Endpointing* de turno (HU-41, tabla `[voice_endpoint]`). También al
+    /// final, por la misma razón que `automation`.
+    pub voice_endpoint: VoiceEndpointConfig,
 }
 
 /// Configuración de la capa "ojos y manos" (HU-38). Apagada por defecto:
@@ -276,6 +439,7 @@ impl Default for JarvisConfig {
             hud_enabled: true,
             hud_max_bubbles: 3,
             automation: AutomationConfig::default(),
+            voice_endpoint: VoiceEndpointConfig::default(),
         }
     }
 }
@@ -391,6 +555,12 @@ impl JarvisConfig {
         self
     }
 
+    /// Reemplaza la tabla `[voice_endpoint]` completa (HU-41).
+    pub fn with_voice_endpoint(mut self, value: VoiceEndpointConfig) -> Self {
+        self.voice_endpoint = value;
+        self
+    }
+
     /// Comando CLI efectivo (el por defecto si quedó vacío).
     pub fn effective_cli_command(&self) -> &str {
         let command = self.cli_command.trim();
@@ -476,6 +646,51 @@ impl JarvisConfig {
             .clamp(*HUD_MAX_BUBBLES_RANGE.start(), *HUD_MAX_BUBBLES_RANGE.end())
     }
 
+    /// Configuración de *endpointing* con todos los valores ya saturados
+    /// (HU-41). Es lo que consume `jarvis-audio` para construir su
+    /// `EndpointConfig`.
+    pub fn voice_endpoint(&self) -> VoiceEndpointConfig {
+        self.voice_endpoint.saturated()
+    }
+
+    /// Umbral VAD de apertura de turno, saturado a [`VOICE_OPEN_RANGE`].
+    pub fn voice_open(&self) -> f32 {
+        self.voice_endpoint.voice_open()
+    }
+
+    /// Umbral VAD de mantenimiento, saturado a [`VOICE_HOLD_RANGE`].
+    pub fn voice_hold(&self) -> f32 {
+        self.voice_endpoint.voice_hold()
+    }
+
+    /// Silencio de cierre normal en ms, saturado a [`SILENCE_MS_RANGE`].
+    pub fn silence_ms(&self) -> u32 {
+        self.voice_endpoint.silence_ms()
+    }
+
+    /// Silencio de cierre extendido (conector) en ms, saturado a
+    /// [`EXTENDED_SILENCE_MS_RANGE`].
+    pub fn extended_silence_ms(&self) -> u32 {
+        self.voice_endpoint.extended_silence_ms()
+    }
+
+    /// Duración máxima de segmento en ms, saturada a [`MAX_SEGMENT_MS_RANGE`].
+    pub fn max_segment_ms(&self) -> u32 {
+        self.voice_endpoint.max_segment_ms()
+    }
+
+    /// Techo total de un turno largo en ms (HU-44), saturado a
+    /// [`MAX_TURN_MS_RANGE`].
+    pub fn max_turn_ms(&self) -> u32 {
+        self.voice_endpoint.max_turn_ms()
+    }
+
+    /// Espera extra tras un turno que termina en conector, en ms, saturada a
+    /// [`CONNECTOR_GRACE_MS_RANGE`].
+    pub fn connector_grace_ms(&self) -> u32 {
+        self.voice_endpoint.connector_grace_ms()
+    }
+
     /// Satura los valores fuera de rango al cargar (no es error de parseo).
     fn saturate(&mut self) {
         let scale = self.sphere_scale_pct();
@@ -555,6 +770,15 @@ impl JarvisConfig {
                 self.hud_max_bubbles
             );
             self.hud_max_bubbles = hud_bubbles;
+        }
+
+        let endpoint = self.voice_endpoint.saturated();
+        if endpoint != self.voice_endpoint {
+            eprintln!(
+                "[config] [voice_endpoint] con valores fuera de rango ({:?}): se saturan a {:?}",
+                self.voice_endpoint, endpoint
+            );
+            self.voice_endpoint = endpoint;
         }
     }
 
@@ -1086,5 +1310,172 @@ mod tests {
         let loaded2 = JarvisConfig::load_from(&path2).unwrap();
         assert_eq!(loaded2.hud_max_bubbles(), 1);
         cleanup(&path2);
+    }
+
+    #[test]
+    fn voice_endpoint_defaults_match_spec() {
+        let ep = VoiceEndpointConfig::default();
+        assert_eq!(ep.voice_open, 0.45);
+        assert_eq!(ep.voice_hold, 0.25);
+        assert_eq!(ep.silence_ms, 1_200);
+        assert_eq!(ep.extended_silence_ms, 2_000);
+        assert_eq!(ep.max_segment_ms, 30_000);
+        assert_eq!(ep.max_turn_ms, 120_000);
+        assert_eq!(ep.connector_grace_ms, 500);
+        // Los defaults ya están dentro de rango: saturar no cambia nada.
+        assert_eq!(ep.saturated(), ep);
+
+        let config = JarvisConfig::default();
+        assert_eq!(config.voice_endpoint(), ep);
+        assert_eq!(config.voice_open(), 0.45);
+        assert_eq!(config.voice_hold(), 0.25);
+        assert_eq!(config.silence_ms(), 1_200);
+        assert_eq!(config.extended_silence_ms(), 2_000);
+        assert_eq!(config.max_segment_ms(), 30_000);
+        assert_eq!(config.max_turn_ms(), 120_000);
+        assert_eq!(config.connector_grace_ms(), 500);
+    }
+
+    #[test]
+    fn voice_endpoint_roundtrips_through_toml() {
+        let ep = VoiceEndpointConfig {
+            voice_open: 0.6,
+            voice_hold: 0.35,
+            silence_ms: 900,
+            extended_silence_ms: 2_500,
+            max_segment_ms: 45_000,
+            max_turn_ms: 90_000,
+            connector_grace_ms: 750,
+        };
+        // Serialización/deserialización directa del struct.
+        let toml = toml::to_string(&ep).expect("serializa");
+        assert!(toml.contains("voice_open = 0.6"), "{toml}");
+        assert!(toml.contains("voice_hold = 0.35"), "{toml}");
+        assert!(toml.contains("silence_ms = 900"), "{toml}");
+        assert!(toml.contains("extended_silence_ms = 2500"), "{toml}");
+        assert!(toml.contains("max_segment_ms = 45000"), "{toml}");
+        assert!(toml.contains("max_turn_ms = 90000"), "{toml}");
+        assert!(toml.contains("connector_grace_ms = 750"), "{toml}");
+        let parsed: VoiceEndpointConfig = toml::from_str(&toml).expect("parsea");
+        assert_eq!(parsed, ep);
+
+        // Y como subtabla `[voice_endpoint]` de la configuración completa.
+        let path = temp_config_path("voice-endpoint-roundtrip");
+        cleanup(&path);
+        let config = JarvisConfig::default().with_voice_endpoint(ep);
+        config.save_to(&path).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("[voice_endpoint]"), "{written}");
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.voice_endpoint(), ep);
+        assert_eq!(loaded.voice_open(), 0.6);
+        assert_eq!(loaded.voice_hold(), 0.35);
+        assert_eq!(loaded.silence_ms(), 900);
+        assert_eq!(loaded.extended_silence_ms(), 2_500);
+        assert_eq!(loaded.max_segment_ms(), 45_000);
+        assert_eq!(loaded.max_turn_ms(), 90_000);
+        assert_eq!(loaded.connector_grace_ms(), 750);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn partial_voice_endpoint_table_fills_defaults() {
+        let path = temp_config_path("voice-endpoint-partial");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "voice_id = \"x\"\n[voice_endpoint]\nsilence_ms = 800\n",
+        )
+        .unwrap();
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.silence_ms(), 800);
+        // El resto de la tabla cae a los defaults.
+        assert_eq!(loaded.voice_open(), 0.45);
+        assert_eq!(loaded.voice_hold(), 0.25);
+        assert_eq!(loaded.extended_silence_ms(), 2_000);
+        assert_eq!(loaded.max_segment_ms(), 30_000);
+        assert_eq!(loaded.connector_grace_ms(), 500);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn out_of_range_voice_endpoint_saturates_on_load() {
+        let path = temp_config_path("voice-endpoint-sat-low");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[voice_endpoint]\nvoice_open = 0.0\nvoice_hold = -1.0\n\
+             silence_ms = 0\nextended_silence_ms = 1\nmax_segment_ms = 10\n\
+             connector_grace_ms = 0\n",
+        )
+        .unwrap();
+        let loaded = JarvisConfig::load_from(&path).unwrap();
+        assert_eq!(loaded.voice_open(), 0.1);
+        assert_eq!(loaded.voice_hold(), 0.05);
+        assert_eq!(loaded.silence_ms(), 300);
+        assert_eq!(loaded.extended_silence_ms(), 500);
+        assert_eq!(loaded.max_segment_ms(), 5_000);
+        assert_eq!(loaded.connector_grace_ms(), 100);
+        // La carga deja la estructura ya saturada (no solo el getter).
+        assert_eq!(loaded.voice_endpoint, loaded.voice_endpoint());
+        cleanup(&path);
+
+        let path2 = temp_config_path("voice-endpoint-sat-high");
+        cleanup(&path2);
+        std::fs::create_dir_all(path2.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path2,
+            "[voice_endpoint]\nvoice_open = 9.0\nvoice_hold = 9.0\n\
+             silence_ms = 99_999\nextended_silence_ms = 99_999\n\
+             max_segment_ms = 999_999\nmax_turn_ms = 999_999\n\
+             connector_grace_ms = 99_999\n",
+        )
+        .unwrap();
+        let loaded2 = JarvisConfig::load_from(&path2).unwrap();
+        assert_eq!(loaded2.voice_open(), 0.95);
+        assert_eq!(loaded2.voice_hold(), 0.8);
+        assert_eq!(loaded2.silence_ms(), 5_000);
+        assert_eq!(loaded2.extended_silence_ms(), 8_000);
+        assert_eq!(loaded2.max_segment_ms(), 120_000);
+        assert_eq!(loaded2.max_turn_ms(), 120_000);
+        assert_eq!(loaded2.connector_grace_ms(), 3_000);
+        cleanup(&path2);
+    }
+
+    #[test]
+    fn max_turn_never_drops_below_max_segment() {
+        // HU-44: un techo menor que el fragmento no tiene sentido; se eleva.
+        let ep = VoiceEndpointConfig {
+            max_segment_ms: 60_000,
+            max_turn_ms: 10_000,
+            ..VoiceEndpointConfig::default()
+        };
+        assert_eq!(ep.max_turn_ms(), 60_000);
+        let low = VoiceEndpointConfig {
+            max_turn_ms: 1,
+            max_segment_ms: 5_000,
+            ..VoiceEndpointConfig::default()
+        };
+        assert_eq!(low.max_turn_ms(), 5_000);
+        assert_eq!(low.saturated().max_turn_ms, 5_000);
+    }
+
+    #[test]
+    fn voice_endpoint_getters_saturate_without_write() {
+        // Un valor inválido construido en memoria también se satura al leerlo.
+        let ep = VoiceEndpointConfig {
+            voice_open: f32::NAN,
+            ..VoiceEndpointConfig::default()
+        };
+        assert_eq!(ep.voice_open(), *VOICE_OPEN_RANGE.start());
+        let config = JarvisConfig::default().with_voice_endpoint(VoiceEndpointConfig {
+            voice_open: 0.0,
+            silence_ms: 1,
+            ..VoiceEndpointConfig::default()
+        });
+        assert_eq!(config.voice_open(), 0.1);
+        assert_eq!(config.silence_ms(), 300);
     }
 }

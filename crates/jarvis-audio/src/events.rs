@@ -16,6 +16,35 @@ pub struct Segment {
     pub duration_ms: u32,
 }
 
+/// Razón por la que el *endpointer* cerró el turno (HU-41).
+///
+/// Viaja dentro de [`VoiceEvent::EndOfTurn`] para que el orquestador (y el
+/// volcado de diagnóstico `--diag-turns`) pueda auditar por qué se cortó cada
+/// turno: un exceso de `Silence` significa que el usuario no había terminado y
+/// conviene subir `silence_ms`; muchos `Connector` apuntan a un conector
+/// demasiado largo o a un silencio extendido excesivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseReason {
+    /// Venció el silencio normal (`silence_ms`).
+    Silence,
+    /// Se alcanzó el techo total del turno (`max_turn_ms`, HU-44).
+    MaxTimeout,
+    /// Cerró tras el silencio extendido por un conector pendiente
+    /// (`extended_silence_ms`).
+    Connector,
+}
+
+impl CloseReason {
+    /// Etiqueta estable (minúsculas) para logs y el volcado de diagnóstico.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Silence => "silence",
+            Self::MaxTimeout => "max_timeout",
+            Self::Connector => "connector",
+        }
+    }
+}
+
 /// Eventos emitidos por el detector de voz y fin de turno (HU-3).
 #[derive(Debug, Clone)]
 pub enum VoiceEvent {
@@ -28,12 +57,29 @@ pub enum VoiceEvent {
         /// Marca de tiempo monotónica del inicio detectado.
         at: Instant,
     },
-    /// Se detectó el fin de turno (o se alcanzó la duración máxima).
+    /// Fragmento intermedio de un turno largo (HU-44): el usuario lleva
+    /// `max_segment_ms` hablando y el turno sigue abierto. Se transcribe y
+    /// acumula, pero **no** se despacha; el texto completo sale con el
+    /// [`EndOfTurn`](Self::EndOfTurn) que cierra el turno.
+    Partial {
+        /// Marca de tiempo monotónica del corte del fragmento.
+        at: Instant,
+        /// Audio del fragmento (el primero incluye el *pre-roll*).
+        segment: Segment,
+        /// Posición del fragmento dentro del turno (0 = el primero).
+        index: u32,
+    },
+    /// Se detectó el fin de turno (o se alcanzó el techo total del turno).
     EndOfTurn {
         /// Marca de tiempo monotónica del cierre.
         at: Instant,
-        /// Audio del turno completo, incluyendo el *pre-roll* de 300 ms.
+        /// Audio del turno, incluyendo el *pre-roll* de 300 ms. Si hubo
+        /// fragmentos [`Partial`](Self::Partial), solo el último tramo.
         segment: Segment,
+        /// Fragmentos parciales emitidos antes de este cierre (HU-44).
+        partials: u32,
+        /// Por qué se cerró el turno (HU-41).
+        close_reason: CloseReason,
     },
 }
 

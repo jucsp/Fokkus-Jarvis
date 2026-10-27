@@ -1,11 +1,64 @@
 # Sprint Board — Fokkus-Jarvis
 
-**Épica:** Issue #7 (Fallback de despacho desacoplado vía tool) — ✅ CERRADA
-**Sprint:** Issue #7 Fallback / v0.2.27
-**Actualizado:** 2026-10-19 · **PM/QA:** Claude · **PO:** Antigravity · **Dev:** DeepSeek
-**Contratos:** [Issue #7](docs/specs/sdd-contracts/sdd-issue7-tareas-asincronas-cli-timeout.md) (Sección 7 y 8) · [HU-37](docs/specs/sdd-contracts/sdd-hu37-tareas-pesadas-asincronas-ipc.md)
+**Épica:** Épica 9 (E-12) Conversación Natural: Turn-Taking Humano y Voz Expresiva
+**Sprint:** E-12 Fase 1 (HU-41 a HU-46) — CÓDIGO COMPLETO (HU-41..46 ✅; pendientes solo pruebas manuales 🧪)
+**Actualizado:** 2026-10-27 · **PM/QA:** Claude · **PO:** Antigravity · **Dev:** DeepSeek
+**Contratos:** [Investigación Turn-Taking y Voz Expresiva](docs/specs/sdd-contracts/investigacion-turn-taking-voz-expresiva.md)
 
 Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere prueba manual
+
+---
+
+## 🏃 EN CURSO: E-12 FASE 1 (Quick Wins Conversacionales y Prosodia)
+
+### HU-41 — Endpointing configurable y observable
+- [x] 41.1 Campos en `jarvis-core`: tabla `[voice_endpoint]` (`voice_open`, `voice_hold`, `silence_ms`, `extended_silence_ms`, `max_segment_ms`, `connector_grace_ms`) con serde y saturación de rangos [Responsable: DeepSeek · fix serialización `f32` corta: Claude]
+- [x] 41.2 Exposición en `jarvis-audio`: `EndpointConfig: From<&VoiceEndpointConfig>`, enum `CloseReason` (`Silence`, `MaxTimeout`, `Connector`) en `VoiceEvent::EndOfTurn`, `TurnPauseStats` (P50/P90, anillo de 256) y conteo en `VoiceStats` [Responsable: DeepSeek]
+- [x] 41.3 Cableado en `jarvis-app`: `EngineConfig.endpoint`, `connector_grace` y `vad_threshold` desde config en `main.rs`; histograma DSP→`DspMetrics::pause_stats()`; flag `--diag-turns [segundos]` (`diag.rs`) [Responsable: Claude]
+- [x] 41.4 Validación y QA: tests en core/audio/app, `make test`, clippy `-D warnings` y `fmt-check` limpios [Responsable: Claude]
+- [ ] 41.5 🧪 Prueba manual: `fokkus-jarvis --diag-turns 60` hablando con pausas naturales y calibrar `silence_ms` según P90 [Responsable: PO]
+
+**QA 2026-10-27 (Claude):** `make test` → 652 passed / 0 failed / 3 ignored · clippy `-D warnings` OK · `make fmt-check` OK · `cargo deny` ❌ advisories preexistentes (RUSTSEC-2026-0385 `ctutils`, -0382 `rustls-webpki`, -0381 `webpki-roots`; Cargo.lock sin cambios) → requiere `cargo update -p` autorizado por PO.
+
+---
+
+### HU-42 — Ventana de continuación sin eco falso
+- [x] 42.1 Chime diferido (`chime_delay` 450 ms) emitido desde el hilo de voz y cancelado si el usuario retoma; ventana de continuación (`continuation_window` 1,5 s); fusión en `Speaking` temprano (`speaking_merge_window` 800 ms); contador `stt_in_flight` contra la carrera STT/`VoiceStart` (H-T6) [Responsable: DeepSeek]
+- [x] 42.2 Fixes QA [Responsable: Claude]: (a) la ventana ya no anula la defensa anti-eco cuando Jarvis suena con la respuesta del **turno en curso** (`sounded_since_dispatch`; rompía 2 tests de HU-29 con `barge_in=false`); (b) `in_early_speech()` se evaluaba **después** de `barge_in()` (estado ya en `Listening`) → la fusión tras barge-in temprano nunca ocurría; (c) `speech_started` solo lo fijaba `reconcile()` → un `VoiceStart` previo al tick perdía la ventana temprana
+- [x] 42.3 Tests de orquestador: chime diferido tras el retardo, chime cancelado + turno fusionado, voz en ventana no es eco (+ control negativo sin ventana), fusión por segmento largo en `Speaking` temprano, barge-in temprano fusiona / tardío abre pregunta nueva, STT lento no parte la frase (H-T6) [Responsable: Claude]
+
+### HU-43 — Detector léxico de incompletitud
+- [x] 43.1 Módulo `jarvis-audio/src/incompleteness.rs`: `incompleteness()` → `IncompleteCue` (`Connector`, `Filler`, `Preposition`, `Determiner`, `Auxiliary`, `TrailingOff`), `is_incomplete()`, `incompleteness_score()` (peso `p_text` para HU-47). `ends_with_connector` queda como alias; `SttOutcome.connector` → `incomplete` [Responsable: Claude]
+- [x] 43.2 `stt.rs`: `DEFAULT_INITIAL_PROMPT` con disfluencias ("Jarvis, eh... este, mmm, o sea, como que, igual...") por defecto en `WhisperEngine`; `without_initial_prompt()` / `initial_prompt()`; `runtime.rs` deja de pisarlo con "Jarvis." [Responsable: Claude]
+- [x] 43.3 Tabla de verdad de 65 casos + tests de vacilaciones y etiquetas; integración: muletilla final y preposición final retienen el turno y fusionan la continuación [Responsable: Claude]
+- [ ] 43.4 🧪 Prueba manual con whisper real: verificar que conserva "eh"/"o sea" y que el prompt no se alucina en silencio [Responsable: PO]
+
+### HU-44 — Turnos largos sin corte duro
+- [x] 44.1 `VoiceEvent::Partial { segment, index }` y `EndOfTurn.partials`; el endpointer entrega un fragmento cada `max_segment_ms` sin cerrar el turno y cierra por silencio real o al techo `max_turn_ms` (`CloseReason::MaxTimeout`). Memoria acotada a un fragmento [Responsable: Claude]
+- [x] 44.2 `max_turn_ms` en `[voice_endpoint]` (default 120 000, rango 5 000–120 000, nunca < `max_segment_ms`); `--diag-turns` muestra parciales y recomienda `max_turn_ms` [Responsable: Claude]
+- [x] 44.3 Orquestador/STT: los parciales se transcriben y acumulan como texto (`LongTurnText`), activación e incompletitud se evalúan sobre el turno completo; un parcial mantiene vivo un turno retenido por conector; un cierre sin parciales nunca hereda texto huérfano [Responsable: Claude]
+- [x] 44.4 Tests: parcial a 30 s + cierre por silencio sin pérdida de audio, techo de 120 s con 3 parciales, memoria ≤ 1 fragmento, pausa que cruza el corte, turno siguiente limpio, acumulación de punta a punta en el orquestador [Responsable: Claude]
+- [ ] 44.5 🧪 Prueba manual: dictar > 60 s y verificar una sola respuesta [Responsable: PO]
+
+**QA HU-42/43/44 2026-10-27 (Claude):** `make test` → 679 passed / 0 failed / 3 ignored · suite del orquestador 10/10 corridas estables · clippy `-D warnings` OK · `make fmt-check` OK. `cargo deny` sin re-ejecutar (advisories preexistentes, Cargo.lock sin cambios).
+
+### HU-45 — Protocolo de directivas de prosodia
+- [x] 45.1 `tts/directive.rs`: `SpeechDirective { mood, rate, pitch, volume, pause_before_ms, pause_after_ms, breath }`, `Mood` (alegre, serio, empático, entusiasta, calmo, curioso) y `DirectiveFilter` incremental para `[ánimo:…]`, `[ritmo:…]`, `[pausa:N]`, `[respira]`, `[énfasis]…[/énfasis]`, `[susurro]…[/susurro]` (con o sin tildes, sin distinguir mayúsculas) [Responsable: Claude]
+- [x] 45.2 Robustez: los tags partidos entre tokens se reensamblan; los desconocidos o malformados se descartan en silencio; un tag roto al final del stream o cortado por un espacio no se lee en voz alta; `[1]`, `array[0]`, `[ nota ]` siguen siendo texto [Responsable: Claude]
+- [x] 45.3 `PhraseSplitter::drain_directed()` / `finish_directed()` → `DirectedPhrase`; ánimo y ritmo persisten durante el turno; pausa, respiración y susurro fuerzan un corte de frase. HUD, TTS, `last_assistant_response` y las tareas de fondo (`strip_directives`) nunca reciben tags [Responsable: Claude]
+- [x] 45.4 `SYSTEM_PROMPT`: bloque con el protocolo, puntuación expresiva y un máximo de 1 o 2 directivas por respuesta, más un ejemplo [Responsable: Claude]
+- [x] 45.5 Tests: los 19 tags válidos, tags desconocidos y malformados, troceo de a un carácter, fuzzing (2 000 casos en el filtro y 1 000 en el splitter) que compara el stream troceado contra el texto completo y busca fugas [Responsable: Claude]
+
+### HU-46 — Render expresivo sobre Edge-TTS
+- [x] 46.1 `edge.rs`: `edge_speech_config()` / `synthesize_edge_with()` traducen la directiva al `<prosody>` de Edge (`rate` en %, `pitch` en Hz, `volume` en %). Tabla de ánimos (por ejemplo, entusiasta +8 %/+2 Hz/+5 % y empático −8 %/−2 Hz/−3 %), ritmo ±12 %, susurro −25 % de volumen, énfasis +5 % y pregunta +2 Hz, con límites [Responsable: Claude]
+- [x] 46.2 `tts/prosody.rs`: silencio PCM local antes y después de la frase, sin importar la tasa ni los canales; heurística de puntuación cuando no hay directiva (`…`/`...` → 400 ms, `.!?` → 250 ms, `;:` → 120 ms) y la primera frase sin pausa para no subir el tiempo hasta el primer audio [Responsable: Claude]
+- [x] 46.3 Respiración: inhalación sintética (ruido filtrado en banda de 300 a 2 500 Hz, 320 ms, pico 0,035, envolvente suave y determinista) más 70 ms de hueco antes de la voz [Responsable: Claude]
+- [x] 46.4 `EdgeTtsEngine::synthesize_directed()` y `ConversationCoordinator::synthesize_directed()`: las pausas y la respiración también se aplican sobre el fallback de espeak y el doble de prueba [Responsable: Claude]
+- [x] 46.5 Fix colateral: un `...` que llegaba partido se sintetizaba como frases sueltas `"."`; ahora un segmento sin palabras no se pronuncia y solo alarga la pausa [Responsable: Claude]
+- [ ] 46.6 Agrupar 2 o 3 frases por request si comparten directiva (H-V3, continuidad de entonación) — no implementado [Responsable: DeepSeek]
+- [ ] 46.7 🧪 Medir la varianza de F0 antes y después con Edge real, y hacer una prueba A/B de oído (que no suene caricaturesco) [Responsable: PO]
+
+**QA HU-45/46 2026-10-27 (Claude):** `make test` → 705 passed / 0 failed / 3 ignored · clippy `--workspace --all-targets -D warnings` OK · `make fmt-check` OK. Clips de respiración pregrabados reemplazados por síntesis procedural, porque el repo no tiene grabaciones.
 
 ---
 

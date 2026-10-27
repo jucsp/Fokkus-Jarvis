@@ -6,7 +6,9 @@
 
 pub mod endpoint;
 
-pub use endpoint::{EndpointConfig, Endpointer, FRAME_SAMPLES, SAMPLE_RATE};
+pub use endpoint::{
+    EndpointConfig, Endpointer, TurnPauseStats, TurnPauseSummary, FRAME_SAMPLES, SAMPLE_RATE,
+};
 
 use crate::io::callbacks::sanitize_slice;
 

@@ -21,6 +21,7 @@
 //! persistente ([`logging`]); si falta el modelo whisper se descarga en
 //! segundo plano y la escucha arranca al quedar cargado.
 
+mod diag;
 mod hud;
 mod logging;
 mod presence;
@@ -38,9 +39,9 @@ use std::time::Duration;
 use jarvis_audio::io::{AudioBackend, CpalBackend, InputPort, OutputPort, PortShared};
 use jarvis_audio::{
     ActivationDetector, AudioEngine, AudioPlayback, ConversationCoordinator, DspThreadConfig,
-    EdgeTtsEngine, EngineConfig, EngineControl, ModelManager, ModelStatus, SpeechPriority,
-    TaskConfig, TaskManager, TaskOrigin, TaskStatus, TtsBackend, VoiceConfig, VoiceDeps,
-    VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
+    EdgeTtsEngine, EndpointConfig, EngineConfig, EngineControl, ModelManager, ModelStatus,
+    SpeechPriority, TaskConfig, TaskManager, TaskOrigin, TaskStatus, TtsBackend, VoiceConfig,
+    VoiceDeps, VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
 };
 use jarvis_automation::{
     ActionRiskLevel, AutomationGuard, Capabilities, CaptureTarget, InputAction, InputSynth, Key,
@@ -82,6 +83,9 @@ enum CliAction {
     Capture(PathBuf),
     /// `dev run <tarea>`: despacha un desarrollo al gestor de tareas (HU-37).
     DevRun(String),
+    /// `--diag-turns [segundos]`: escucha y vuelca las métricas de cierre de
+    /// turno y pausas intra-turno (HU-41).
+    DiagTurns(Duration),
 }
 
 /// Resultado de una sonda de salud sobre un subsistema.
@@ -232,6 +236,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Input(action)) => run_input(action),
         Ok(CliAction::Capture(path)) => run_capture(&path),
         Ok(CliAction::DevRun(task)) => run_dev_task(&task),
+        Ok(CliAction::DiagTurns(window)) => diag::run(window),
         Err(message) => {
             eprintln!("{message}");
             print_usage();
@@ -248,6 +253,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         Some("-c" | "--check") => Ok(CliAction::Check),
         Some("-h" | "--help") => Ok(CliAction::Help),
         Some("--set-api-key") => Ok(CliAction::SetApiKey),
+        Some("--diag-turns") => diag::parse_secs(&args[1..]).map(CliAction::DiagTurns),
         Some("input") => parse_input(&args[1..]).map(CliAction::Input),
         Some("dev") => parse_dev(&args[1..]).map(CliAction::DevRun),
         Some("capture") => match &args[1..] {
@@ -323,6 +329,12 @@ fn print_usage() {
     println!("  -h, --help      Muestra esta ayuda y sale.");
     println!("  --set-api-key   Lee la API key de Anthropic por stdin y la guarda");
     println!("                  en el llavero del sistema.");
+    println!("  --diag-turns [segundos]");
+    println!(
+        "                  Escucha (por defecto {} s) y vuelca por qué se cierra",
+        diag::DEFAULT_SECS
+    );
+    println!("                  cada turno y las pausas P50/P90; luego sale.");
     println!();
     println!("Ojos y manos (requieren [automation] enabled = true):");
     println!("  input type <texto>          Escribe el texto en la ventana con foco.");
@@ -610,19 +622,22 @@ fn run() -> ExitCode {
     // Motor de audio: solo lanza el supervisor; los dispositivos se abren en
     // su hilo cuando el orquestador lo habilita.
     let (events_tx, events_rx) = crossbeam_channel::unbounded();
-    let mut engine = match AudioEngine::start_cpal(
-        EngineConfig::default(),
-        None,
-        None,
-        playback.clone(),
-        events_tx,
-    ) {
-        Ok(engine) => Some(engine),
-        Err(e) => {
-            eprintln!("[audio] no se pudo arrancar el motor de audio: {e}; Jarvis no escuchará.");
-            None
-        }
+    // Endpointing desde `[voice_endpoint]` (HU-41), ya saturado a rango.
+    let voice_endpoint = config.voice_endpoint();
+    let engine_config = EngineConfig {
+        endpoint: EndpointConfig::from(&voice_endpoint),
+        ..EngineConfig::default()
     };
+    let mut engine =
+        match AudioEngine::start_cpal(engine_config, None, None, playback.clone(), events_tx) {
+            Ok(engine) => Some(engine),
+            Err(e) => {
+                eprintln!(
+                    "[audio] no se pudo arrancar el motor de audio: {e}; Jarvis no escuchará."
+                );
+                None
+            }
+        };
 
     // Cerebro según la configuración: CLI local (por defecto `agy -p`) o la
     // API. Sin cerebro solo hay comandos locales y se avisa por voz.
@@ -670,6 +685,8 @@ fn run() -> ExitCode {
             startup_notice: brain_notice.map(str::to_string),
             clock: Arc::new(runtime::local_time),
             barge_in_enabled: config.barge_in_enabled,
+            connector_grace: Duration::from_millis(u64::from(voice_endpoint.connector_grace_ms)),
+            vad_threshold: voice_endpoint.voice_open,
             tasks: Some(task_config(&config)),
             automation_kill: Some({
                 let automation = Arc::clone(&automation);
@@ -1374,6 +1391,21 @@ mod tests {
             Ok(CliAction::SetApiKey)
         );
         assert!(parse_args(&args(&["--desconocida"])).is_err());
+    }
+
+    #[test]
+    fn diag_turns_flag_parses_window() {
+        assert_eq!(
+            parse_args(&args(&["--diag-turns"])),
+            Ok(CliAction::DiagTurns(Duration::from_secs(
+                diag::DEFAULT_SECS
+            )))
+        );
+        assert_eq!(
+            parse_args(&args(&["--diag-turns", "20"])),
+            Ok(CliAction::DiagTurns(Duration::from_secs(20)))
+        );
+        assert!(parse_args(&args(&["--diag-turns", "x"])).is_err());
     }
 
     #[test]

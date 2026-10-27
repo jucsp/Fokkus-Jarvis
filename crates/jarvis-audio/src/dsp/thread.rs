@@ -176,6 +176,11 @@ pub fn spawn_dsp_thread(
                             endpointer.signal_connector();
                         }
                         if let Some(event) = endpointer.process(frame, score, Instant::now()) {
+                            // Al cerrar el turno, sus pausas pasan a las
+                            // métricas compartidas (HU-41, `--diag-turns`).
+                            if matches!(event, VoiceEvent::EndOfTurn { .. }) {
+                                thread_metrics.absorb_pauses(&endpointer.take_pause_stats());
+                            }
                             receiver_gone |= events.send(event).is_err();
                         }
                     });

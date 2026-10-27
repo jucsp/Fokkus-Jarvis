@@ -23,6 +23,7 @@ use jarvis_core::tasks_dir;
 use crate::brain::{BrainError, CancellationToken};
 use crate::conversation::TokenStream;
 use crate::speech_queue::{Delivery, SpeechPriority, SpeechQueue};
+use crate::tts::strip_directives;
 
 /// Identificador estable de una tarea.
 pub type TaskId = u64;
@@ -768,11 +769,13 @@ fn run_worker(inner: Arc<Inner>, id: TaskId, title: String, prompt: String) {
 
     match result {
         Ok(completion) => {
-            let full = if completion.text.trim().is_empty() {
-                text.trim().to_string()
+            let raw = if completion.text.trim().is_empty() {
+                &text
             } else {
-                completion.text.trim().to_string()
+                &completion.text
             };
+            // Las directivas de prosodia (HU-45) no se leen ni se archivan.
+            let full = strip_directives(raw).trim().to_string();
             if full.is_empty() {
                 notify(
                     &inner,

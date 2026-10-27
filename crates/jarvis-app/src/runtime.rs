@@ -532,8 +532,9 @@ pub fn spawn_stt_loader(manager: ModelManager) -> Option<SttLoad<WhisperEngine>>
                 .map_err(|e| format!("modelo no disponible: {e}"))
                 .and_then(|model| {
                     let sha = model.sha256().to_string();
+                    // El prompt por defecto ya sesga hacia "Jarvis" y conserva
+                    // las muletillas (HU-43).
                     WhisperEngine::from_verified(model)
-                        .map(|engine| engine.with_initial_prompt("Jarvis."))
                         .map_err(|e| format!("whisper no pudo cargar el modelo: {e}"))
                         .inspect(|_| {
                             println!(

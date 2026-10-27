@@ -20,12 +20,16 @@
 
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use jarvis_core::{JarvisConfig, JarvisCore, JarvisState, SharedCore, TransitionError};
 
 use crate::brain::{BrainError, ClaudeClient, CliBrain, Completion};
 use crate::playback::AudioPlayback;
-use crate::tts::{EdgeTtsEngine, FillerCategory, PcmAudio, PhraseSplitter, TtsError};
+use crate::tts::{
+    apply_directive_pcm, DirectedPhrase, EdgeTtsEngine, FillerCategory, PcmAudio, PhraseGrouper,
+    PhraseSplitter, TtsError,
+};
 
 /// Palabras clave que identifican órdenes de desarrollo (dictamen §4.1).
 pub const DEV_KEYWORDS: &[&str] = &[
@@ -257,6 +261,8 @@ pub struct ConversationCoordinator {
     defer_finish: bool,
     /// Motor de síntesis alternativo (dobles de prueba).
     synth_override: Option<Box<SynthesizeFn>>,
+    /// Agrupa frases con la misma directiva en un request (HU-50).
+    group_phrases: bool,
 }
 
 impl ConversationCoordinator {
@@ -288,6 +294,7 @@ impl ConversationCoordinator {
             interrupted: false,
             defer_finish: false,
             synth_override: None,
+            group_phrases: true,
         }
     }
 
@@ -304,6 +311,12 @@ impl ConversationCoordinator {
     /// se cierra cuando el audio termina de sonar, no cuando acaba el stream.
     pub fn set_deferred_finish(&mut self, deferred: bool) {
         self.defer_finish = deferred;
+    }
+
+    /// Activa o desactiva la agrupación de frases (HU-50). Activa por
+    /// defecto; desactivada, cada frase va en su propio request.
+    pub fn set_phrase_grouping(&mut self, enabled: bool) {
+        self.group_phrases = enabled;
     }
 
     /// Estado actual de la máquina de estados.
@@ -511,6 +524,13 @@ impl ConversationCoordinator {
     {
         let generation = self.utterance_generation;
         let mut splitter = PhraseSplitter::new();
+        // HU-50: la primera frase sale sola; las siguientes con la misma voz
+        // van en un request para que Edge entone el párrafo como unidad.
+        let mut grouper = if self.group_phrases {
+            PhraseGrouper::new()
+        } else {
+            PhraseGrouper::disabled()
+        };
         let mut saw_phrase = false;
         let mut aborted = false;
 
@@ -526,7 +546,13 @@ impl ConversationCoordinator {
             }
 
             splitter.push(token);
-            for phrase in splitter.drain_available() {
+            let now = Instant::now();
+            let mut ready = Vec::new();
+            for phrase in splitter.drain_directed() {
+                ready.extend(grouper.push(phrase, now));
+            }
+            ready.extend(grouper.poll(now));
+            for phrase in ready {
                 if self.interrupted || self.playback.is_stop_requested() {
                     client.cancel();
                     aborted = true;
@@ -553,7 +579,7 @@ impl ConversationCoordinator {
                     }
                 }
 
-                if let Ok(pcm) = self.synthesize_phrase(&phrase) {
+                if let Ok(pcm) = self.synthesize_directed(&phrase) {
                     // Locución obsoleta por barge-in: descarta y aborta.
                     if self.is_stale(generation) {
                         client.cancel();
@@ -563,35 +589,41 @@ impl ConversationCoordinator {
                             .transition_from(JarvisState::Speaking, JarvisState::Listening);
                         return;
                     }
-                    on_phrase_audio(&phrase, &pcm);
+                    on_phrase_audio(&phrase.text, &pcm);
                 }
             }
         });
 
         // Remanente pendiente del segmentador al terminar el stream.
         if !aborted {
-            if let Some(remaining) = splitter.finish() {
-                if !self.interrupted && !self.playback.is_stop_requested() {
-                    if !saw_phrase {
-                        match self
-                            .core
-                            .transition_from(JarvisState::Thinking, JarvisState::Speaking)
-                        {
-                            Some(result) => {
-                                result?;
-                            }
-                            None => aborted = true,
+            let now = Instant::now();
+            let mut ready = Vec::new();
+            for phrase in splitter.finish_directed() {
+                ready.extend(grouper.push(phrase, now));
+            }
+            ready.extend(grouper.flush());
+            for remaining in ready {
+                if self.interrupted || self.playback.is_stop_requested() {
+                    break;
+                }
+                if !saw_phrase {
+                    match self
+                        .core
+                        .transition_from(JarvisState::Thinking, JarvisState::Speaking)
+                    {
+                        Some(result) => {
+                            result?;
+                            saw_phrase = true;
+                        }
+                        None => {
+                            aborted = true;
+                            break;
                         }
                     }
-                    let pcm = if aborted {
-                        None
-                    } else {
-                        self.synthesize_phrase(&remaining).ok()
-                    };
-                    if let Some(pcm) = pcm {
-                        if !self.is_stale(generation) {
-                            on_phrase_audio(&remaining, &pcm);
-                        }
+                }
+                if let Ok(pcm) = self.synthesize_directed(&remaining) {
+                    if !self.is_stale(generation) {
+                        on_phrase_audio(&remaining.text, &pcm);
                     }
                 }
             }
@@ -618,10 +650,16 @@ impl ConversationCoordinator {
 
     /// Sintetiza una frase con el motor configurado (o el doble inyectado).
     pub fn synthesize_phrase(&self, text: &str) -> Result<PcmAudio, TtsError> {
+        self.synthesize_directed(&DirectedPhrase::plain(text))
+    }
+
+    /// Sintetiza una frase con su prosodia (HU-46). El doble inyectado solo
+    /// recibe el texto; las pausas y la respiración se aplican igual.
+    pub fn synthesize_directed(&self, phrase: &DirectedPhrase) -> Result<PcmAudio, TtsError> {
         if let Some(synth) = &self.synth_override {
-            return synth(text);
+            return synth(&phrase.text).map(|pcm| apply_directive_pcm(pcm, &phrase.directive));
         }
-        self.tts.synthesize_phrase_native(text)
+        self.tts.synthesize_directed(phrase)
     }
 }
 
@@ -1074,6 +1112,59 @@ mod tests {
         cleanup(&dir);
     }
 
+    /// Corre un turno con `tokens` y devuelve el texto de cada request TTS.
+    fn streamed_requests(name: &str, tokens: &[&str], grouping: bool) -> Vec<String> {
+        let dir = temp_dir(name);
+        cleanup(&dir);
+        let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        coord.set_phrase_grouping(grouping);
+        coord.start_listening().unwrap();
+        coord.handle_user_utterance("hola").unwrap();
+        coord.synth_override = Some(Box::new(|_text| {
+            Ok(PcmAudio::new(vec![0.0, 0.5], 24_000, 1))
+        }));
+        let client = FakeClient {
+            tokens: tokens.iter().map(|t| t.to_string()).collect(),
+            cancelled: Cell::new(false),
+            interrupt_after: None,
+            playback: None,
+        };
+        let mut emitted = Vec::new();
+        coord
+            .run_turn_streaming_with(&client, "hola", &mut |phrase, _pcm| {
+                emitted.push(phrase.to_string());
+            })
+            .expect("turno de streaming");
+        assert_eq!(coord.state(), JarvisState::Idle);
+        cleanup(&dir);
+        emitted
+    }
+
+    #[test]
+    fn turn_streaming_groups_phrases_after_the_first_one() {
+        let tokens = [
+            "[ánimo:alegre]Listo",
+            ".",
+            " Revisé",
+            " el build",
+            ".",
+            " Todo",
+            " pasa",
+            ".",
+            " [pausa:300]Te",
+            " aviso",
+            ".",
+        ];
+        assert_eq!(
+            streamed_requests("streaming-grouped", &tokens, true),
+            ["Listo.", "Revisé el build. Todo pasa.", "Te aviso."]
+        );
+        assert_eq!(
+            streamed_requests("streaming-ungrouped", &tokens, false),
+            ["Listo.", "Revisé el build.", "Todo pasa.", "Te aviso."]
+        );
+    }
+
     #[test]
     fn barge_in_during_streaming_stops_phrases_and_preserves_background_tasks() {
         let dir = temp_dir("bargein-streaming");
@@ -1160,6 +1251,56 @@ mod tests {
             assert!(!coord.playback().is_stop_requested(), "turno {i}");
         }
 
+        cleanup(&dir);
+    }
+
+    /// HU-45/46: las directivas del LLM no llegan al HUD ni al TTS, y su
+    /// prosodia se aplica al audio de cada frase.
+    #[test]
+    fn streaming_turn_strips_directives_and_renders_pauses() {
+        let dir = temp_dir("streaming-directives");
+        cleanup(&dir);
+        let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        coord.start_listening().unwrap();
+        coord.handle_user_utterance("hola").unwrap();
+
+        let synthesized = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = std::sync::Arc::clone(&synthesized);
+        coord.synth_override = Some(Box::new(move |text| {
+            seen.lock().unwrap().push(text.to_string());
+            Ok(PcmAudio::new(vec![0.5; 2_400], 24_000, 1))
+        }));
+
+        let client = FakeClient {
+            tokens: vec![
+                "[ánimo:entu".to_string(),
+                "siasta]¡Listo!".to_string(),
+                " [pau".to_string(),
+                "sa:300][respira]Te".to_string(),
+                " aviso.".to_string(),
+            ],
+            cancelled: Cell::new(false),
+            interrupt_after: None,
+            playback: None,
+        };
+
+        let mut emitted = Vec::new();
+        coord
+            .run_turn_streaming_with(&client, "hola", &mut |phrase, pcm| {
+                emitted.push((phrase.to_string(), pcm.samples.len()));
+            })
+            .expect("turno con directivas");
+
+        assert_eq!(
+            *synthesized.lock().unwrap(),
+            vec!["¡Listo!".to_string(), "Te aviso.".to_string()]
+        );
+        let captions: Vec<&str> = emitted.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(captions, vec!["¡Listo!", "Te aviso."]);
+        // Primera frase sin silencio; la segunda con 300 ms de pausa,
+        // inhalación (320 ms) y su hueco (70 ms) antes de la voz.
+        assert_eq!(emitted[0].1, 2_400);
+        assert_eq!(emitted[1].1, 2_400 + 7_200 + 7_680 + 1_680);
         cleanup(&dir);
     }
 }
