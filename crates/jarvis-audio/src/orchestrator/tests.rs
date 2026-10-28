@@ -150,6 +150,7 @@ const SCRIPT: &[&str] = &[
     "Jarvis, ¿cómo va?",                                     // 35: CA-3
     "Jarvis, abre otro hilo para revisar los logs de Melón", // 36: paso 5
     "Jarvis, y también agrega el módulo de facturas",        // 37: continuación anafórica
+    "Jarvis, no busques en Google, dime de dónde salió la notificación", // 38: HU-71
 ];
 
 struct ScriptTranscriber;
@@ -1818,6 +1819,7 @@ fn a_slow_planner_times_out_instead_of_blocking_the_turn_hu63() {
     let request = crate::router::PlanRequest {
         text: SCRIPT[27],
         roster: &[],
+        constraints: crate::router::TurnConstraints::none(),
     };
     assert_eq!(
         planner.plan(&request),
@@ -2146,10 +2148,8 @@ fn stop_automation_is_recognized_with_priority() {
     }
     // "para" como preposición o "cancela" con objeto no son el kill switch.
     assert_eq!(local_command("para qué sirve esto"), None);
-    assert!(matches!(
-        local_command("busca vuelos para mañana"),
-        Some(LocalCommand::OpenUrl { .. })
-    ));
+    // HU-71: "busca X" sin sitio ya no abre Google; va al router.
+    assert_eq!(local_command("busca vuelos para mañana"), None);
     assert_eq!(
         local_command("cancela todas las tareas"),
         Some(LocalCommand::CancelTask {
@@ -2269,19 +2269,18 @@ fn google_search_commands_extract_the_query() {
             "{query}"
         );
     }
-    // Buscar sin sitio va a Google, salvo que sea algo del equipo o del
-    // trabajo del usuario (eso lo resuelve el LLM).
+    assert_eq!(
+        local_command("escribe en Google el clima en Temuco"),
+        google("clima+en+Temuco", "clima en Temuco")
+    );
+    // HU-71 (CA-71.1): buscar sin sitio ya no va a Google; lo decide el
+    // cerebro por el router.
     for query in [
         "busca el clima en Temuco",
         "búscame el clima en Temuco",
         "prueba buscar el clima en Temuco",
-        "escribe en Google el clima en Temuco",
     ] {
-        assert_eq!(
-            local_command(query),
-            google("clima+en+Temuco", "clima en Temuco"),
-            "{query}"
-        );
+        assert_eq!(local_command(query), None, "{query}");
     }
     assert!(matches!(
         local_command("abre google"),
@@ -2812,5 +2811,139 @@ fn free_question_reaches_converse_with_the_roster_hu65() {
             .iter()
             .all(|text| !text.contains(ROSTER_CONTEXT_HEADER)),
         "{user_said:?}"
+    );
+}
+
+// ─── HU-71: restricciones negativas del turno ───────────────────────────────
+
+fn opens_web(query: &str) -> bool {
+    local_command(query).is_some_and(|command| command.opens_web())
+}
+
+#[test]
+fn negated_web_requests_never_open_the_browser_hu71() {
+    // CA-71.3 (regresión P5) y tabla de verdad CA-71.5: (frase, no_web, abre web).
+    let table: &[(&str, bool, bool)] = &[
+        (
+            "no busques en Google, dime de dónde salió la notificación",
+            true,
+            false,
+        ),
+        (
+            "No busques en Google dime de dónde salió la notificación",
+            true,
+            false,
+        ),
+        ("no lo busques en internet", true, false),
+        (
+            "no lo busques en internet, ¿qué hora es en Tokio?",
+            true,
+            false,
+        ),
+        (
+            "sin buscar en la web, explícame qué es Kubernetes",
+            true,
+            false,
+        ),
+        ("no abras YouTube", true, false),
+        ("no abras el navegador", true, false),
+        ("no abre el navegador", true, false),
+        ("no abre youtube po", true, false),
+        ("ni se te ocurra googlearlo", true, false),
+        ("no me busques nada en Google, cachai", true, false),
+        ("oye no vayas a buscar en Google, dime tú", true, false),
+        ("no hace falta que busques en internet", true, false),
+        ("no quiero que busques en YouTube", true, false),
+        ("nunca busques eso en Google", true, false),
+        ("jamás lo googlees", true, false),
+        ("no vayas a internet, respóndeme al tiro", true, false),
+        ("porfa no lo busques en la web, dime nomás", true, false),
+        ("tampoco lo busques en Google", true, false),
+        ("no busques el clima en Temuco en Google", true, false),
+        // Negación acotada a su cláusula.
+        (
+            "no busques en Google, busca en YouTube Marvel Rivals",
+            false,
+            true,
+        ),
+        ("no sé, búscame el clima en Google", false, true),
+        ("no, busca el clima en Temuco en Google", false, true),
+        ("no lo sé pero busca recetas de pan en Google", false, true),
+        // Sin negación: igual que antes.
+        ("busca el clima en Temuco en Google", false, true),
+        ("búscame Marvel Rivals en youtube", false, true),
+        ("métete a YouTube y busca Marvel Rivals", false, true),
+        ("abre YouTube", false, true),
+        ("abre google", false, true),
+        // Negaciones que no tocan la web.
+        ("no abras Spotify", false, false),
+        ("no sé qué hora es", false, false),
+        ("busca el clima en Temuco", false, false),
+        ("no me digas la hora", false, false),
+    ];
+    for &(query, no_web, web) in table {
+        assert_eq!(turn_constraints(query).no_web, no_web, "no_web: {query}");
+        assert_eq!(opens_web(query), web, "abre web: {query}");
+    }
+    assert!(table.len() >= 30);
+}
+
+#[test]
+fn negated_google_search_goes_to_the_router_hu71() {
+    // Antes: abría google.com/search?q=dime+de+donde+salio… (P5).
+    assert_eq!(
+        local_command("no busques en Google, dime de dónde salió la notificación"),
+        None
+    );
+    assert_eq!(
+        local_command("no busques en Google, busca en YouTube Marvel Rivals"),
+        youtube_search("Marvel+Rivals", "Marvel Rivals")
+    );
+}
+
+#[test]
+fn no_web_does_not_block_local_commands_hu71() {
+    // CA-71.7: hora, reposo, kill switch y apps siguen igual con no_web.
+    assert_eq!(
+        local_command("no busques en Google, dime qué hora es"),
+        Some(LocalCommand::Time)
+    );
+    assert!(matches!(
+        local_command("sin buscar en internet, abre Spotify"),
+        Some(LocalCommand::OpenApp { .. })
+    ));
+    assert!(!LocalCommand::Time.opens_web());
+}
+
+#[test]
+fn negated_search_reaches_the_brain_with_the_no_web_directive_hu71() {
+    // CA-71.3 + CA-71.4c de extremo a extremo: no se lanza el navegador y el
+    // cerebro recibe la instrucción dura en el contexto efímero del turno.
+    let launched = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let config = VoiceConfig {
+        launcher: {
+            let launched = Arc::clone(&launched);
+            Arc::new(move |argv: &[String]| {
+                launched.lock().unwrap().push(argv.to_vec());
+                Ok(())
+            })
+        },
+        ..fast()
+    };
+    let brain = FakeBrain::new("Vino de Spectacle.");
+    let h = harness("hu71-no-web", Some(brain.clone()), config);
+
+    h.say_line(38);
+    wait_until("turno al cerebro", || brain.queries().len() == 1);
+    h.wait_state(JarvisState::Listening);
+
+    assert!(launched.lock().unwrap().is_empty(), "no abre el navegador");
+    assert_eq!(h.stats().local_commands, 0);
+    assert_eq!(h.stats().no_web_turns, 1);
+    assert!(brain.queries()[0].contains("dime de dónde salió la notificación"));
+    let context = brain.contexts()[0].clone().expect("directiva no_web");
+    assert!(
+        context.starts_with(crate::router::NO_WEB_DIRECTIVE),
+        "{context}"
     );
 }

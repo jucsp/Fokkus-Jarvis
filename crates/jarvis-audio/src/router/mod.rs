@@ -190,9 +190,72 @@ pub enum SessionControl {
     Cancel(SessionRef),
 }
 
+/// Restricciones duras del turno (HU-71).
+///
+/// A diferencia del resto del plan, una restricción **no se puede levantar**:
+/// se extrae del texto del usuario antes de
+/// [`local_command`](crate::orchestrator::local_command), viaja en el
+/// [`TurnPlan`] y el plan final la acumula con [`TurnConstraints::union`], así
+/// que ni el planificador LLM puede desactivarla (CA-71.4b).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnConstraints {
+    /// El usuario prohibió buscar en la web ("no busques en Google", "sin
+    /// buscar en internet", "no abras YouTube").
+    #[serde(default)]
+    pub no_web: bool,
+}
+
+/// Instrucción dura que viaja al cerebro cuando [`TurnConstraints::no_web`]
+/// está activo (CA-71.4c).
+///
+/// Va en el contexto efímero del turno, no en el historial: se aplica a esta
+/// respuesta y desaparece con ella.
+pub const NO_WEB_DIRECTIVE: &str = "Restricción del turno (obligatoria, la pidió el usuario): \
+     NO busques en la web. No abras el navegador, no visites ningún sitio y no propongas \
+     hacerlo; responde con lo que ya sabes o pide el dato que falte.";
+
+impl TurnConstraints {
+    /// Sin ninguna restricción.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// `true` si no hay ninguna restricción activa.
+    pub fn is_empty(&self) -> bool {
+        !self.no_web
+    }
+
+    /// Acumula dos conjuntos de restricciones.
+    ///
+    /// Las restricciones solo **se añaden**: una prohibición del usuario nunca
+    /// se puede quitar con otra fuente (CA-71.4b).
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            no_web: self.no_web || other.no_web,
+        }
+    }
+
+    /// Instrucción para el prompt del cerebro, si hay alguna restricción.
+    pub fn directive(&self) -> Option<&'static str> {
+        self.no_web.then_some(NO_WEB_DIRECTIVE)
+    }
+
+    /// Etiqueta para el diagnóstico de turnos (`--diag-turns`).
+    pub fn label(&self) -> &'static str {
+        if self.no_web {
+            "no_web"
+        } else {
+            "ninguna"
+        }
+    }
+}
+
 /// Plan de un turno: qué se responde ahora y qué se despacha.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnPlan {
+    /// Restricciones duras del turno (HU-71). Se acumulan; nunca se relajan.
+    #[serde(default)]
+    pub constraints: TurnConstraints,
     /// Parte que responde el hilo central en este turno.
     #[serde(default)]
     pub foreground: Option<String>,
@@ -243,6 +306,12 @@ impl TurnPlan {
             spawn: vec![describe(instruction)],
             ..Self::default()
         }
+    }
+
+    /// Acumula restricciones duras al plan (HU-71, CA-71.4b).
+    pub fn with_constraints(mut self, constraints: TurnConstraints) -> Self {
+        self.constraints = self.constraints.union(constraints);
+        self
     }
 }
 
@@ -295,6 +364,9 @@ pub struct RouteContext<'a> {
     pub roster: &'a [RosterEntry],
     /// Sub-sesión enfocada (HU-64): a quién van las continuaciones anafóricas.
     pub focus: Option<SessionId>,
+    /// Restricciones duras que el orquestador extrajo del texto del turno antes
+    /// de [`local_command`](crate::orchestrator::local_command) (HU-71).
+    pub constraints: TurnConstraints,
 }
 
 impl RouteContext<'_> {
@@ -304,6 +376,7 @@ impl RouteContext<'_> {
             planner: None,
             roster: &[],
             focus: None,
+            constraints: TurnConstraints::none(),
         }
     }
 }
@@ -316,6 +389,9 @@ pub struct PlannerTrace {
     pub latency: Duration,
     /// El planificador falló o devolvió un plan vacío y se usó la heurística.
     pub fallback: bool,
+    /// Restricciones duras del turno, ya acumuladas con las que el planificador
+    /// devolvió (HU-71, CA-71.6).
+    pub constraints: TurnConstraints,
 }
 
 /// Enrutador de turnos (HU-63).
@@ -330,41 +406,64 @@ impl TurnRouter {
     /// planificador, y cualquier otro se resuelve con la heurística sin llamar
     /// al LLM (CA-3). Si el planificador falla o devuelve un plan vacío, se cae
     /// en la heurística (CA-2).
+    ///
+    /// En **todos** los caminos el plan final acumula las restricciones duras
+    /// del turno ([`TurnConstraints`]), así que el planificador LLM no puede
+    /// levantar una prohibición del usuario (CA-71.4b).
     pub fn route(query: &str, ctx: &RouteContext<'_>) -> TurnPlan {
-        Self::route_traced(query, ctx).0
+        Self::route_inner(query, ctx).0
     }
 
     /// Igual que [`Self::route`], pero informa de la llamada al planificador
     /// (HU-68): `None` si el turno no llegó a él.
     pub fn route_traced(query: &str, ctx: &RouteContext<'_>) -> (TurnPlan, Option<PlannerTrace>) {
+        let (plan, trace) = Self::route_inner(query, ctx);
+        let trace = trace.map(|trace| PlannerTrace {
+            constraints: plan.constraints,
+            ..trace
+        });
+        (plan, trace)
+    }
+
+    /// Enrutamiento puro, sin acumular todavía las restricciones del contexto.
+    fn route_inner(query: &str, ctx: &RouteContext<'_>) -> (TurnPlan, Option<PlannerTrace>) {
         if let Some(plan) = addressing_plan(query, ctx) {
-            return (plan, None);
+            return (plan.with_constraints(ctx.constraints), None);
         }
         if !is_composite(query) {
-            return (Self::heuristic_plan(query), None);
+            return (
+                Self::heuristic_plan(query).with_constraints(ctx.constraints),
+                None,
+            );
         }
         let Some(planner) = ctx.planner else {
-            return (Self::heuristic_plan(query), None);
+            return (
+                Self::heuristic_plan(query).with_constraints(ctx.constraints),
+                None,
+            );
         };
         let started = Instant::now();
         let result = planner.plan(&PlanRequest {
             text: query,
             roster: ctx.roster,
+            constraints: ctx.constraints,
         });
         let latency = started.elapsed();
         match result {
             Ok(plan) if !plan.is_empty() => (
-                cap_profiles(plan, query),
+                cap_profiles(plan, query).with_constraints(ctx.constraints),
                 Some(PlannerTrace {
                     latency,
                     fallback: false,
+                    constraints: ctx.constraints,
                 }),
             ),
             Ok(_) | Err(_) => (
-                Self::heuristic_plan(query),
+                Self::heuristic_plan(query).with_constraints(ctx.constraints),
                 Some(PlannerTrace {
                     latency,
                     fallback: true,
+                    constraints: ctx.constraints,
                 }),
             ),
         }

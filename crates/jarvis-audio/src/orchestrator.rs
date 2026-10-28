@@ -58,8 +58,8 @@ use crate::io::{to_output_pcm, AudioEngine, EngineShared, PlayOutcome, Player};
 use crate::playback::AudioPlayback;
 use crate::router::{
     fuse_ack_and_foreground, resolve_in_roster, voice_aliases, BrainTurnPlanner, PlannerTrace,
-    RosterEntry, RouteContext, SessionControl, SessionQuery, SessionRef, SpawnSpec, TurnPlan,
-    TurnPlanner, TurnRouter,
+    RosterEntry, RouteContext, SessionControl, SessionQuery, SessionRef, SpawnSpec,
+    TurnConstraints, TurnPlan, TurnPlanner, TurnRouter,
 };
 use crate::sessions::SessionId;
 use crate::speech_queue::{Delivery, DeliveryGate, SpeechPriority};
@@ -438,6 +438,8 @@ pub struct VoiceStats {
     pub planner_fallbacks: AtomicU64,
     /// Latencia de la última llamada al planificador, en ms (HU-68).
     pub planner_latency_ms: AtomicU64,
+    /// Turnos con la restricción `no_web` activa (HU-71, CA-71.6).
+    pub no_web_turns: AtomicU64,
 }
 
 /// Fotografía de [`VoiceStats`].
@@ -460,6 +462,7 @@ pub struct VoiceStatsSnapshot {
     pub routed_foreground: u64,
     pub planner_fallbacks: u64,
     pub planner_latency_ms: u64,
+    pub no_web_turns: u64,
 }
 
 impl VoiceStats {
@@ -483,6 +486,7 @@ impl VoiceStats {
             routed_foreground: get(&self.routed_foreground),
             planner_fallbacks: get(&self.planner_fallbacks),
             planner_latency_ms: get(&self.planner_latency_ms),
+            no_web_turns: get(&self.no_web_turns),
         }
     }
 
@@ -547,6 +551,21 @@ pub enum LocalCommand {
     },
     /// Acción de pantalla vía `jarvis-automation` ("pausa", "escribe …").
     Screen(ScreenAction),
+}
+
+impl LocalCommand {
+    /// `true` si la orden abre la web o el navegador (HU-71): lo que
+    /// [`TurnConstraints::no_web`] prohíbe.
+    pub fn opens_web(&self) -> bool {
+        match self {
+            Self::OpenUrl { .. } => true,
+            Self::OpenApp {
+                command,
+                display_name,
+            } => display_name == BROWSER_NAME || command.iter().any(|arg| arg.starts_with("http")),
+            _ => false,
+        }
+    }
 }
 
 /// Acciones de pantalla que el orquestador resuelve sin LLM (HU-38).
@@ -823,6 +842,9 @@ fn fold_accents(text: &str) -> String {
         .collect()
 }
 
+/// Cómo se nombra el navegador en las respuestas habladas.
+const BROWSER_NAME: &str = "el navegador";
+
 /// La aplicación pedida: un verbo de apertura seguido (salvo artículos) del
 /// nombre de la aplicación. "¿Cómo abro Spotify?" o "abre el menú" no cuentan.
 fn requested_app(words: &[&str]) -> Option<App> {
@@ -864,7 +886,7 @@ fn close_app_command(app: App) -> Option<LocalCommand> {
         App::Terminal => ("konsole", "la terminal"),
         App::Browser | App::Zen => (
             "zen|zen-bin|chrome|google-chrome|firefox|firefox-bin",
-            "el navegador",
+            BROWSER_NAME,
         ),
         _ => return None,
     };
@@ -922,14 +944,14 @@ fn open_app_command(app: App) -> LocalCommand {
         App::Terminal => (vec!["konsole".into()], "la terminal"),
         App::Browser => (
             vec!["xdg-open".into(), "https://google.com".into()],
-            "el navegador",
+            BROWSER_NAME,
         ),
         App::Zen if std::path::Path::new("/opt/zen/zen").is_file() => {
-            (vec!["/opt/zen/zen".into()], "el navegador")
+            (vec!["/opt/zen/zen".into()], BROWSER_NAME)
         }
         App::Zen => (
             vec!["xdg-open".into(), "https://google.com".into()],
-            "el navegador",
+            BROWSER_NAME,
         ),
         App::Telegram => (vec!["telegram-desktop".into()], "Telegram"),
         App::Discord => (vec!["discord".into()], "Discord"),
@@ -979,7 +1001,18 @@ fn is_standalone_silence(text: &str) -> bool {
 }
 
 /// Reconoce una orden local en la consulta (ya sin el vocativo).
+///
+/// Aplica las restricciones duras del turno (HU-71): con `no_web` activo
+/// nunca devuelve una orden que abra la web ni el navegador.
 pub fn local_command(query: &str) -> Option<LocalCommand> {
+    let command = unconstrained_local_command(query)?;
+    if turn_constraints(query).no_web && command.opens_web() {
+        return None;
+    }
+    Some(command)
+}
+
+fn unconstrained_local_command(query: &str) -> Option<LocalCommand> {
     let text: String = query
         .to_lowercase()
         .chars()
@@ -1207,10 +1240,12 @@ fn site_request(
     let site = tokens
         .iter()
         .position(|t| sites.contains(&t.key.as_str()))?;
-    let Some(verb) = tokens.iter().position(|t| verbs.contains(&t.key.as_str())) else {
-        let navigates = tokens[..site]
-            .iter()
-            .any(|t| NAV_VERBS.contains(&t.key.as_str()));
+    // Solo cuentan los verbos en forma afirmativa (HU-71, CA-71.3): "no
+    // busques en Google" no es una petición a Google.
+    let affirmative =
+        |i: usize, list: &[&str]| list.contains(&tokens[i].key.as_str()) && !is_negated(tokens, i);
+    let Some(verb) = (0..tokens.len()).find(|&i| affirmative(i, verbs)) else {
+        let navigates = (0..site).any(|i| affirmative(i, NAV_VERBS));
         return (home && navigates).then_some(None);
     };
     // "busca X en YouTube" → entre el verbo y el sitio; "busca en YouTube X"
@@ -1462,57 +1497,194 @@ fn typed_site_query(tokens: &[Token<'_>], sites: &[&str]) -> Option<String> {
     Some(join_raw(trim_edges(&rest[site..])))
 }
 
-/// Búsquedas sobre el equipo o el trabajo del usuario: "busca X" sin sitio
-/// no va a Google si menciona alguna (el LLM sabe buscar en local).
-const LOCAL_SEARCH_WORDS: &[&str] = &[
-    "archivo",
-    "archivos",
-    "carpeta",
-    "carpetas",
-    "fichero",
-    "ficheros",
-    "directorio",
-    "documento",
-    "documentos",
-    "correo",
-    "correos",
-    "mail",
-    "mails",
-    "tarea",
-    "tareas",
-    "mi",
-    "mis",
-    "codigo",
-    "funcion",
-    "clase",
-    "proyecto",
-    "repo",
-    "repositorio",
-    "log",
-    "logs",
-    "equipo",
-    "disco",
-    "spotify",
+/// "busca en el buscador X" → teclea X en el campo con foco. "Busca X" sin
+/// sitio ya no abre Google: va al router y el cerebro decide (HU-71, CA-71.1).
+fn search_in_field(tokens: &[Token<'_>]) -> Option<ScreenAction> {
+    let rest = &tokens[leading_verb_end(tokens, GOOGLE_VERBS)?..];
+    let len = place_len(rest).filter(|_| rest.first().is_some_and(|t| t.key == "en"))?;
+    let query = trim_edges(&rest[len..]);
+    (!query.is_empty()).then(|| ScreenAction::Type(join_raw(query)))
+}
+
+// ─── Restricciones negativas del turno (HU-71) ──────────────────────────────
+
+/// Palabras que niegan el verbo que sigue en su cláusula.
+const NEGATORS: &[&str] = &["no", "nunca", "jamas", "tampoco", "sin", "ni"];
+
+/// Palabras que pueden ir entre la negación y el verbo sin romperla: clíticos
+/// ("no *lo* busques"), perífrasis ("no *vayas a* buscar", "no *hace falta
+/// que* busques", "ni *se te ocurra* googlearlo") y cortesía.
+const NEGATION_BRIDGE: &[&str] = &[
+    "lo",
+    "la",
+    "los",
+    "las",
+    "le",
+    "les",
+    "me",
+    "te",
+    "se",
+    "nos",
+    "ya",
+    "mas",
+    "por",
+    "favor",
+    "porfa",
+    "que",
+    "quiero",
+    "vayas",
+    "a",
+    "de",
+    "ocurra",
+    "hace",
+    "falta",
+    "hay",
+    "es",
+    "necesario",
+    "necesito",
+    "trates",
+    "intentes",
+    "vuelvas",
+    "sigas",
+    "tienes",
+    "jarvis",
+    "oye",
 ];
 
-/// "busca recetas de pan" → Google; "busca en el buscador X" → teclea X en el
-/// campo con foco.
-fn bare_search(tokens: &[Token<'_>]) -> Option<LocalCommand> {
-    let rest = &tokens[leading_verb_end(tokens, GOOGLE_VERBS)?..];
-    if let Some(len) = place_len(rest).filter(|_| rest.first().is_some_and(|t| t.key == "en")) {
-        let query = trim_edges(&rest[len..]);
-        return (!query.is_empty())
-            .then(|| LocalCommand::Screen(ScreenAction::Type(join_raw(query))));
+/// Conectores que abren una cláusula nueva: la negación no los cruza.
+const CLAUSE_BREAKS: &[&str] = &["pero", "sino", "y", "o", "mejor", "entonces", "luego"];
+
+/// Verbos de navegación negables: "no *abras* YouTube", "no *vayas* a internet".
+const WEB_NAV_VERBS: &[&str] = &[
+    "abre",
+    "abras",
+    "abrir",
+    "abrirlo",
+    "abrela",
+    "abrelo",
+    "abreme",
+    "ve",
+    "vayas",
+    "ir",
+    "entra",
+    "entres",
+    "entrar",
+    "metete",
+    "metas",
+    "meterte",
+    "navega",
+    "navegues",
+    "navegar",
+    "usa",
+    "uses",
+    "usar",
+    "consulta",
+    "consultes",
+    "consultar",
+    "pon",
+    "pongas",
+    "reproduce",
+    "reproduzcas",
+];
+
+/// Palabras que nombran la web o el navegador en una cláusula.
+const WEB_WORDS: &[&str] = &[
+    "google",
+    "internet",
+    "web",
+    "youtube",
+    "navegador",
+    "browser",
+    "chrome",
+    "firefox",
+    "zen",
+    "pagina",
+    "sitio",
+    "online",
+    "linea",
+];
+
+/// `true` si el token abre cláusula nueva: puntuación al final del anterior
+/// ("no sé, búscalo…") o conector ("…pero busca…").
+fn starts_clause(tokens: &[Token<'_>], i: usize) -> bool {
+    i == 0
+        || tokens[i - 1].raw.ends_with(|c: char| ",;.:!?".contains(c))
+        || CLAUSE_BREAKS.contains(&tokens[i].key.as_str())
+}
+
+/// `true` si el verbo de `tokens[verb]` está negado en su cláusula: una
+/// negación lo precede y entre ambos solo hay [`NEGATION_BRIDGE`].
+///
+/// "no sé" no niega lo que sigue: "sé" con tilde no es el clítico "se".
+fn is_negated(tokens: &[Token<'_>], verb: usize) -> bool {
+    let mut i = verb;
+    while !starts_clause(tokens, i) {
+        i -= 1;
+        let token = &tokens[i];
+        if NEGATORS.contains(&token.key.as_str()) {
+            return true;
+        }
+        let accented_se = token.key == "se" && token.raw.to_lowercase().contains('é');
+        if accented_se || !NEGATION_BRIDGE.contains(&token.key.as_str()) {
+            return false;
+        }
     }
-    let query = trim_edges(rest);
-    if query.is_empty()
-        || query
-            .iter()
-            .any(|t| LOCAL_SEARCH_WORDS.contains(&t.key.as_str()))
-    {
-        return None;
+    false
+}
+
+/// Rango `[inicio, fin)` de la cláusula que contiene `tokens[i]`.
+fn clause_of(tokens: &[Token<'_>], i: usize) -> std::ops::Range<usize> {
+    let start = (0..=i)
+        .rev()
+        .find(|&j| starts_clause(tokens, j))
+        .unwrap_or(0);
+    let end = (i + 1..tokens.len())
+        .find(|&j| starts_clause(tokens, j))
+        .unwrap_or(tokens.len());
+    start..end
+}
+
+/// `true` si el turno prohíbe la web: un verbo de búsqueda negado ("no lo
+/// busques", "sin buscar", "ni se te ocurra googlearlo") o un verbo de
+/// navegación negado en una cláusula que nombra la web ("no abras YouTube").
+fn forbids_web(tokens: &[Token<'_>]) -> bool {
+    (0..tokens.len()).any(|i| {
+        let key = tokens[i].key.as_str();
+        // "busca", "búscalo", "busques" (busq-), "googlearlo"…
+        let search = ((key.starts_with("busc") || key.starts_with("busq"))
+            && !key.starts_with("buscador"))
+            || key.starts_with("googl");
+        let navigates = WEB_NAV_VERBS.contains(&key)
+            && tokens[clause_of(tokens, i)]
+                .iter()
+                .any(|t| WEB_WORDS.contains(&t.key.as_str()));
+        (search || navigates) && is_negated(tokens, i)
+    })
+}
+
+/// Petición web afirmativa, explícita y con sitio en el mismo turno.
+fn explicit_site_request(tokens: &[Token<'_>]) -> bool {
+    typed_site_query(tokens, YOUTUBE_SITES).is_some()
+        || typed_site_query(tokens, GOOGLE_SITES).is_some()
+        || site_request(tokens, YOUTUBE_SITES, YOUTUBE_VERBS, true).is_some()
+        || matches!(
+            site_request(tokens, GOOGLE_SITES, GOOGLE_VERBS, false),
+            Some(Some(_))
+        )
+}
+
+/// Restricciones duras del turno (HU-71, CA-71.4), extraídas del texto
+/// **antes** de [`local_command`] y del router.
+///
+/// Una negación ("no busques en Google, dime X") activa `no_web`. La única
+/// excepción es que el mismo turno pida, en otra cláusula y en afirmativo,
+/// un sitio concreto: "no busques en Google, busca en YouTube X" abre YouTube
+/// (CA-71.5), porque la orden explícita es lo último que dijo el usuario.
+pub fn turn_constraints(query: &str) -> TurnConstraints {
+    let tokens = tokenize(query);
+    TurnConstraints {
+        no_web: forbids_web(&tokens) && !explicit_site_request(&tokens),
     }
-    Some(google_search(&join_raw(query)))
 }
 
 fn youtube_search(q: &str) -> LocalCommand {
@@ -1568,8 +1740,8 @@ pub fn web_or_automation_command(query: &str) -> Option<LocalCommand> {
     }
     media_command(&tokens)
         .or_else(|| type_command(&tokens))
+        .or_else(|| search_in_field(&tokens))
         .map(LocalCommand::Screen)
-        .or_else(|| bare_search(&tokens))
 }
 
 /// Frase con la hora: "Es la 1:05." / "Son las 15:30."
@@ -2095,6 +2267,7 @@ impl VoiceOrchestrator {
                 focus: None,
                 focus_at: None,
                 focus_timeout: config.focus_timeout,
+                constraints: TurnConstraints::none(),
                 threads: HashMap::new(),
                 last_assistant_response: None,
                 queue: queue.clone(),
@@ -3265,6 +3438,9 @@ struct BrainLoop {
     focus_at: Option<Instant>,
     /// Caducidad del foco (HU-64); configurable para poder probarla.
     focus_timeout: Duration,
+    /// Restricciones duras del turno en curso (HU-71). Las fija
+    /// [`Self::on_turn`] y las lee [`Self::converse`] para el prompt.
+    constraints: TurnConstraints,
     /// Sub-sesiones abiertas por voz (id → título hablado y alias). El
     /// registro del gestor guarda un título corto pensado para elegir el
     /// *prompt*; de oído se usan estos. Es el roster que resuelve las
@@ -3429,11 +3605,14 @@ impl BrainLoop {
                 planner: self.planner.as_deref(),
                 roster: &roster,
                 focus: self.focus,
+                constraints: self.constraints,
             },
         );
         if let Some(trace) = trace {
             self.stats.count_planner(trace);
         }
+        // El plan solo puede sumar restricciones, nunca quitarlas (CA-71.4b).
+        self.constraints = self.constraints.union(plan.constraints);
         self.apply_plan(plan, query, notice);
     }
 
@@ -3602,7 +3781,7 @@ impl BrainLoop {
         let tasks = self.tasks.clone()?;
         self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
         let title = spec.task_title();
-        let prompt = spec.task_prompt(self.last_assistant_response.as_deref());
+        let prompt = self.constrained(spec.task_prompt(self.last_assistant_response.as_deref()));
         let id = tasks.submit(title, prompt, TaskOrigin::Voice);
         self.stats.routed_spawn.fetch_add(1, Ordering::Relaxed);
         let aliases = if spec.aliases.is_empty() {
@@ -3630,6 +3809,15 @@ impl BrainLoop {
     /// indicación se encola como un turno nuevo con el mismo título, y el hilo
     /// hablado sigue siendo el original. Pasará a `SessionManager::send` cuando
     /// el gestor de HU-62 esté cableado en el orquestador.
+    /// Antepone al prompt de una sub-sesión la instrucción dura del turno
+    /// (HU-71): un `no_web` dicho al abrirla también la obliga a ella.
+    fn constrained(&self, prompt: String) -> String {
+        match self.constraints.directive() {
+            Some(directive) => format!("{directive}\n\n{prompt}"),
+            None => prompt,
+        }
+    }
+
     fn apply_session_route(&mut self, id: SessionId, instruction: &str) -> Option<String> {
         let tasks = self.tasks.clone()?;
         let Some(record) = tasks.get(TaskId::from(id)) else {
@@ -3639,7 +3827,7 @@ impl BrainLoop {
         self.touch_focus(id);
         tasks.submit(
             record.title.clone(),
-            task_prompt(instruction),
+            self.constrained(task_prompt(instruction)),
             TaskOrigin::Voice,
         );
         Some(format!(
@@ -3847,6 +4035,16 @@ impl BrainLoop {
         // El chime de confirmación (HU-18) ya no se reproduce aquí: el hilo de
         // voz lo difiere y lo cancela si el usuario retoma su frase (HU-42).
 
+        // HU-71: las restricciones se extraen antes que cualquier ruta, y
+        // `local_command` ya no devuelve nada que abra la web si `no_web`.
+        self.constraints = turn_constraints(query);
+        if self.constraints.no_web {
+            self.stats.no_web_turns.fetch_add(1, Ordering::Relaxed);
+            println!(
+                "[voz] restricciones del turno: {}",
+                self.constraints.label()
+            );
+        }
         match local_command(query) {
             Some(LocalCommand::Time) => {
                 self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
@@ -4031,6 +4229,13 @@ impl BrainLoop {
         // HU-65: el roster viaja como contexto efímero de la petición. El
         // historial de la conversación guarda solo el turno del usuario.
         let context = self.roster_context();
+        // HU-71 (CA-71.4c): la restricción va como instrucción dura en el
+        // contexto efímero del turno, no en el historial.
+        let context = match (context, self.constraints.directive()) {
+            (Some(roster), Some(directive)) => Some(format!("{directive}\n\n{roster}")),
+            (None, Some(directive)) => Some(directive.to_string()),
+            (context, None) => context,
+        };
 
         let tts = self.tts.clone();
         let hud_turn = self.hud_open;

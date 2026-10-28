@@ -73,6 +73,7 @@ fn route_with(query: &str, planner: &dyn TurnPlanner) -> TurnPlan {
             planner: Some(planner),
             roster: &[],
             focus: None,
+            constraints: TurnConstraints::none(),
         },
     )
 }
@@ -259,6 +260,7 @@ fn planner_prompt_is_concise_and_carries_the_roster() {
     let prompt = planner::planner_prompt(&PlanRequest {
         text: COMPOSITE,
         roster: &roster,
+        constraints: TurnConstraints::none(),
     });
     assert!(prompt.contains("SOLO con un objeto JSON"));
     assert!(prompt.contains("#3 revisión de PRs de Felipe — trabajando"));
@@ -268,6 +270,7 @@ fn planner_prompt_is_concise_and_carries_the_roster() {
     let empty = planner::planner_prompt(&PlanRequest {
         text: "x",
         roster: &[],
+        constraints: TurnConstraints::none(),
     });
     assert!(empty.contains("(ninguna)"));
 }
@@ -425,6 +428,7 @@ fn route_in(query: &str, roster: &[RosterEntry], focus: Option<SessionId>) -> Tu
             planner: Some(&planner),
             roster,
             focus,
+            constraints: TurnConstraints::none(),
         },
     );
     assert_eq!(planner.calls(), 0, "sin LLM: {query}");
@@ -558,4 +562,80 @@ fn focus_keeps_general_questions_in_the_central_thread_hu64() {
     assert!(plan.route.is_empty(), "{plan:?}");
     let plan = route_in("Ahora revisa pagos", &roster, Some(1));
     assert_eq!(plan.route, vec![(1, "Ahora revisa pagos".to_string())]);
+}
+
+// ─── HU-71: restricciones duras del turno ────────────────────────────────────
+
+fn route_constrained(
+    query: &str,
+    planner: &dyn TurnPlanner,
+    constraints: TurnConstraints,
+) -> (TurnPlan, Option<PlannerTrace>) {
+    TurnRouter::route_traced(
+        query,
+        &RouteContext {
+            planner: Some(planner),
+            roster: &[],
+            focus: None,
+            constraints,
+        },
+    )
+}
+
+#[test]
+fn the_planner_cannot_lift_no_web_hu71() {
+    // CA-71.4b: el plan del LLM llega sin restricción, el final la conserva.
+    let no_web = TurnConstraints { no_web: true };
+    let planner = FakePlanner::returning(llm_plan());
+    let (plan, trace) = route_constrained(COMPOSITE, &planner, no_web);
+    assert_eq!(planner.calls(), 1);
+    assert!(plan.constraints.no_web);
+    // CA-71.6: la traza del planificador registra la restricción.
+    assert!(trace.expect("pasó por el planificador").constraints.no_web);
+
+    // Y si el planificador falla, la heurística también la conserva.
+    let failing = FakePlanner::failing(PlanError::Timeout);
+    let (plan, trace) = route_constrained(COMPOSITE, &failing, no_web);
+    assert!(plan.constraints.no_web);
+    assert!(trace.expect("fallback").fallback);
+
+    // Turno simple (sin planificador) y direccionamiento: igual.
+    let (plan, trace) = route_constrained("¿qué hora es en Tokio?", &failing, no_web);
+    assert!(plan.constraints.no_web);
+    assert!(trace.is_none());
+}
+
+#[test]
+fn the_planner_can_only_add_constraints_hu71() {
+    let plan = TurnPlan {
+        constraints: TurnConstraints { no_web: true },
+        ..llm_plan()
+    };
+    let planner = FakePlanner::returning(plan);
+    let (plan, _) = route_constrained(COMPOSITE, &planner, TurnConstraints::none());
+    assert!(plan.constraints.no_web, "union, no reemplazo");
+}
+
+#[test]
+fn constraints_travel_in_the_plan_json_and_the_prompt_hu71() {
+    // CA-71.4: serde con default, compatible con planes sin el campo.
+    let old = planner::parse_plan(r#"{"foreground":"hola"}"#).expect("plan v0.3.0");
+    assert!(old.constraints.is_empty());
+    let new = planner::parse_plan(r#"{"foreground":"hola","constraints":{"no_web":true}}"#)
+        .expect("plan con restricción");
+    assert!(new.constraints.no_web);
+
+    let prompt = planner::planner_prompt(&PlanRequest {
+        text: COMPOSITE,
+        roster: &[],
+        constraints: TurnConstraints { no_web: true },
+    });
+    assert!(prompt.contains("RESTRICCIÓN ACTIVA"), "{prompt}");
+    assert!(prompt.contains(NO_WEB_DIRECTIVE));
+    let free = planner::planner_prompt(&PlanRequest {
+        text: COMPOSITE,
+        roster: &[],
+        constraints: TurnConstraints::none(),
+    });
+    assert!(!free.contains("RESTRICCIÓN ACTIVA"));
 }
