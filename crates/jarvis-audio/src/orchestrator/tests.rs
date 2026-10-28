@@ -139,6 +139,7 @@ const SCRIPT: &[&str] = &[
     "programadores",                                         // 24: continuación
     "Jarvis, deja un monitor ping corriendo en segundo plano", // 25: tarea operacional (HU-57)
     "Jarvis, detén el proceso",                              // 26: cancelación flexible (HU-57)
+    "Jarvis, revísame las PR de Felipe en segundo plano mientras me sintetizas un mensaje para Oscar", // 27: compuesto (HU-63)
 ];
 
 struct ScriptTranscriber;
@@ -1702,6 +1703,127 @@ fn operational_task_runs_with_the_executing_prompt_and_stops_by_voice_hu57() {
         h.task_status() == vec![TaskStatus::Cancelled]
     });
     assert!(brain.queries().is_empty(), "comandos locales, sin LLM");
+}
+
+// ------------------------------------------------------------ HU-63 router
+
+/// Plan JSON que devolvería el planificador LLM para la línea 27.
+const PLANNER_REPLY: &str = r#"{"foreground": "Sintetiza un mensaje breve para Oscar.", "spawn": [{"title": "la revisión de PR de Felipe", "aliases": ["prs", "felipe"], "profile": "read_only", "instruction": "Revisa los PR abiertos de Felipe"}], "route": [], "query": [], "control": []}"#;
+
+#[test]
+fn composite_turn_spawns_a_session_and_fuses_ack_with_the_answer_hu63() {
+    // CA-1: una sub-sesión **y** respuesta en primer plano, en una sola
+    // locución del cerebro conversacional.
+    let brain =
+        FakeBrain::new("Abrí la revisión de PR de Felipe en segundo plano. Para Oscar: listo.");
+    let factory = FakeFactory::new(PLANNER_REPLY, Duration::ZERO);
+    let h = task_harness("router-ca1", brain.clone(), factory.clone());
+
+    h.say_line(27);
+    wait_until("respuesta en primer plano", || brain.queries().len() == 1);
+    let tasks = h.orchestrator.tasks().expect("gestor de tareas");
+    wait_until("sub-sesión abierta", || tasks.list().len() == 1);
+
+    let queries = brain.queries();
+    assert_eq!(queries.len(), 1, "acuse y respuesta van en un solo turno");
+    assert!(
+        queries[0].contains("Abrí la revisión de PR de Felipe en segundo plano."),
+        "{}",
+        queries[0]
+    );
+    assert!(
+        queries[0].contains("Sintetiza un mensaje breve para Oscar."),
+        "el foreground viene del planificador: {}",
+        queries[0]
+    );
+    assert!(
+        !queries[0].contains("Revisa los PR"),
+        "la parte de fondo no se responde en primer plano"
+    );
+
+    // La sub-sesión lleva la instrucción del planificador con el prompt de
+    // solo lectura (sin `FakeBrain` con herramientas, HU-60 CA-3 la corta
+    // antes de lanzar el subagente: aquí basta con el registro).
+    let record = tasks.list().remove(0);
+    assert!(
+        record.prompt.contains("Revisa los PR abiertos de Felipe"),
+        "{}",
+        record.prompt
+    );
+    assert!(
+        record.prompt.contains("Solo lees y resumes"),
+        "{}",
+        record.prompt
+    );
+    let spawned = factory.spawned.lock().unwrap();
+    assert!(spawned[0].queries()[0].contains("planificador de turnos"));
+}
+
+#[test]
+fn invalid_planner_output_falls_back_to_the_heuristic_split_hu63() {
+    // CA-2: el planificador responde texto que no es JSON; el turno no se
+    // pierde y la heurística reparte las dos mitades igual.
+    let brain = FakeBrain::new("Listo.");
+    let factory = FakeFactory::new(TASK_REPLY, Duration::ZERO);
+    let h = task_harness("router-ca2", brain.clone(), factory.clone());
+
+    h.say_line(27);
+    wait_until("respuesta en primer plano", || brain.queries().len() == 1);
+    let tasks = h.orchestrator.tasks().expect("gestor de tareas");
+    wait_until("sub-sesión abierta", || tasks.list().len() == 1);
+    let query = &brain.queries()[0];
+    assert!(
+        query.contains("Abrí la revisión de PR de Felipe en segundo plano."),
+        "{query}"
+    );
+    assert!(query.contains("mensaje para Oscar"), "{query}");
+}
+
+#[test]
+fn a_slow_planner_times_out_instead_of_blocking_the_turn_hu63() {
+    // CA-2: el timeout duro del planificador real devuelve `Timeout`.
+    let factory = FakeFactory::new(PLANNER_REPLY, Duration::from_millis(150));
+    let planner = BrainTurnPlanner::new(factory as Arc<dyn BrainFactory>)
+        .with_timeout(Duration::from_millis(50));
+    let request = crate::router::PlanRequest {
+        text: SCRIPT[27],
+        roster: &[],
+    };
+    assert_eq!(
+        planner.plan(&request),
+        Err(crate::router::PlanError::Timeout)
+    );
+    assert_eq!(planner.calls(), 1);
+
+    // Con tiempo suficiente, el mismo cerebro produce el plan tipado.
+    let factory = FakeFactory::new(PLANNER_REPLY, Duration::ZERO);
+    let planner = BrainTurnPlanner::new(factory as Arc<dyn BrainFactory>);
+    let plan = planner.plan(&request).expect("plan válido");
+    assert_eq!(plan.spawn.len(), 1);
+    assert_eq!(
+        plan.spawn[0].profile,
+        crate::sessions::SessionProfile::ReadOnly
+    );
+}
+
+#[test]
+fn simple_heavy_turn_does_not_spawn_a_planner_brain_hu63() {
+    // CA-3: un turno pesado simple no paga la llamada al planificador.
+    let brain = FakeBrain::new("x");
+    let factory = FakeFactory::new(TASK_REPLY, Duration::from_millis(200));
+    let h = task_harness("router-ca3", brain.clone(), factory.clone());
+
+    h.say_line(13);
+    h.wait_spoken_and_listening(0, 0);
+    wait_until("subagente lanzado", || {
+        !factory.spawned.lock().unwrap().is_empty()
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    let spawned = factory.spawned.lock().unwrap();
+    assert_eq!(spawned.len(), 1, "solo el subagente, sin planificador");
+    wait_until("prompt del subagente", || !spawned[0].queries().is_empty());
+    assert!(!spawned[0].queries()[0].contains("planificador de turnos"));
+    assert!(brain.queries().is_empty());
 }
 
 #[test]

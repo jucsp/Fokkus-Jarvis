@@ -28,6 +28,8 @@
 //!   enclíticos y variantes fonéticas de STT) para las heurísticas (HU-59).
 //! - [`sessions`]: multi-sesiones y subhilos de conversación con persistencia
 //!   (HU-62).
+//! - [`router`]: enrutamiento de turnos con `TurnPlan` y planificador LLM para
+//!   instrucciones compuestas (HU-63).
 
 pub mod activation;
 pub mod agent;
@@ -40,6 +42,7 @@ pub mod io;
 pub mod models;
 pub mod orchestrator;
 pub mod playback;
+pub mod router;
 pub mod sessions;
 pub mod speech_queue;
 pub mod stt;
@@ -77,6 +80,11 @@ pub use orchestrator::{
     LocalClock, VoiceConfig, VoiceDeps, VoiceOrchestrator, VoiceSpeaker, VoiceStatsSnapshot,
 };
 pub use playback::AudioPlayback;
+pub use router::{
+    fuse_ack_and_foreground, BrainTurnPlanner, PlanError, PlanRequest, RosterEntry, RouteContext,
+    SessionControl, SessionQuery, SessionRef, SpawnSpec, TurnPlan, TurnPlanner, TurnRouter,
+    PLANNER_TIMEOUT,
+};
 pub use speech_queue::{
     Delivery, DeliveryGate, SpeechPriority, SpeechQueue, SPEECH_QUEUE_CAPACITY,
 };
