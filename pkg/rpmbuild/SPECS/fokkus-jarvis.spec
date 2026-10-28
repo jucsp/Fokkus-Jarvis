@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.2.29
+Version:        0.3.0
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,6 +23,19 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Wed Oct 28 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.3.0-1
+- Épica 14: Hilo Central + Sub-sesiones Ramificadas (HU-59 a HU-68).
+- HU-59: Normalizador léxico unificado con preservación de acentos y puntuación.
+- HU-60: Cerebro desacoplado y guardia antirrecursión de subagentes (JARVIS_SUB_SESSION).
+- HU-61: Red de seguridad local para fallos LLM y unificación 'task run'.
+- HU-62: SessionManager persistente multi-turno y multi-hilo con rehidratación.
+- HU-63: TurnRouter con planificador LLM, turnos compuestos y concurrencia.
+- HU-64: Direccionamiento verbal de sesiones por id/ordinal/alias y foco de 5 min.
+- HU-65: Roster de sub-sesiones en contexto efímero (presupuesto <= 1600 chars).
+- HU-66: Métodos IPC jarvis.sessions.*, eventos JSON-RPC y CLI de sesiones.
+- HU-67: HUD con chips interactivos de sub-sesiones y menú en bandeja del sistema.
+- HU-68: Métricas de enrutamiento y suite de validación E2E.
+
 * Tue Oct 27 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.2.29-1
 - HU-55: estados visuales de la esfera (escucha pasiva/activa, background) con paleta y velocidad propias.
 - HU-56: barge-in anti-eco más sensible e interrupción inmediata con clic simple en la esfera.
