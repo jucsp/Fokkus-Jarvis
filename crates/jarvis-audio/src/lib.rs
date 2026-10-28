@@ -65,7 +65,7 @@ pub use dsp::{
     spawn_dsp_thread, ConnectorSignal, DspError, DspHandle, DspMetrics, DspMetricsSnapshot,
     DspThreadConfig, LatencyProbe, ProcessorConfig,
 };
-pub use events::{CloseReason, HudEvent, Segment, TurnId, VoiceEvent};
+pub use events::{CloseReason, HudEvent, Segment, SessionView, TurnId, VoiceEvent};
 pub use incompleteness::{incompleteness, incompleteness_score, is_incomplete, IncompleteCue};
 pub use io::{
     AudioEngine, AudioError, AudioMetrics, AudioMetricsSnapshot, EngineConfig, EngineStatus,
@@ -81,9 +81,9 @@ pub use orchestrator::{
 };
 pub use playback::AudioPlayback;
 pub use router::{
-    fuse_ack_and_foreground, BrainTurnPlanner, PlanError, PlanRequest, RosterEntry, RouteContext,
-    SessionControl, SessionQuery, SessionRef, SpawnSpec, TurnPlan, TurnPlanner, TurnRouter,
-    PLANNER_TIMEOUT,
+    fuse_ack_and_foreground, BrainTurnPlanner, PlanError, PlanRequest, PlannerTrace, RosterEntry,
+    RouteContext, SessionControl, SessionQuery, SessionRef, SpawnSpec, TurnPlan, TurnPlanner,
+    TurnRouter, PLANNER_TIMEOUT,
 };
 pub use speech_queue::{
     Delivery, DeliveryGate, SpeechPriority, SpeechQueue, SPEECH_QUEUE_CAPACITY,

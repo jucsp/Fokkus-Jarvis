@@ -218,6 +218,10 @@ pub enum ShellCommand {
     /// Interrumpir la locución en curso (HU-56): un clic simple sobre la
     /// esfera la corta en el acto, sin esperar a que Jarvis termine.
     Interrupt,
+    /// Abrir el detalle de una sub-sesión (submenú de la bandeja, HU-67).
+    OpenSession(u64),
+    /// Cancelar una sub-sesión (submenú de la bandeja, HU-67).
+    CancelSession(u64),
     /// Cerrar Fokkus-Jarvis.
     Quit,
 }

@@ -26,8 +26,9 @@ pub use tiny_skia::Pixmap;
 pub use jarvis_core::SphereVisualState;
 
 pub use hud::{
-    bubble_ttl, Bubble, BubbleStack, HudRenderer, Speaker, TextRasterizer, TurnId, FADE_IN,
-    FADE_OUT_EVICT, FADE_OUT_TTL,
+    bubble_ttl, short_title, Bubble, BubbleStack, ChipState, HudRenderer, SessionChip, Speaker,
+    TextRasterizer, TurnId, CHIP_FOCUS_COLOR, CHIP_TITLE_CHARS, FADE_IN, FADE_OUT_EVICT,
+    FADE_OUT_TTL, MAX_CHIPS_DRAWN,
 };
 
 /// Tamaño por defecto de la esfera, en píxeles.

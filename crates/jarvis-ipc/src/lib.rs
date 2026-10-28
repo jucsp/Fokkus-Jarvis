@@ -44,12 +44,14 @@ pub use protocol::{
     error_codes, methods, speech_priority, task_status, Ack, CancelTaskResult, DispatchSwarmParams,
     DispatchTaskParams, DispatchTaskResult, HelloParams, HelloResult, HelloSession, Id, Incoming,
     JsonRpcError, Notification, NotifySwarmCompletedParams, NotifySwarmProgressParams,
-    NotifyTriageAlertParams, PingResult, Request, Response, SetMutedParams, SetMutedResult,
-    SpeakParams, SpeakResult, StateResult, SwarmStatusResult, SwarmTask, TaskIdParams, TasksResult,
-    TriageAlert, Utterance, JSONRPC_VERSION, MAX_MESSAGE_BYTES, PROTOCOL_VERSION, SERVER_VERSION,
+    NotifyTriageAlertParams, PingResult, Request, Response, RoutingMetrics, SetMutedParams,
+    SetMutedResult, SpeakParams, SpeakResult, StateResult, SwarmStatusResult, SwarmTask,
+    TaskIdParams, TasksResult, TriageAlert, Utterance, JSONRPC_VERSION, MAX_MESSAGE_BYTES,
+    PROTOCOL_VERSION, SERVER_VERSION,
 };
 pub use server::{
-    IpcError, IpcServer, PeerPolicy, ServerState, SpeechSink, TaskPort, MAX_CONNECTIONS,
+    IpcError, IpcServer, PeerPolicy, RoutingSource, ServerState, SpeechSink, TaskPort,
+    MAX_CONNECTIONS,
 };
 
 pub use jarvis_core::{JarvisConfig, JarvisCore, JarvisState};

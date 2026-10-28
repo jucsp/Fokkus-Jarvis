@@ -60,6 +60,7 @@ use crate::tasks::{
 };
 use crate::text::normalize::{normalize, Normalized, HEAVY_VERBS};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 pub use planner::{BrainTurnPlanner, PlanError, PlanRequest, TurnPlanner, PLANNER_TIMEOUT};
 
@@ -307,6 +308,16 @@ impl RouteContext<'_> {
     }
 }
 
+/// Llamada al planificador en un turno (HU-68): alimenta las métricas de
+/// enrutamiento de `VoiceStats`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannerTrace {
+    /// Tiempo de pared de la llamada.
+    pub latency: Duration,
+    /// El planificador falló o devolvió un plan vacío y se usó la heurística.
+    pub fallback: bool,
+}
+
 /// Enrutador de turnos (HU-63).
 pub struct TurnRouter;
 
@@ -320,21 +331,42 @@ impl TurnRouter {
     /// al LLM (CA-3). Si el planificador falla o devuelve un plan vacío, se cae
     /// en la heurística (CA-2).
     pub fn route(query: &str, ctx: &RouteContext<'_>) -> TurnPlan {
+        Self::route_traced(query, ctx).0
+    }
+
+    /// Igual que [`Self::route`], pero informa de la llamada al planificador
+    /// (HU-68): `None` si el turno no llegó a él.
+    pub fn route_traced(query: &str, ctx: &RouteContext<'_>) -> (TurnPlan, Option<PlannerTrace>) {
         if let Some(plan) = addressing_plan(query, ctx) {
-            return plan;
+            return (plan, None);
         }
         if !is_composite(query) {
-            return Self::heuristic_plan(query);
+            return (Self::heuristic_plan(query), None);
         }
         let Some(planner) = ctx.planner else {
-            return Self::heuristic_plan(query);
+            return (Self::heuristic_plan(query), None);
         };
-        match planner.plan(&PlanRequest {
+        let started = Instant::now();
+        let result = planner.plan(&PlanRequest {
             text: query,
             roster: ctx.roster,
-        }) {
-            Ok(plan) if !plan.is_empty() => cap_profiles(plan, query),
-            Ok(_) | Err(_) => Self::heuristic_plan(query),
+        });
+        let latency = started.elapsed();
+        match result {
+            Ok(plan) if !plan.is_empty() => (
+                cap_profiles(plan, query),
+                Some(PlannerTrace {
+                    latency,
+                    fallback: false,
+                }),
+            ),
+            Ok(_) | Err(_) => (
+                Self::heuristic_plan(query),
+                Some(PlannerTrace {
+                    latency,
+                    fallback: true,
+                }),
+            ),
         }
     }
 

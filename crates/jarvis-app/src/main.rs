@@ -41,8 +41,8 @@ use jarvis_audio::sessions::{sessions_dir, SessionStore};
 use jarvis_audio::{
     ActivationDetector, AudioEngine, AudioPlayback, ConversationCoordinator, DspThreadConfig,
     EdgeTtsEngine, EndpointConfig, EngineConfig, EngineControl, ModelManager, ModelStatus,
-    SpeechPriority, TaskConfig, TaskManager, TaskOrigin, TaskStatus, TtsBackend, VoiceConfig,
-    VoiceDeps, VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
+    SpeechPriority, TaskConfig, TaskManager, TaskOrigin, TaskRecord, TaskStatus, TtsBackend,
+    VoiceConfig, VoiceDeps, VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
 };
 use jarvis_automation::{
     ActionRiskLevel, AutomationGuard, Capabilities, CaptureTarget, InputAction, InputSynth, Key,
@@ -54,7 +54,8 @@ use jarvis_core::{
     SharedCore,
 };
 use jarvis_ipc::{
-    speech_priority, IpcClient, IpcError, IpcServer, ServerState, SpeechSink, TaskPort, Utterance,
+    speech_priority, IpcClient, IpcError, IpcServer, RoutingMetrics, ServerState, SpeechSink,
+    TaskPort, Utterance,
 };
 use jarvis_shell::{
     HeadlessSurface, OverlayOptions, OverlaySurface, ShellCommand, SurfaceError, SurfaceSize,
@@ -1113,6 +1114,20 @@ fn run() -> ExitCode {
             Ok(orchestrator) => {
                 speech_sink.connect(orchestrator.speaker());
                 orchestrator.set_gaming_mode(gaming_mode);
+                // HU-68: los contadores de enrutamiento del router se leen
+                // desde `jarvis.getState` sin pasar por el orquestador.
+                server_state.set_routing_metrics({
+                    let stats = orchestrator.stats_handle();
+                    Arc::new(move || {
+                        let snapshot = stats.snapshot();
+                        RoutingMetrics {
+                            routed_spawn: snapshot.routed_spawn,
+                            routed_foreground: snapshot.routed_foreground,
+                            planner_fallbacks: snapshot.planner_fallbacks,
+                            planner_latency_ms: snapshot.planner_latency_ms,
+                        }
+                    })
+                });
                 if let Some(tasks) = orchestrator.tasks() {
                     server_state.set_task_port(Arc::new(VoiceTaskPort(tasks)));
                 }
@@ -1177,11 +1192,36 @@ fn run() -> ExitCode {
     // "Volver a posición inicial": el panel sale con código 3 y el bucle
     // restablece el anclaje de la esfera en el siguiente frame.
     let reset_position = AtomicBool::new(false);
+    // Icono en la bandeja del sistema: sin bandeja (o fuera de Linux) Jarvis
+    // sigue funcionando con el menú contextual de la esfera. Se publica antes
+    // del closure `source` para poder refrescar su submenú de sub-sesiones
+    // (HU-67) desde el bucle de frames.
+    let mut tray = start_tray();
+    let tray_sessions = tray.as_ref().map(|tray| tray.sessions());
+    // Última revisión del gestor publicada en la bandeja: el submenú solo se
+    // reconstruye cuando cambia, nunca en cada frame (sin asignaciones por
+    // frame, CA-67.3).
+    let tray_revision = Cell::new(None::<u64>);
     let mut source = || {
         if let Some(orchestrator) = orchestrator.borrow().as_ref() {
             runtime::poll_stt_loader(&mut stt_pending, |engine: WhisperEngine| {
                 orchestrator.set_transcriber(Box::new(engine))
             });
+        }
+        // Sub-sesiones en la bandeja (HU-67): la revisión del gestor es una
+        // lectura atómica; la lista solo se arma cuando algo cambió.
+        if let Some(tray_sessions) = tray_sessions.as_ref() {
+            if let Some(tasks) = orchestrator
+                .borrow()
+                .as_ref()
+                .and_then(|voice| voice.tasks())
+            {
+                let revision = tasks.revision();
+                if tray_revision.get() != Some(revision) {
+                    tray_revision.set(Some(revision));
+                    tray_sessions.set(tray_menu_sessions(&tasks.list()));
+                }
+            }
         }
         let closed_panel = quick_panel.borrow().as_ref().and_then(|panel| panel.poll());
         if let Some(outcome) = closed_panel {
@@ -1311,12 +1351,13 @@ fn run() -> ExitCode {
                 }
             }
         }
+        // Submenú de sub-sesiones de la bandeja (HU-67): abrir el detalle
+        // guardado o cancelar el turno en curso del hilo elegido.
+        ShellCommand::OpenSession(id) => open_session_detail(id),
+        ShellCommand::CancelSession(id) => cancel_session_from_tray(id),
         // Los resuelve el propio bucle.
         ShellCommand::ToggleVisibility | ShellCommand::Quit => {}
     };
-    // Icono en la bandeja del sistema: sin bandeja (o fuera de Linux) Jarvis
-    // sigue funcionando con el menú contextual de la esfera.
-    let mut tray = start_tray();
     let tray_commands = tray.as_ref().map(|tray| tray.commands());
     // Detección de pantalla completa (HU-35): con `ignore` no carga nada.
     let mut fullscreen = presence::FullscreenMonitor::start(
@@ -1392,6 +1433,89 @@ fn start_tray() -> Option<jarvis_shell::tray::TrayIcon> {
             None
         }
     }
+}
+
+/// Abre en el visor del escritorio el detalle de una sub-sesión (HU-67).
+///
+/// Es una acción **explícita** del usuario desde la bandeja, así que aquí sí se
+/// lanza `xdg-open`: el aislamiento de HU-58 (`BROWSER=/bin/true`) protege a
+/// los subagentes de abrir ventanas por su cuenta, no a esta orden directa.
+fn open_session_detail(id: u64) {
+    let Ok(id) = u32::try_from(id) else {
+        eprintln!("[tray] id de sub-sesión fuera de rango: {id}");
+        return;
+    };
+    // Mismo criterio que `session show <id>` (HU-65): sin detalle en disco no
+    // se abre nada, para no lanzar un visor sobre una ruta inexistente.
+    let Some(path) = detail_path(DetailTarget::Session(id), &sessions_dir(), &tasks_dir()) else {
+        eprintln!("[tray] la sub-sesión #{id} aún no tiene detalle guardado.");
+        return;
+    };
+    match std::process::Command::new("xdg-open").arg(&path).spawn() {
+        Ok(_) => println!("[tray] abriendo el detalle de la sub-sesión #{id}"),
+        Err(e) => eprintln!("[tray] no pude abrir {}: {e}", path.display()),
+    }
+}
+
+/// Cancela desde la bandeja el turno en curso de una sub-sesión (HU-67).
+///
+/// Va por IPC (`jarvis.sessions.cancel`, HU-66) igual que `session cancel`, así
+/// que el hilo se cancela en el propio Jarvis y no en una copia del registro.
+fn cancel_session_from_tray(id: u64) {
+    let Some(mut client) = connect_jarvis() else {
+        return;
+    };
+    match client.cancel_session(id) {
+        Ok(true) => println!("[tray] sub-sesión #{id} cancelada desde la bandeja."),
+        Ok(false) => println!("[tray] la sub-sesión #{id} ya había terminado."),
+        Err(e) => eprintln!("[tray] no pude cancelar la sub-sesión #{id}: {e}"),
+    }
+}
+
+/// Entrada del submenú de la bandeja para una sub-sesión (HU-67).
+///
+/// Solo las vivas (en cola o trabajando) son cancelables; el detalle se ofrece
+/// cuando ya existe en disco.
+fn tray_session(record: &TaskRecord) -> jarvis_shell::tray::TraySession {
+    jarvis_shell::tray::TraySession {
+        id: record.id,
+        label: format!(
+            "#{} {} · {}",
+            record.id,
+            record.title,
+            tray_status_word(&record.status)
+        ),
+        has_detail: record.detail_path.is_some(),
+        cancellable: matches!(record.status, TaskStatus::Queued | TaskStatus::Running),
+    }
+}
+
+/// Estado de una sub-sesión en el texto del submenú (HU-67).
+fn tray_status_word(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "en cola",
+        TaskStatus::Running => "trabajando",
+        TaskStatus::Done => "lista",
+        TaskStatus::Failed => "falló",
+        TaskStatus::Cancelled => "cancelada",
+        TaskStatus::TimedOut => "agotó el tiempo",
+    }
+}
+
+/// Sub-sesiones que la bandeja publica (HU-67): las vivas, por id y con el
+/// mismo tope que el HUD.
+///
+/// Solo se construye cuando cambia la revisión del gestor, nunca por frame.
+fn tray_menu_sessions(records: &[TaskRecord]) -> Vec<jarvis_shell::tray::TraySession> {
+    const MAX_TRAY_SESSIONS: usize = 8;
+    let mut live: Vec<&TaskRecord> = records
+        .iter()
+        .filter(|record| matches!(record.status, TaskStatus::Queued | TaskStatus::Running))
+        .collect();
+    if live.len() > MAX_TRAY_SESSIONS {
+        live.drain(..live.len() - MAX_TRAY_SESSIONS);
+    }
+    live.into_iter().map(tray_session).collect()
 }
 
 /// Comprueba la salud de los subsistemas y sale.

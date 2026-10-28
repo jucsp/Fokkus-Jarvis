@@ -572,6 +572,9 @@ struct TaskHandle {
 
 struct Inner {
     registry: Mutex<HashMap<TaskId, TaskRecord>>,
+    /// Sube con cada alta o cambio de estado del registro (HU-67): el HUD y la
+    /// bandeja detectan cambios con una lectura atómica, sin clonar registros.
+    revision: AtomicU64,
     handles: Mutex<HashMap<TaskId, Arc<Mutex<TaskHandle>>>>,
     next_id: AtomicU64,
     slots_tx: Sender<()>,
@@ -625,6 +628,7 @@ impl TaskManager {
         Ok(Self {
             inner: Arc::new(Inner {
                 registry: Mutex::new(HashMap::new()),
+                revision: AtomicU64::new(0),
                 handles: Mutex::new(HashMap::new()),
                 next_id: AtomicU64::new(0),
                 slots_tx,
@@ -653,6 +657,7 @@ impl TaskManager {
             error: None,
         };
         self.inner.registry.lock().unwrap().insert(id, record);
+        self.inner.revision.fetch_add(1, Ordering::Release);
         let handle = Arc::new(Mutex::new(TaskHandle {
             token: CancellationToken::new(),
             brain: None,
@@ -761,6 +766,14 @@ impl TaskManager {
             .count()
     }
 
+    /// Revisión del registro (HU-67): cambia con cada alta o cambio de estado.
+    ///
+    /// Es una lectura atómica sin bloqueo ni asignación, pensada para que el
+    /// HUD y la bandeja solo pidan [`list`](Self::list) cuando algo cambió.
+    pub fn revision(&self) -> u64 {
+        self.inner.revision.load(Ordering::Acquire)
+    }
+
     /// `true` si hay alguna tarea en cola o en curso (HU-55).
     pub fn has_active_tasks(&self) -> bool {
         self.active_count() > 0
@@ -800,6 +813,7 @@ impl TaskManager {
             record.spoken_summary = summary;
             record.detail_path = path;
         }
+        self.inner.revision.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -962,6 +976,7 @@ fn set_status(inner: &Inner, id: TaskId, status: TaskStatus) {
     if let Some(record) = inner.registry.lock().unwrap().get_mut(&id) {
         record.status = status;
     }
+    inner.revision.fetch_add(1, Ordering::Release);
 }
 
 fn finish_task(
@@ -979,6 +994,7 @@ fn finish_task(
         record.spoken_summary = summary;
         record.detail_path = path;
     }
+    inner.revision.fetch_add(1, Ordering::Release);
 }
 
 fn create_tasks_dir(dir: &Path) -> std::io::Result<()> {

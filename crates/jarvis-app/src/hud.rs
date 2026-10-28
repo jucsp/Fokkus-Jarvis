@@ -9,9 +9,9 @@
 use std::time::Instant;
 
 use crossbeam_channel::Receiver;
-use jarvis_audio::HudEvent;
+use jarvis_audio::{HudEvent, TaskStatus};
 use jarvis_core::{JarvisConfig, Opacity};
-use jarvis_render::{BubbleStack, HudRenderer, Pixmap};
+use jarvis_render::{BubbleStack, ChipState, HudRenderer, Pixmap, SessionChip};
 use jarvis_shell::{FrameBuffer, OverlaySurface, SurfaceSize};
 
 /// Ancho fijo de la capa: los globos del usuario se alinean a la derecha y
@@ -20,6 +20,21 @@ pub const HUD_WIDTH: u32 = 320;
 
 /// Tamaño de letra de los globos, en píxeles lógicos.
 const HUD_FONT_PX: f32 = 15.0;
+
+/// Traduce el ciclo de vida de una tarea al estado que pinta su chip (HU-67).
+///
+/// `Queued` y `Running` tienen chip propio para distinguir "en cola" de "en
+/// marcha"; `Failed` y `TimedOut` comparten el rojo porque para el usuario son
+/// el mismo desenlace.
+fn chip_state(status: &TaskStatus) -> ChipState {
+    match status {
+        TaskStatus::Queued => ChipState::Queued,
+        TaskStatus::Running => ChipState::Working,
+        TaskStatus::Done => ChipState::Done,
+        TaskStatus::Failed | TaskStatus::TimedOut => ChipState::Failed,
+        TaskStatus::Cancelled => ChipState::Cancelled,
+    }
+}
 
 /// Ajustes del HUD que la app toma de `config.toml`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +73,9 @@ pub struct HudFrame {
 pub struct HudPipeline {
     events: Receiver<HudEvent>,
     stack: BubbleStack,
+    /// Chips de sub-sesión sobre los globos (HU-67). Se rehacen solo cuando
+    /// llega un [`HudEvent::Sessions`], nunca por frame.
+    chips: Vec<SessionChip>,
     renderer: Option<HudRenderer>,
     pixmap: Option<Pixmap>,
     settings: Option<HudSettings>,
@@ -74,6 +92,7 @@ impl HudPipeline {
         Self {
             events,
             stack: BubbleStack::new(3),
+            chips: Vec::new(),
             renderer: None,
             pixmap: None,
             settings: None,
@@ -103,7 +122,9 @@ impl HudPipeline {
             return false;
         };
 
-        if self.stack.is_empty() {
+        // Sin globos **ni chips** la capa se oculta (0 frames). Con
+        // sub-sesiones vivas los chips se muestran aunque no haya burbujas.
+        if self.stack.is_empty() && self.chips.is_empty() {
             if self.shown {
                 hud.set_visible(false);
                 self.shown = false;
@@ -127,7 +148,7 @@ impl HudPipeline {
         let Some(height) = self
             .renderer
             .as_ref()
-            .map(|renderer| renderer.measure(&self.stack, now).1)
+            .map(|renderer| renderer.measure_with_chips(&self.chips, &self.stack, now).1)
         else {
             return false;
         };
@@ -153,7 +174,7 @@ impl HudPipeline {
         let (Some(renderer), Some(pixmap)) = (self.renderer.as_mut(), self.pixmap.as_mut()) else {
             return false;
         };
-        renderer.render_into(&self.stack, pixmap, ctx.text_alpha, now);
+        renderer.render_with_chips(&self.chips, &self.stack, pixmap, ctx.text_alpha, now);
         let result = FrameBuffer::new(pixmap.data(), pixmap.width(), pixmap.height())
             .and_then(|frame| hud.present(&frame));
         match result {
@@ -224,7 +245,26 @@ impl HudPipeline {
             HudEvent::Notice { text } if !suppress_new => self.stack.push_notice(text, now),
             HudEvent::JarvisDone { turn } => self.stack.seal(turn, now),
             HudEvent::JarvisInterrupted { turn } => self.stack.interrupt(turn, now),
-            HudEvent::Clear => self.stack.clear(),
+            HudEvent::Clear => {
+                self.stack.clear();
+                self.chips.clear();
+            }
+            // Chips de sub-sesión (HU-67): se rehacen aquí, nunca por frame.
+            // La lista vacía los retira y deja el HUD como estaba (CA-67.1).
+            // No los suprime el modo pantalla completa: informan de trabajo en
+            // curso y no son globos de conversación.
+            HudEvent::Sessions(views) => {
+                let chips: Vec<SessionChip> = views
+                    .iter()
+                    .map(|view| {
+                        SessionChip::new(&view.title, chip_state(&view.status), view.focused)
+                    })
+                    .collect();
+                if chips == self.chips {
+                    return;
+                }
+                self.chips = chips;
+            }
             _ => return,
         }
         self.dirty = true;
@@ -259,6 +299,18 @@ mod tests {
             suppress_new: false,
             text_alpha: Opacity::OPAQUE,
         }
+    }
+
+    #[test]
+    fn chip_state_maps_every_task_status_hu67() {
+        // Cada estado del ciclo de vida tiene su chip; `Failed` y `TimedOut`
+        // comparten el rojo porque desde fuera se ven igual.
+        assert_eq!(chip_state(&TaskStatus::Queued), ChipState::Queued);
+        assert_eq!(chip_state(&TaskStatus::Running), ChipState::Working);
+        assert_eq!(chip_state(&TaskStatus::Done), ChipState::Done);
+        assert_eq!(chip_state(&TaskStatus::Failed), ChipState::Failed);
+        assert_eq!(chip_state(&TaskStatus::TimedOut), ChipState::Failed);
+        assert_eq!(chip_state(&TaskStatus::Cancelled), ChipState::Cancelled);
     }
 
     #[test]

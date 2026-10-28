@@ -47,10 +47,10 @@ use crate::protocol::{
     error_codes, methods, session_event, speech_priority, task_status, Ack, CancelTaskResult,
     DispatchSwarmParams, DispatchTaskParams, DispatchTaskResult, HelloParams, HelloResult,
     HelloSession, Incoming, JsonRpcError, Notification, NotifySwarmCompletedParams,
-    NotifySwarmProgressParams, NotifyTriageAlertParams, PingResult, Response, SessionCancelResult,
-    SessionEventParams, SessionIdParams, SessionReadResult, SessionSendParams, SessionSendResult,
-    SessionsResult, SetMutedParams, SetMutedResult, SpeakParams, SpeakResult, StateResult,
-    SwarmStatusResult, SwarmTask, TaskIdParams, TasksResult, TriageAlert, Utterance,
+    NotifySwarmProgressParams, NotifyTriageAlertParams, PingResult, Response, RoutingMetrics,
+    SessionCancelResult, SessionEventParams, SessionIdParams, SessionReadResult, SessionSendParams,
+    SessionSendResult, SessionsResult, SetMutedParams, SetMutedResult, SpeakParams, SpeakResult,
+    StateResult, SwarmStatusResult, SwarmTask, TaskIdParams, TasksResult, TriageAlert, Utterance,
     PROTOCOL_VERSION, SERVER_VERSION,
 };
 
@@ -148,7 +148,12 @@ pub struct ServerState {
     /// Eventos de sub-sesión emitidos (HU-66), acotados a
     /// [`SESSION_EVENTS_CAPACITY`].
     session_events: Mutex<Vec<SessionEventParams>>,
+    /// Fuente de las métricas de enrutamiento (HU-68); `None` sin voz.
+    routing: Mutex<Option<RoutingSource>>,
 }
+
+/// Lee las métricas de enrutamiento del orquestador en el momento (HU-68).
+pub type RoutingSource = Arc<dyn Fn() -> RoutingMetrics + Send + Sync>;
 
 impl ServerState {
     /// Crea el estado a partir de un núcleo ya construido.
@@ -169,6 +174,7 @@ impl ServerState {
             tasks: Mutex::new(None),
             hello: Mutex::new(None),
             session_events: Mutex::new(Vec::new()),
+            routing: Mutex::new(None),
         }
     }
 
@@ -193,6 +199,12 @@ impl ServerState {
     /// orquestador de voz arranca después del IPC).
     pub fn set_task_port(&self, tasks: Arc<dyn TaskPort>) {
         *lock(&self.tasks) = Some(tasks);
+    }
+
+    /// Instala la fuente de métricas de enrutamiento de `jarvis.getState`
+    /// (HU-68). Como el puerto de tareas, llega con el servidor ya en marcha.
+    pub fn set_routing_metrics(&self, source: RoutingSource) {
+        *lock(&self.routing) = Some(source);
     }
 
     /// Núcleo compartido (el mismo que ven la esfera y el orquestador).
@@ -325,6 +337,7 @@ impl ServerState {
             voice,
             voice_lang,
             swarm_in_flight: self.in_flight(),
+            routing: lock(&self.routing).as_ref().map(|source| source()),
         }
     }
 
@@ -1318,6 +1331,28 @@ mod tests {
         assert!(!result.muted);
         assert_eq!(result.voice_lang, "es-CL");
         assert_eq!(result.swarm_in_flight, 0);
+        assert_eq!(result.routing, None, "sin orquestador no hay métricas");
+    }
+
+    #[test]
+    fn get_state_exposes_routing_metrics() {
+        let state = ServerState::with_default_config();
+        let metrics = RoutingMetrics {
+            routed_spawn: 3,
+            routed_foreground: 7,
+            planner_fallbacks: 1,
+            planner_latency_ms: 840,
+        };
+        state.set_routing_metrics(Arc::new(move || metrics));
+        let response = call(
+            &state,
+            r#"{"jsonrpc":"2.0","method":"jarvis.getState","id":2}"#,
+        );
+        let raw = result_of(&response);
+        assert_eq!(raw["routing"]["routed_spawn"], 3);
+        assert_eq!(raw["routing"]["planner_latency_ms"], 840);
+        let result: StateResult = serde_json::from_value(raw).expect("result válido");
+        assert_eq!(result.routing, Some(metrics));
     }
 
     #[test]

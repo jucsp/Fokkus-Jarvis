@@ -725,6 +725,31 @@ pub struct StateResult {
     /// Número de tareas swarm en vuelo.
     #[serde(alias = "swarmInFlight")]
     pub swarm_in_flight: usize,
+    /// Métricas de enrutamiento de turnos (HU-68). Ausente si no hay
+    /// orquestador de voz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing: Option<RoutingMetrics>,
+}
+
+/// Contadores de enrutamiento de turnos de voz (HU-68), en `jarvis.getState`.
+///
+/// Miden en uso real el "a veces sí, a veces no" del router: cuántos turnos
+/// abrieron sub-sesión, cuántos respondió el hilo central y cómo le fue al
+/// planificador LLM.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoutingMetrics {
+    /// Sub-sesiones abiertas por el router.
+    #[serde(alias = "routedSpawn")]
+    pub routed_spawn: u64,
+    /// Turnos respondidos por el hilo central.
+    #[serde(alias = "routedForeground")]
+    pub routed_foreground: u64,
+    /// Llamadas al planificador que acabaron en la heurística.
+    #[serde(alias = "plannerFallbacks")]
+    pub planner_fallbacks: u64,
+    /// Latencia de la última llamada al planificador, en ms.
+    #[serde(alias = "plannerLatencyMs")]
+    pub planner_latency_ms: u64,
 }
 
 /// Parámetros de `jarvis.dispatchSwarm`.

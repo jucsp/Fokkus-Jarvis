@@ -8,7 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use jarvis_core::Opacity;
-use tiny_skia::{Color, FillRule, Paint, PathBuilder, Transform};
+use tiny_skia::{Color, FillRule, Paint, PathBuilder, Stroke, Transform};
 
 use crate::{Pixmap, RenderError};
 
@@ -293,6 +293,71 @@ struct Glyph {
     bitmap: Vec<u8>,
 }
 
+/// Estado de una sub-sesión, tal como lo pinta su chip (HU-67).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChipState {
+    Queued,
+    Working,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+impl ChipState {
+    /// Color RGB del punto de estado del chip.
+    pub fn color(self) -> (u8, u8, u8) {
+        match self {
+            ChipState::Queued => (0x9A, 0x9A, 0xAE),
+            ChipState::Working => (0xF5, 0x9E, 0x0B),
+            ChipState::Done => (0x22, 0xC5, 0x5E),
+            ChipState::Failed => (0xF8, 0x71, 0x71),
+            ChipState::Cancelled => (0x55, 0x55, 0x68),
+        }
+    }
+}
+
+/// Máximo de caracteres del título de un chip (sin contar la elipsis).
+pub const CHIP_TITLE_CHARS: usize = 18;
+
+/// Color RGB del borde del chip enfocado (turquesa de la paleta).
+pub const CHIP_FOCUS_COLOR: (u8, u8, u8) = (0x37, 0xEC, 0xBA);
+
+/// Chip de una sub-sesión junto a la esfera (HU-67): título corto, estado y
+/// si es la sub-sesión enfocada.
+///
+/// El título se recorta al construirlo: los chips se rehacen solo cuando la
+/// lista de sub-sesiones cambia, nunca por frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionChip {
+    pub title: String,
+    pub state: ChipState,
+    pub focused: bool,
+}
+
+impl SessionChip {
+    pub fn new(title: &str, state: ChipState, focused: bool) -> Self {
+        Self {
+            title: short_title(title, CHIP_TITLE_CHARS),
+            state,
+            focused,
+        }
+    }
+}
+
+/// `title` sin espacios sobrantes y con como mucho `max` caracteres; si se
+/// recorta, termina en "…".
+pub fn short_title(title: &str, max: usize) -> String {
+    let words: Vec<&str> = title.split_whitespace().collect();
+    let clean = words.join(" ");
+    if clean.chars().count() <= max {
+        return clean;
+    }
+    let mut cut: String = clean.chars().take(max).collect();
+    cut.truncate(cut.trim_end().len());
+    cut.push('…');
+    cut
+}
+
 /// Caché de glifos. Acotada: al superar 512 glifos se limpia (evita crecer sin
 /// límite con emojis/caracteres raros sin sacrificar el coste por frame).
 const GLYPH_CACHE_CAP: usize = 512;
@@ -512,6 +577,28 @@ const MAX_HUD_WIDTH: u32 = 320;
 /// Opacidad del fondo negro de la burbuja (55 %).
 const BACKGROUND_ALPHA: f32 = 0.55;
 
+/// Relleno horizontal del chip.
+const CHIP_PADDING_X: f32 = 8.0;
+
+/// Relleno vertical del chip.
+const CHIP_PADDING_Y: f32 = 4.0;
+
+/// Diámetro del punto de estado.
+const CHIP_DOT: f32 = 8.0;
+
+/// Separación entre el punto y el título.
+const CHIP_DOT_GAP: f32 = 6.0;
+
+/// Separación entre chips (horizontal y vertical).
+const CHIP_GAP: f32 = 6.0;
+
+/// Opacidad del fondo de un chip normal y del enfocado.
+const CHIP_BACKGROUND_ALPHA: f32 = 0.45;
+const CHIP_FOCUSED_BACKGROUND_ALPHA: f32 = 0.80;
+
+/// Grosor del borde del chip enfocado.
+const CHIP_FOCUS_STROKE: f32 = 2.0;
+
 /// Renderizador del HUD: mide y dibuja [`BubbleStack`] sobre un `Pixmap`.
 pub struct HudRenderer {
     raster: TextRasterizer,
@@ -527,6 +614,66 @@ impl HudRenderer {
     /// Ancho y alto en píxeles necesarios para el stack actual. `(0, 0)` si no
     /// hay burbujas visibles.
     pub fn measure(&self, stack: &BubbleStack, now: Instant) -> (u32, u32) {
+        self.measure_with_chips(&[], stack, now)
+    }
+
+    /// Como [`Self::measure`], con una fila de chips de sub-sesión encima de
+    /// las burbujas (HU-67). Sin chips mide exactamente lo mismo.
+    pub fn measure_with_chips(
+        &self,
+        chips: &[SessionChip],
+        stack: &BubbleStack,
+        now: Instant,
+    ) -> (u32, u32) {
+        let (bubbles_width, bubbles_height) = self.measure_bubbles(stack, now);
+        if chips.is_empty() {
+            return (bubbles_width, bubbles_height);
+        }
+        let (chips_width, chips_height) = self.layout_chips(chips, |_, _, _, _| {});
+        let gap = if bubbles_height > 0 { BUBBLE_GAP } else { 0.0 };
+        let width = (chips_width.ceil() as u32)
+            .max(bubbles_width)
+            .clamp(1, MAX_HUD_WIDTH);
+        let height = ((chips_height + gap).ceil() as u32 + bubbles_height).clamp(1, MAX_HUD_HEIGHT);
+        (width, height)
+    }
+
+    /// Alto de un chip.
+    fn chip_height(&self) -> f32 {
+        self.raster.line_height() + 2.0 * CHIP_PADDING_Y
+    }
+
+    /// Ancho de un chip.
+    fn chip_width(&self, chip: &SessionChip) -> f32 {
+        2.0 * CHIP_PADDING_X + CHIP_DOT + CHIP_DOT_GAP + self.raster.measure(&chip.title)
+    }
+
+    /// Reparte los chips en filas de [`MAX_HUD_WIDTH`] y llama a `place(i, x,
+    /// y, w)` por cada uno. Devuelve el ancho y el alto ocupados.
+    fn layout_chips(
+        &self,
+        chips: &[SessionChip],
+        mut place: impl FnMut(usize, f32, f32, f32),
+    ) -> (f32, f32) {
+        let chips = &chips[..chips.len().min(MAX_CHIPS_DRAWN)];
+        let max_width = MAX_HUD_WIDTH as f32;
+        let row_height = self.chip_height();
+        let (mut x, mut y, mut used) = (0.0f32, 0.0f32, 0.0f32);
+        for (i, chip) in chips.iter().enumerate() {
+            let w = self.chip_width(chip).min(max_width);
+            if x > 0.0 && x + w > max_width {
+                x = 0.0;
+                y += row_height + CHIP_GAP;
+            }
+            place(i, x, y, w);
+            used = used.max(x + w);
+            x += w + CHIP_GAP;
+        }
+        (used, y + row_height)
+    }
+
+    /// Medida de las burbujas solas.
+    fn measure_bubbles(&self, stack: &BubbleStack, now: Instant) -> (u32, u32) {
         let mut total_height = 0.0f32;
         let mut max_width = 0.0f32;
         let mut count = 0u32;
@@ -569,11 +716,31 @@ impl HudRenderer {
         min_alpha: Opacity,
         now: Instant,
     ) {
+        self.render_with_chips(&[], stack, pixmap, min_alpha, now);
+    }
+
+    /// Como [`Self::render_into`], con los chips de sub-sesión arriba (HU-67).
+    ///
+    /// El chip enfocado se distingue por un fondo más opaco y un borde
+    /// turquesa ([`CHIP_FOCUS_COLOR`]). Sin chips el resultado es idéntico al
+    /// de `render_into`.
+    pub fn render_with_chips(
+        &mut self,
+        chips: &[SessionChip],
+        stack: &BubbleStack,
+        pixmap: &mut Pixmap,
+        min_alpha: Opacity,
+        now: Instant,
+    ) {
         pixmap.fill(Color::TRANSPARENT);
 
         let surface_width = pixmap.width() as f32;
         let min_fraction = f32::from(min_alpha.as_u8()) / 255.0;
         let mut y = 0.0f32;
+
+        if !chips.is_empty() {
+            y = self.render_chips(chips, pixmap, min_fraction) + BUBBLE_GAP;
+        }
 
         // Las burbujas con opacidad 0 (recién nacidas) ocupan su sitio igual
         // que en `measure`; `fill_rounded_rect` y `draw_line` no pintan nada.
@@ -617,6 +784,104 @@ impl HudRenderer {
             y += bubble_height + BUBBLE_GAP;
         }
     }
+}
+
+impl HudRenderer {
+    /// Dibuja la fila de chips desde `y = 0` y devuelve su alto.
+    fn render_chips(
+        &mut self,
+        chips: &[SessionChip],
+        pixmap: &mut Pixmap,
+        min_fraction: f32,
+    ) -> f32 {
+        let height = self.chip_height();
+        let ascent = self.raster.ascent();
+        let mut boxes = [(0.0f32, 0.0f32, 0.0f32); MAX_CHIPS_DRAWN];
+        let (_, total) = self.layout_chips(chips, |i, x, y, w| {
+            if let Some(slot) = boxes.get_mut(i) {
+                *slot = (x, y, w);
+            }
+        });
+        for (chip, &(x, y, w)) in chips.iter().zip(boxes.iter()) {
+            let bg = if chip.focused {
+                CHIP_FOCUSED_BACKGROUND_ALPHA
+            } else {
+                CHIP_BACKGROUND_ALPHA
+            };
+            let bg_byte = (bg * 255.0).round() as u8;
+            fill_rounded_rect(pixmap, x, y, w, height, height / 2.0, bg_byte);
+            if chip.focused {
+                stroke_rounded_rect(
+                    pixmap,
+                    x + CHIP_FOCUS_STROKE / 2.0,
+                    y + CHIP_FOCUS_STROKE / 2.0,
+                    w - CHIP_FOCUS_STROKE,
+                    height - CHIP_FOCUS_STROKE,
+                    (height - CHIP_FOCUS_STROKE) / 2.0,
+                    CHIP_FOCUS_COLOR,
+                );
+            }
+            let dot_x = x + CHIP_PADDING_X;
+            let dot_y = y + (height - CHIP_DOT) / 2.0;
+            fill_circle(pixmap, dot_x, dot_y, CHIP_DOT, chip.state.color());
+
+            let opacity = if chip.focused {
+                1.0
+            } else {
+                min_fraction.max(0.6) * 0.85
+            };
+            let text_byte = (opacity * 255.0).round().clamp(0.0, 255.0) as u8;
+            let text_x = dot_x + CHIP_DOT + CHIP_DOT_GAP;
+            let baseline = y + CHIP_PADDING_Y + ascent;
+            self.raster
+                .draw_line(pixmap, &chip.title, text_x, baseline, text_byte);
+        }
+        total
+    }
+}
+
+/// Tope de chips que se dibujan (el resto se recorta en la app).
+pub const MAX_CHIPS_DRAWN: usize = 8;
+
+/// Traza el borde de un rectángulo redondeado en el color indicado.
+fn stroke_rounded_rect(
+    pixmap: &mut Pixmap,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    r: f32,
+    (red, green, blue): (u8, u8, u8),
+) {
+    let Some(path) = rounded_rect_path(x, y, w, h, r) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(red, green, blue, 255);
+    paint.anti_alias = true;
+    let stroke = Stroke {
+        width: CHIP_FOCUS_STROKE,
+        ..Stroke::default()
+    };
+    pixmap.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+}
+
+/// Rellena un círculo de diámetro `d` con esquina superior izquierda en `(x, y)`.
+fn fill_circle(pixmap: &mut Pixmap, x: f32, y: f32, d: f32, (red, green, blue): (u8, u8, u8)) {
+    let r = d / 2.0;
+    let Some(path) = PathBuilder::from_circle(x + r, y + r, r) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(red, green, blue, 255);
+    paint.anti_alias = true;
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 }
 
 /// Rellena un rectángulo redondeado negro con la opacidad indicada.
@@ -891,6 +1156,144 @@ mod tests {
         }
         assert!(background_found, "fondo negro de la burbuja ausente");
         assert!(text_found, "texto blanco ausente");
+    }
+
+    #[test]
+    fn short_title_trims_and_adds_ellipsis() {
+        assert_eq!(short_title("  PR   de Felipe ", 18), "PR de Felipe");
+        assert_eq!(
+            short_title("la revisión de PR de Felipe en pagos", 18),
+            "la revisión de PR…"
+        );
+        assert_eq!(short_title("ñandú café", 4), "ñand…");
+        assert_eq!(
+            SessionChip::new("x".repeat(40).as_str(), ChipState::Working, false)
+                .title
+                .chars()
+                .count(),
+            CHIP_TITLE_CHARS + 1
+        );
+    }
+
+    fn settled_stack() -> (BubbleStack, Instant) {
+        let mut stack = BubbleStack::new(3);
+        let now = base();
+        stack.push_user(1, "hola", now);
+        (stack, now + Duration::from_millis(200))
+    }
+
+    #[test]
+    fn without_chips_measure_and_render_are_unchanged() {
+        // CA-67.1: con 0 sub-sesiones el HUD es idéntico al de HU-36.
+        let (stack, now) = settled_stack();
+        let mut renderer = HudRenderer::new(16.0).unwrap();
+        let size = renderer.measure(&stack, now);
+        assert_eq!(renderer.measure_with_chips(&[], &stack, now), size);
+        assert_eq!(
+            renderer.measure_with_chips(&[], &BubbleStack::new(3), now),
+            (0, 0)
+        );
+
+        let mut plain = Pixmap::new(size.0, size.1).unwrap();
+        let mut with_none = Pixmap::new(size.0, size.1).unwrap();
+        renderer.render_into(&stack, &mut plain, Opacity::OPAQUE, now);
+        renderer.render_with_chips(&[], &stack, &mut with_none, Opacity::OPAQUE, now);
+        assert_eq!(plain.data(), with_none.data());
+    }
+
+    #[test]
+    fn chips_take_space_above_the_bubbles() {
+        let (stack, now) = settled_stack();
+        let renderer = HudRenderer::new(16.0).unwrap();
+        let chips = [SessionChip::new("PR de Felipe", ChipState::Working, false)];
+        let (_, bubbles) = renderer.measure(&stack, now);
+        let (w, h) = renderer.measure_with_chips(&chips, &stack, now);
+        assert!(h > bubbles, "los chips suman alto: {h} vs {bubbles}");
+        // Solo chips (sin burbujas): el HUD igual tiene algo que mostrar.
+        let (cw, ch) = renderer.measure_with_chips(&chips, &BubbleStack::new(3), now);
+        assert!(cw > 0 && ch > 0 && ch < h && cw <= w);
+    }
+
+    #[test]
+    fn many_chips_wrap_into_rows() {
+        let renderer = HudRenderer::new(16.0).unwrap();
+        let now = base();
+        let one = [SessionChip::new(
+            "revisión de logs",
+            ChipState::Queued,
+            false,
+        )];
+        let many: Vec<SessionChip> = (0..6)
+            .map(|i| SessionChip::new(&format!("revisión de logs {i}"), ChipState::Queued, false))
+            .collect();
+        let (_, single_row) = renderer.measure_with_chips(&one, &BubbleStack::new(3), now);
+        let (w, rows) = renderer.measure_with_chips(&many, &BubbleStack::new(3), now);
+        assert!(w <= MAX_HUD_WIDTH);
+        assert!(rows > 2 * single_row, "6 chips no caben en una fila");
+    }
+
+    /// Píxeles turquesa (borde de foco) en un render premultiplicado opaco.
+    fn focus_pixels(pixmap: &Pixmap) -> usize {
+        pixmap
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|px| px[3] > 200 && px[0] < 120 && px[1] > 170 && px[2] > 120)
+            .count()
+    }
+
+    #[test]
+    fn focused_chip_is_visually_distinct() {
+        // CA-67.2: mismo título y estado; solo cambia el foco.
+        let now = base();
+        let stack = BubbleStack::new(3);
+        let mut renderer = HudRenderer::new(16.0).unwrap();
+        let normal = [SessionChip::new("PR de Felipe", ChipState::Working, false)];
+        let focused = [SessionChip::new("PR de Felipe", ChipState::Working, true)];
+        let (w, h) = renderer.measure_with_chips(&normal, &stack, now);
+        assert_eq!(renderer.measure_with_chips(&focused, &stack, now), (w, h));
+
+        let mut a = Pixmap::new(w, h).unwrap();
+        let mut b = Pixmap::new(w, h).unwrap();
+        renderer.render_with_chips(&normal, &stack, &mut a, Opacity::OPAQUE, now);
+        renderer.render_with_chips(&focused, &stack, &mut b, Opacity::OPAQUE, now);
+        assert_ne!(a.data(), b.data());
+        assert_eq!(focus_pixels(&a), 0, "sin foco no hay borde turquesa");
+        assert!(
+            focus_pixels(&b) > 20,
+            "el chip enfocado lleva borde turquesa"
+        );
+
+        // Y el fondo del enfocado es más opaco.
+        let alpha_sum = |p: &Pixmap| -> u64 {
+            p.data()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|px| u64::from(px[3]))
+                .sum()
+        };
+        assert!(alpha_sum(&b) > alpha_sum(&a));
+    }
+
+    #[test]
+    fn chip_dot_uses_the_state_color() {
+        let now = base();
+        let stack = BubbleStack::new(3);
+        let mut renderer = HudRenderer::new(16.0).unwrap();
+        let chips = [SessionChip::new("logs", ChipState::Failed, false)];
+        let (w, h) = renderer.measure_with_chips(&chips, &stack, now);
+        let mut pixmap = Pixmap::new(w, h).unwrap();
+        renderer.render_with_chips(&chips, &stack, &mut pixmap, Opacity::OPAQUE, now);
+        let (r, g, b) = ChipState::Failed.color();
+        let found = pixmap
+            .data()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[3] == 255 && px[0] == r && px[1] == g && px[2] == b);
+        assert!(found, "falta el punto rojo de estado fallido");
     }
 
     #[test]

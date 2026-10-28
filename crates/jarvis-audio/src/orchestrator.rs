@@ -53,13 +53,13 @@ use crate::activation::{Activation, ActivationDetector};
 use crate::brain::{BrainError, Completion};
 use crate::conversation::{barge_in, ConversationCoordinator, ConversationError, TokenStream};
 use crate::dsp::ConnectorSignal;
-use crate::events::{CloseReason, HudEvent, TurnId, VoiceEvent};
+use crate::events::{CloseReason, HudEvent, SessionView, TurnId, VoiceEvent};
 use crate::io::{to_output_pcm, AudioEngine, EngineShared, PlayOutcome, Player};
 use crate::playback::AudioPlayback;
 use crate::router::{
-    fuse_ack_and_foreground, resolve_in_roster, voice_aliases, BrainTurnPlanner, RosterEntry,
-    RouteContext, SessionControl, SessionQuery, SessionRef, SpawnSpec, TurnPlan, TurnPlanner,
-    TurnRouter,
+    fuse_ack_and_foreground, resolve_in_roster, voice_aliases, BrainTurnPlanner, PlannerTrace,
+    RosterEntry, RouteContext, SessionControl, SessionQuery, SessionRef, SpawnSpec, TurnPlan,
+    TurnPlanner, TurnRouter,
 };
 use crate::sessions::SessionId;
 use crate::speech_queue::{Delivery, DeliveryGate, SpeechPriority};
@@ -352,9 +352,16 @@ struct HudTx(Option<Sender<HudEvent>>);
 
 impl HudTx {
     fn emit(&self, event: HudEvent) {
-        if let Some(tx) = &self.0 {
+        let _ = self.try_emit(event);
+    }
+
+    /// Como [`Self::emit`], pero dice si el evento entró al canal. Sin HUD
+    /// cuenta como entregado: no hay nadie a quien reintentárselo.
+    fn try_emit(&self, event: HudEvent) -> bool {
+        match &self.0 {
             // Canal lleno o HUD cerrado: se descarta, la voz sigue.
-            let _ = tx.try_send(event);
+            Some(tx) => tx.try_send(event).is_ok(),
+            None => true,
         }
     }
 }
@@ -423,6 +430,14 @@ pub struct VoiceStats {
     pub close_max_timeout: AtomicU64,
     /// Turnos cerrados tras el silencio extendido por conector (HU-41).
     pub close_connector: AtomicU64,
+    /// Sub-sesiones abiertas por el router (HU-68).
+    pub routed_spawn: AtomicU64,
+    /// Turnos que respondió el hilo central (HU-68).
+    pub routed_foreground: AtomicU64,
+    /// Llamadas al planificador que acabaron en la heurística (HU-68).
+    pub planner_fallbacks: AtomicU64,
+    /// Latencia de la última llamada al planificador, en ms (HU-68).
+    pub planner_latency_ms: AtomicU64,
 }
 
 /// Fotografía de [`VoiceStats`].
@@ -441,6 +456,10 @@ pub struct VoiceStatsSnapshot {
     pub close_silence: u64,
     pub close_max_timeout: u64,
     pub close_connector: u64,
+    pub routed_spawn: u64,
+    pub routed_foreground: u64,
+    pub planner_fallbacks: u64,
+    pub planner_latency_ms: u64,
 }
 
 impl VoiceStats {
@@ -460,6 +479,19 @@ impl VoiceStats {
             close_silence: get(&self.close_silence),
             close_max_timeout: get(&self.close_max_timeout),
             close_connector: get(&self.close_connector),
+            routed_spawn: get(&self.routed_spawn),
+            routed_foreground: get(&self.routed_foreground),
+            planner_fallbacks: get(&self.planner_fallbacks),
+            planner_latency_ms: get(&self.planner_latency_ms),
+        }
+    }
+
+    /// Anota la llamada al planificador de un turno (HU-68).
+    pub fn count_planner(&self, trace: PlannerTrace) {
+        let ms = u64::try_from(trace.latency.as_millis()).unwrap_or(u64::MAX);
+        self.planner_latency_ms.store(ms, Ordering::Relaxed);
+        if trace.fallback {
+            self.planner_fallbacks.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -1590,6 +1622,50 @@ fn session_id(id: TaskId) -> SessionId {
     SessionId::try_from(id).unwrap_or(SessionId::MAX)
 }
 
+/// Máximo de sub-sesiones que se publican al HUD y a la bandeja (HU-67).
+pub const MAX_SESSION_VIEWS: usize = 8;
+
+/// Sub-sesiones visibles (HU-67): las vivas (en cola o trabajando) y la
+/// enfocada aunque ya haya terminado, por id y con tope
+/// [`MAX_SESSION_VIEWS`]. `title` da el título hablado de cada registro.
+pub fn session_views(
+    records: &[TaskRecord],
+    focus: Option<SessionId>,
+    title: impl Fn(&TaskRecord) -> String,
+) -> Vec<SessionView> {
+    let mut views: Vec<SessionView> = records
+        .iter()
+        .filter(|record| {
+            matches!(record.status, TaskStatus::Queued | TaskStatus::Running)
+                || focus == Some(session_id(record.id))
+        })
+        .map(|record| SessionView {
+            id: record.id,
+            title: title(record),
+            status: record.status.clone(),
+            focused: focus == Some(session_id(record.id)),
+            has_detail: record.detail_path.is_some(),
+        })
+        .collect();
+    views.sort_by_key(|view| view.id);
+    if views.len() > MAX_SESSION_VIEWS {
+        // Se conservan las más recientes, sin perder la enfocada.
+        let focused = views.iter().position(|view| view.focused);
+        let keep_from = views.len() - MAX_SESSION_VIEWS;
+        match focused {
+            Some(i) if i < keep_from => {
+                let pinned = views.remove(i);
+                views.drain(..keep_from);
+                views.insert(0, pinned);
+            }
+            _ => {
+                views.drain(..keep_from);
+            }
+        }
+    }
+    views
+}
+
 /// Estado en palabras para el roster (§3.5).
 fn status_word(status: TaskStatus) -> &'static str {
     match status {
@@ -2031,6 +2107,8 @@ impl VoiceOrchestrator {
                 hud_user_turn: 0,
                 hud_open: None,
                 pending_user_turn: pending_user_turn.clone(),
+                sessions_key: None,
+                sessions_shown: Vec::new(),
             };
             threads.push(spawn(
                 "jarvis-brain",
@@ -2224,6 +2302,12 @@ impl VoiceOrchestrator {
 
     pub fn stats(&self) -> VoiceStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// Contadores vivos, para leerlos desde otro hilo (`jarvis.getState`,
+    /// HU-68) sin pasar por el orquestador.
+    pub fn stats_handle(&self) -> Arc<VoiceStats> {
+        Arc::clone(&self.stats)
     }
 
     /// Detiene los hilos. Corta el audio y cancela el LLM para que nada quede
@@ -3209,6 +3293,11 @@ struct BrainLoop {
     hud_open: Option<TurnId>,
     /// Turno de usuario despachado y en curso (se limpia al terminar).
     pending_user_turn: PendingUserTurn,
+    /// Última clave publicada al HUD (revisión del gestor, foco visible):
+    /// mientras no cambie no se recalcula la lista de sub-sesiones (HU-67).
+    sessions_key: Option<(u64, Option<SessionId>)>,
+    /// Última lista de sub-sesiones entregada al HUD (HU-67).
+    sessions_shown: Vec<SessionView>,
 }
 
 /// Cómo se subtitula una locución en el HUD (HU-36).
@@ -3251,7 +3340,39 @@ impl BrainLoop {
                 default(QUEUE_TICK) => {}
             }
             self.drain_queue();
+            self.publish_sessions(Instant::now());
         }
+    }
+
+    /// Publica al HUD las sub-sesiones visibles si cambiaron (HU-67).
+    ///
+    /// Se evalúa en cada vuelta del bucle (como mucho cada [`QUEUE_TICK`]):
+    /// la revisión del gestor y el foco son lecturas baratas, y la lista solo
+    /// se reconstruye cuando cambian. El render no consulta nada por frame.
+    /// Si el canal del HUD está lleno, la clave no se da por publicada y se
+    /// reintenta en la vuelta siguiente.
+    fn publish_sessions(&mut self, now: Instant) {
+        let Some(tasks) = &self.tasks else {
+            return;
+        };
+        let focus = self.visible_focus(now);
+        let key = (tasks.revision(), focus);
+        if self.sessions_key == Some(key) {
+            return;
+        }
+        let views = session_views(&tasks.list(), focus, |record| self.spoken_title(record));
+        if views == self.sessions_shown || self.hud.try_emit(HudEvent::Sessions(views.clone())) {
+            self.sessions_key = Some(key);
+            self.sessions_shown = views;
+        }
+    }
+
+    /// Foco que se muestra: el vigente, salvo que ya haya caducado. No lo
+    /// suelta (eso lo hace el siguiente turno, que además lo anuncia).
+    fn visible_focus(&self, now: Instant) -> Option<SessionId> {
+        let at = self.focus_at?;
+        self.focus
+            .filter(|_| !focus_expired(at, now, self.focus_timeout))
     }
 
     /// Dice la siguiente locución de la cola si el *gate* lo permite: Jarvis
@@ -3302,7 +3423,7 @@ impl BrainLoop {
     fn route_turn(&mut self, query: &str) {
         let notice = self.expire_focus(Instant::now());
         let roster = self.roster();
-        let plan = TurnRouter::route(
+        let (plan, trace) = TurnRouter::route_traced(
             query,
             &RouteContext {
                 planner: self.planner.as_deref(),
@@ -3310,6 +3431,9 @@ impl BrainLoop {
                 focus: self.focus,
             },
         );
+        if let Some(trace) = trace {
+            self.stats.count_planner(trace);
+        }
         self.apply_plan(plan, query, notice);
     }
 
@@ -3411,6 +3535,7 @@ impl BrainLoop {
     /// una sola locución. `notice` (foco caducado) abre la locución.
     fn apply_plan(&mut self, plan: TurnPlan, query: &str, notice: Option<String>) {
         if plan.is_empty() {
+            self.count_foreground();
             match notice {
                 Some(notice) => self.converse_or_say(&fuse_ack_and_foreground(&notice, query)),
                 None => self.converse_or_say(query),
@@ -3420,6 +3545,7 @@ impl BrainLoop {
         // Sin gestor de tareas no hay sub-sesiones donde despachar: el hilo
         // central atiende el turno completo, como antes de HU-63.
         if !plan.spawn.is_empty() && self.tasks.is_none() {
+            self.count_foreground();
             self.converse_or_say(query);
             return;
         }
@@ -3450,13 +3576,25 @@ impl BrainLoop {
         match (plan.foreground, ack.is_empty()) {
             // Acuse + respuesta en una sola locución (CA-1).
             (Some(foreground), false) => {
+                self.count_foreground();
                 let fused = fuse_ack_and_foreground(&ack, &foreground);
                 self.converse_or_say(&fused);
             }
-            (Some(foreground), true) => self.converse_or_say(&foreground),
+            (Some(foreground), true) => {
+                self.count_foreground();
+                self.converse_or_say(&foreground);
+            }
             (None, false) => self.say(&ack, AfterSpeech::Listen),
-            (None, true) => self.converse_or_say(query),
+            (None, true) => {
+                self.count_foreground();
+                self.converse_or_say(query);
+            }
         }
+    }
+
+    /// El hilo central responde este turno (HU-68).
+    fn count_foreground(&self) {
+        self.stats.routed_foreground.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Abre la sub-sesión de un `SpawnSpec` y devuelve su acuse hablado.
@@ -3466,6 +3604,7 @@ impl BrainLoop {
         let title = spec.task_title();
         let prompt = spec.task_prompt(self.last_assistant_response.as_deref());
         let id = tasks.submit(title, prompt, TaskOrigin::Voice);
+        self.stats.routed_spawn.fetch_add(1, Ordering::Relaxed);
         let aliases = if spec.aliases.is_empty() {
             voice_aliases(&spec.title, &spec.instruction, 3)
         } else {

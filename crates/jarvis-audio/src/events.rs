@@ -7,6 +7,8 @@
 
 use std::time::Instant;
 
+use crate::tasks::TaskStatus;
+
 /// Segmento de audio limpio y normalizado listo para la transcripción.
 #[derive(Debug, Clone)]
 pub struct Segment {
@@ -104,4 +106,20 @@ pub enum HudEvent {
     Notice { text: String },
     /// Vaciar el HUD.
     Clear,
+    /// Sub-sesiones visibles (HU-67): chips junto a la esfera y submenú de la
+    /// bandeja. Se emite solo cuando la lista cambia; vacía = sin chips.
+    Sessions(Vec<SessionView>),
+}
+
+/// Sub-sesión tal como se muestra en el HUD y la bandeja (HU-67).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionView {
+    pub id: u64,
+    /// Título hablado ("la revisión de PR de Felipe").
+    pub title: String,
+    pub status: TaskStatus,
+    /// Es la sub-sesión enfocada por voz (HU-64).
+    pub focused: bool,
+    /// Ya dejó detalle en disco (habilita "Abrir detalle" en la bandeja).
+    pub has_detail: bool,
 }
