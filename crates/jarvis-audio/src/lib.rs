@@ -26,6 +26,8 @@
 //!   TTS con barge-in y silencio real (HU-9).
 //! - [`text`]: normalización léxica única de las órdenes de voz (tildes,
 //!   enclíticos y variantes fonéticas de STT) para las heurísticas (HU-59).
+//! - [`sessions`]: multi-sesiones y subhilos de conversación con persistencia
+//!   (HU-62).
 
 pub mod activation;
 pub mod agent;
@@ -38,6 +40,7 @@ pub mod io;
 pub mod models;
 pub mod orchestrator;
 pub mod playback;
+pub mod sessions;
 pub mod speech_queue;
 pub mod stt;
 pub mod tasks;

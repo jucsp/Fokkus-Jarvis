@@ -22,6 +22,7 @@ use jarvis_core::tasks_dir;
 
 use crate::brain::{BrainError, CancellationToken};
 use crate::conversation::TokenStream;
+use crate::sessions::SessionProfile;
 use crate::speech_queue::{Delivery, SpeechPriority, SpeechQueue};
 use crate::text::normalize::{normalize, HEAVY_IDIOMS, HEAVY_OBJECTS, HEAVY_VERBS};
 use crate::tts::strip_directives;
@@ -270,6 +271,19 @@ const DETAIL_MAX_BYTES: usize = 1 << 20;
 /// del orquestador).
 pub trait BrainFactory: Send + Sync {
     fn spawn(&self, timeout: Duration) -> Result<Arc<dyn TokenStream + Send + Sync>, BrainError>;
+
+    /// Cerebro para una sub-sesión de un perfil concreto (HU-62).
+    ///
+    /// Por defecto delega en [`spawn`](Self::spawn): las fábricas que sepan
+    /// construir un cerebro específico por perfil (por ejemplo, con el
+    /// `system_prompt` de [`crate::sessions::prompts`]) lo sobrescriben.
+    fn spawn_worker(
+        &self,
+        _profile: SessionProfile,
+        timeout: Duration,
+    ) -> Result<Arc<dyn TokenStream + Send + Sync>, BrainError> {
+        self.spawn(timeout)
+    }
 }
 
 /// Cola hablada compartida entre el hilo del cerebro (que la drena con su
@@ -539,7 +553,7 @@ fn strip_summary_marker(s: &str) -> String {
 }
 
 /// `true` si el error corresponde al timeout del cerebro CLI.
-fn is_timeout(err: &BrainError) -> bool {
+pub(crate) fn is_timeout(err: &BrainError) -> bool {
     matches!(err, BrainError::Cli(msg) if msg.contains("no respondió"))
 }
 
