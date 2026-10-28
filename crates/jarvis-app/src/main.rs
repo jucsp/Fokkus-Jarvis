@@ -94,6 +94,12 @@ enum CliAction {
     /// `session show <id>` | `task show <id>`: imprime el detalle en markdown
     /// de una sub-sesión o de una tarea de fondo (HU-65).
     Show(DetailTarget),
+    /// `session list`: sub-sesiones del daemon por IPC (HU-66).
+    SessionList,
+    /// `session cancel <id>`: `jarvis.sessions.cancel` (HU-66).
+    SessionCancel(u64),
+    /// `session send <id> <instrucción…>`: `jarvis.sessions.send` (HU-66).
+    SessionSend(u64, String),
 }
 
 /// Qué detalle imprime `… show <id>` (HU-65).
@@ -248,6 +254,25 @@ impl TaskPort for VoiceTaskPort {
             .is_some_and(|r| matches!(r.status, TaskStatus::Queued | TaskStatus::Running));
         active && self.0.cancel(id)
     }
+
+    /// Instrucción nueva a un hilo (HU-66). Mientras la sub-sesión sea una
+    /// tarea de un disparo, la instrucción se encola como turno nuevo con el
+    /// mismo título (y por tanto el mismo perfil), igual que por voz.
+    fn send_session(&self, id: u64, instruction: String) -> Result<(), String> {
+        let record = self
+            .0
+            .get(id)
+            .ok_or_else(|| format!("no existe la sesión {id}"))?;
+        let prompt = ipc_task_prompt(&record.title, &instruction);
+        let turn = self.0.submit(record.title, prompt, TaskOrigin::Ipc);
+        println!("[tareas] #{id} recibió una instrucción por IPC (turno #{turn}).");
+        Ok(())
+    }
+
+    fn read_detail(&self, id: u64) -> Option<String> {
+        let path = self.0.get(id)?.detail_path?;
+        std::fs::read_to_string(path).ok()
+    }
 }
 
 /// Elige el *prompt* del subagente según el título de la tarea despachada por
@@ -291,6 +316,9 @@ fn main() -> ExitCode {
         Ok(CliAction::TaskRun(profile, task)) => run_background_task(profile, &task),
         Ok(CliAction::DiagTurns(window)) => diag::run(window),
         Ok(CliAction::Show(target)) => run_show(target),
+        Ok(CliAction::SessionList) => run_session_list(),
+        Ok(CliAction::SessionCancel(id)) => run_session_cancel(id),
+        Ok(CliAction::SessionSend(id, instruction)) => run_session_send(id, &instruction),
         Err(message) => {
             eprintln!("{message}");
             print_usage();
@@ -320,7 +348,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             Some("show") => parse_show_id("session", &args[2..])
                 .and_then(|id| u32::try_from(id).map_err(|_| format!("id inválido: {id}")))
                 .map(|id| CliAction::Show(DetailTarget::Session(id))),
-            _ => Err("uso: session show <id>".into()),
+            Some("list") if args.len() == 2 => Ok(CliAction::SessionList),
+            Some("cancel") => match &args[2..] {
+                [id] => parse_session_id(id).map(CliAction::SessionCancel),
+                _ => Err("uso: session cancel <id>".into()),
+            },
+            Some("send") => parse_session_send(&args[2..])
+                .map(|(id, instruction)| CliAction::SessionSend(id, instruction)),
+            _ => Err(SESSION_USAGE.into()),
         },
         Some("capture") => match &args[1..] {
             [] => Ok(CliAction::Capture(PathBuf::from(DEFAULT_CAPTURE_PATH))),
@@ -428,6 +463,32 @@ fn parse_show_id(kind: &str, args: &[String]) -> Result<u64, String> {
     }
 }
 
+/// Uso del subcomando `session` (HU-66).
+const SESSION_USAGE: &str =
+    "uso: session list | session show <id> | session cancel <id> | session send <id> <instrucción>";
+
+/// Id de una sub-sesión, con o sin `#` delante (HU-66).
+fn parse_session_id(raw: &str) -> Result<u64, String> {
+    raw.trim_start_matches('#')
+        .parse::<u64>()
+        .map_err(|_| format!("id inválido: {raw}"))
+}
+
+/// `session send <id> <palabras…>` (HU-66): une la instrucción con espacios.
+fn parse_session_send(args: &[String]) -> Result<(u64, String), String> {
+    const USAGE: &str = "uso: session send <id> <instrucción>";
+    let Some((id, rest)) = args.split_first() else {
+        return Err(USAGE.to_string());
+    };
+    let id = parse_session_id(id)?;
+    let instruction = rest.join(" ").trim().to_string();
+    if instruction.is_empty() {
+        Err(USAGE.to_string())
+    } else {
+        Ok((id, instruction))
+    }
+}
+
 /// Ruta del detalle de una sub-sesión o tarea, si existe (HU-65).
 ///
 /// Las tareas escriben `<ms>-<id>.md` (los ids reinician con el proceso), así
@@ -513,7 +574,12 @@ fn print_usage() {
     println!("                              Despacha una revisión, análisis o investigación");
     println!("                              (por defecto read_only, sin prompt de ingeniería).");
     println!("  task show <id>              Imprime el detalle (markdown) de una tarea.");
+    println!();
+    println!("Sub-sesiones (list, cancel y send requieren Jarvis corriendo):");
+    println!("  session list                Lista los hilos con su id, estado y título.");
     println!("  session show <id>           Imprime el detalle (markdown) de una sub-sesión.");
+    println!("  session cancel <id>         Cancela el turno en curso de una sub-sesión.");
+    println!("  session send <id> <texto>   Envía una instrucción nueva a una sub-sesión.");
     println!();
     println!("Sin opciones, arranca Fokkus-Jarvis, levanta el servidor IPC y deja");
     println!("el socket listo para conexiones de Fokkus IDE.");
@@ -632,6 +698,15 @@ fn in_sub_session() -> bool {
     std::env::var_os(SUBSESSION_ENV).is_some()
 }
 
+/// Motivo del rechazo de `session send` dentro de una sub-sesión (HU-66).
+const SUB_SESSION_SEND_REFUSAL: &str =
+    "Error: fokkus-jarvis session send no está permitido dentro de una sub-sesión (antirrecursión)";
+
+/// Motivo con el que `session send` debe negarse a correr, si corresponde (HU-66).
+fn session_send_refusal() -> Option<&'static str> {
+    in_sub_session().then_some(SUB_SESSION_SEND_REFUSAL)
+}
+
 /// Motivo con el que `dev run` debe negarse a correr, si corresponde (HU-60).
 fn dev_run_refusal() -> Option<&'static str> {
     in_sub_session().then_some(SUB_SESSION_DEV_RUN_REFUSAL)
@@ -703,6 +778,103 @@ fn run_background_task(profile: TaskProfile, task: &str) -> ExitCode {
         }
         Err(e) => {
             eprintln!("No se pudo despachar la tarea: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Cliente IPC conectado al daemon, o `None` con el aviso ya impreso.
+fn connect_jarvis() -> Option<IpcClient> {
+    match IpcClient::connect_default() {
+        Ok(client) => Some(client),
+        Err(e) => {
+            eprintln!("No se pudo conectar con Jarvis (¿está corriendo?): {e}");
+            None
+        }
+    }
+}
+
+/// Una línea de `session list`: `#id  estado  título` (HU-66).
+fn session_list_line(session: &serde_json::Value) -> String {
+    let field = |name: &str| session.get(name).and_then(serde_json::Value::as_str);
+    let id = session
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "?".to_string(), |id| format!("#{id}"));
+    format!(
+        "{id:<6} {:<12} {}",
+        field("status").unwrap_or("?"),
+        field("title").unwrap_or("(sin título)")
+    )
+}
+
+/// `fokkus-jarvis session list` (HU-66).
+fn run_session_list() -> ExitCode {
+    let Some(mut client) = connect_jarvis() else {
+        return ExitCode::FAILURE;
+    };
+    match client.list_sessions() {
+        Ok(sessions) if sessions.is_empty() => {
+            println!("No hay sub-sesiones.");
+            ExitCode::SUCCESS
+        }
+        Ok(sessions) => {
+            println!("{:<6} {:<12} TÍTULO", "ID", "ESTADO");
+            for session in &sessions {
+                println!("{}", session_list_line(session));
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("No se pudieron listar las sub-sesiones: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `fokkus-jarvis session cancel <id>` (HU-66).
+fn run_session_cancel(id: u64) -> ExitCode {
+    let Some(mut client) = connect_jarvis() else {
+        return ExitCode::FAILURE;
+    };
+    match client.cancel_session(id) {
+        Ok(true) => {
+            println!("Sub-sesión #{id} cancelada.");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("La sub-sesión #{id} ya había terminado; no había nada que cancelar.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("No se pudo cancelar la sub-sesión #{id}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `fokkus-jarvis session send <id> <instrucción>` (HU-66).
+///
+/// Dentro de una sub-sesión se niega antes de tocar el socket (antirrecursión).
+fn run_session_send(id: u64, instruction: &str) -> ExitCode {
+    if let Some(refusal) = session_send_refusal() {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
+    let Some(mut client) = connect_jarvis() else {
+        return ExitCode::FAILURE;
+    };
+    match client.send_session(id, instruction) {
+        Ok(true) => {
+            println!("Instrucción enviada a la sub-sesión #{id}.");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            eprintln!("La sub-sesión #{id} no aceptó la instrucción.");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("No se pudo enviar la instrucción a la sub-sesión #{id}: {e}");
             ExitCode::FAILURE
         }
     }
@@ -2028,12 +2200,77 @@ mod tests {
             &["session", "show", "x"],
             &["session", "show", "1", "2"],
             &["session", "show", "99999999999"],
-            &["session", "list"],
             &["task", "show"],
             &["task", "show", "-1"],
         ] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn session_subcommands_parse_hu66() {
+        assert_eq!(
+            parse_args(&args(&["session", "list"])),
+            Ok(CliAction::SessionList)
+        );
+        assert_eq!(
+            parse_args(&args(&["session", "cancel", "#7"])),
+            Ok(CliAction::SessionCancel(7))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "session", "send", "3", "revisa", "también", "la", "PR", "214"
+            ])),
+            Ok(CliAction::SessionSend(3, "revisa también la PR 214".into()))
+        );
+        assert_eq!(
+            parse_args(&args(&["session", "send", "#3", "  sigue  "])),
+            Ok(CliAction::SessionSend(3, "sigue".into()))
+        );
+        for bad in [
+            &["session", "list", "extra"][..],
+            &["session", "cancel"],
+            &["session", "cancel", "x"],
+            &["session", "cancel", "1", "2"],
+            &["session", "send"],
+            &["session", "send", "3"],
+            &["session", "send", "3", "   "],
+            &["session", "send", "x", "hola"],
+            &["session", "borra", "1"],
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn session_send_is_refused_inside_a_sub_session_hu66() {
+        let _env = lock_subsession_env();
+        std::env::remove_var(SUBSESSION_ENV);
+        assert_eq!(session_send_refusal(), None);
+
+        let _mark = SubSessionMark::set();
+        assert_eq!(
+            session_send_refusal(),
+            Some(SUB_SESSION_SEND_REFUSAL),
+            "un subagente no empuja instrucciones a otros hilos"
+        );
+        assert!(SUB_SESSION_SEND_REFUSAL.contains("antirrecursión"));
+        // Corta antes de conectar con el IPC: no se envía nada.
+        assert_eq!(run_session_send(3, "sigue"), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn session_list_line_shows_id_status_and_title_hu66() {
+        let line = session_list_line(&serde_json::json!({
+            "id": 3, "status": "running", "title": "revisión de PRs de Felipe"
+        }));
+        assert!(line.starts_with("#3 "), "{line}");
+        assert!(line.contains("running"), "{line}");
+        assert!(line.ends_with("revisión de PRs de Felipe"), "{line}");
+        assert_eq!(
+            session_list_line(&serde_json::json!({})),
+            format!("{:<6} {:<12} (sin título)", "?", "?")
+        );
     }
 
     #[test]

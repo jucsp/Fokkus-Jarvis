@@ -44,10 +44,12 @@ use crate::paths;
 #[cfg(unix)]
 use crate::protocol::MAX_MESSAGE_BYTES;
 use crate::protocol::{
-    error_codes, methods, speech_priority, task_status, Ack, CancelTaskResult, DispatchSwarmParams,
-    DispatchTaskParams, DispatchTaskResult, HelloParams, HelloResult, HelloSession, Incoming,
-    JsonRpcError, NotifySwarmCompletedParams, NotifySwarmProgressParams, NotifyTriageAlertParams,
-    PingResult, Response, SetMutedParams, SetMutedResult, SpeakParams, SpeakResult, StateResult,
+    error_codes, methods, session_event, speech_priority, task_status, Ack, CancelTaskResult,
+    DispatchSwarmParams, DispatchTaskParams, DispatchTaskResult, HelloParams, HelloResult,
+    HelloSession, Incoming, JsonRpcError, Notification, NotifySwarmCompletedParams,
+    NotifySwarmProgressParams, NotifyTriageAlertParams, PingResult, Response, SessionCancelResult,
+    SessionEventParams, SessionIdParams, SessionReadResult, SessionSendParams, SessionSendResult,
+    SessionsResult, SetMutedParams, SetMutedResult, SpeakParams, SpeakResult, StateResult,
     SwarmStatusResult, SwarmTask, TaskIdParams, TasksResult, TriageAlert, Utterance,
     PROTOCOL_VERSION, SERVER_VERSION,
 };
@@ -94,6 +96,11 @@ pub trait SpeechSink: Send + Sync {
 
 /// Puerto de tareas pesadas (HU-37): lo implementa `jarvis-app` sobre el
 /// `TaskManager` de `jarvis-audio`, sin que este crate dependa de él.
+///
+/// Desde HU-66 el mismo puerto expone las sub-sesiones (`jarvis.sessions.*`):
+/// mientras el `SessionManager` de HU-62 no esté conectado al orquestador, una
+/// sub-sesión es una tarea de fondo y estos métodos por defecto fallan de forma
+/// explícita en vez de fingir que funcionan.
 pub trait TaskPort: Send + Sync {
     /// Despacha una tarea y devuelve su id estable.
     fn dispatch(&self, title: String, prompt: String) -> u64;
@@ -103,7 +110,26 @@ pub trait TaskPort: Send + Sync {
     fn get(&self, id: u64) -> Option<Value>;
     /// Cancela una tarea en cola o en curso; `false` si no existe o ya terminó.
     fn cancel(&self, id: u64) -> bool;
+
+    /// Envía una instrucción nueva a una sub-sesión (HU-66).
+    ///
+    /// La implementación por defecto rechaza el envío: un puerto que no sepa
+    /// continuar un hilo no debe aceptar la instrucción y perderla.
+    fn send_session(&self, _id: u64, _instruction: String) -> Result<(), String> {
+        Err(SEND_SESSION_UNSUPPORTED.to_string())
+    }
+
+    /// Detalle en markdown de una sub-sesión (`None` si no hay) (HU-66).
+    fn read_detail(&self, _id: u64) -> Option<String> {
+        None
+    }
 }
+
+/// Motivo con el que un [`TaskPort`] sin sub-sesiones rechaza `send_session`.
+pub const SEND_SESSION_UNSUPPORTED: &str = "send_session no soportado";
+
+/// Tope del registro de eventos de sub-sesión (`jarvis.sessionEvent`).
+const SESSION_EVENTS_CAPACITY: usize = 256;
 
 /// Estado compartido que atiende las llamadas del protocolo.
 ///
@@ -119,6 +145,9 @@ pub struct ServerState {
     sink: Mutex<Option<Arc<dyn SpeechSink>>>,
     tasks: Mutex<Option<Arc<dyn TaskPort>>>,
     hello: Mutex<Option<HelloSession>>,
+    /// Eventos de sub-sesión emitidos (HU-66), acotados a
+    /// [`SESSION_EVENTS_CAPACITY`].
+    session_events: Mutex<Vec<SessionEventParams>>,
 }
 
 impl ServerState {
@@ -139,6 +168,7 @@ impl ServerState {
             sink: Mutex::new(None),
             tasks: Mutex::new(None),
             hello: Mutex::new(None),
+            session_events: Mutex::new(Vec::new()),
         }
     }
 
@@ -443,6 +473,115 @@ impl ServerState {
         })
     }
 
+    /// `jarvis.sessions.list` (HU-66): las sub-sesiones conocidas.
+    fn sessions_list(&self) -> Result<SessionsResult, JsonRpcError> {
+        Ok(SessionsResult {
+            sessions: self.task_port()?.list(),
+        })
+    }
+
+    /// `jarvis.sessions.get` (HU-66): una sub-sesión, con la misma carga útil
+    /// que `jarvis.getTask`.
+    fn sessions_get(&self, id: u64) -> Result<Value, JsonRpcError> {
+        self.task_port()?.get(id).ok_or_else(|| unknown_session(id))
+    }
+
+    /// `jarvis.sessions.send` (HU-66): instrucción nueva al hilo.
+    fn sessions_send(&self, params: SessionSendParams) -> Result<SessionSendResult, JsonRpcError> {
+        let instruction = params.instruction.trim();
+        if instruction.is_empty() {
+            return Err(JsonRpcError::new(
+                error_codes::INVALID_PARAMS,
+                "el campo \"instruction\" no puede estar vacío",
+            ));
+        }
+        let port = self.task_port()?;
+        if port.get(params.id).is_none() {
+            return Err(unknown_session(params.id));
+        }
+        port.send_session(params.id, instruction.to_string())
+            .map_err(|e| {
+                JsonRpcError::new(
+                    error_codes::INTERNAL_ERROR,
+                    format!(
+                        "no se pudo enviar la instrucción a la sesión {}: {e}",
+                        params.id
+                    ),
+                )
+            })?;
+        self.emit_session_event(SessionEventParams {
+            id: params.id,
+            event: session_event::INSTRUCTION.to_string(),
+            title: session_title(port.as_ref(), params.id),
+            status: session_status(port.as_ref(), params.id),
+            detail: Some(instruction.to_string()),
+        });
+        Ok(SessionSendResult {
+            id: params.id,
+            ok: true,
+        })
+    }
+
+    /// `jarvis.sessions.cancel` (HU-66): detiene el turno en curso.
+    fn sessions_cancel(&self, id: u64) -> Result<SessionCancelResult, JsonRpcError> {
+        let port = self.task_port()?;
+        if port.get(id).is_none() {
+            return Err(unknown_session(id));
+        }
+        let cancelled = port.cancel(id);
+        if cancelled {
+            self.emit_session_event(SessionEventParams {
+                id,
+                event: session_event::CANCELLED.to_string(),
+                title: session_title(port.as_ref(), id),
+                status: session_status(port.as_ref(), id),
+                detail: None,
+            });
+        }
+        Ok(SessionCancelResult { id, cancelled })
+    }
+
+    /// `jarvis.sessions.read` (HU-66): detalle en markdown del último turno.
+    fn sessions_read(&self, id: u64) -> Result<SessionReadResult, JsonRpcError> {
+        let port = self.task_port()?;
+        if port.get(id).is_none() {
+            return Err(unknown_session(id));
+        }
+        let detail = port.read_detail(id).ok_or_else(|| {
+            JsonRpcError::new(
+                error_codes::INVALID_PARAMS,
+                format!("la sesión {id} no tiene detalle guardado"),
+            )
+        })?;
+        Ok(SessionReadResult { id, detail })
+    }
+
+    /// Registra un evento de sub-sesión y devuelve la notificación
+    /// `jarvis.sessionEvent` lista para enviar (HU-66).
+    ///
+    /// # Alcance
+    ///
+    /// El evento queda en [`ServerState::session_events`], que es lo que hoy
+    /// pueden consumir el HUD y los tests. El envío *push* a las conexiones
+    /// abiertas necesita un canal por conexión y un hilo escritor (el bucle de
+    /// conexión es bloqueante en lectura); queda para HU-67.
+    pub fn emit_session_event(&self, params: SessionEventParams) -> Notification {
+        let payload = serde_json::to_value(&params).unwrap_or(Value::Null);
+        {
+            let mut events = lock(&self.session_events);
+            if events.len() >= SESSION_EVENTS_CAPACITY {
+                events.remove(0);
+            }
+            events.push(params);
+        }
+        Notification::new(methods::NOTIFY_SESSION_EVENT, Some(payload))
+    }
+
+    /// Eventos de sub-sesión emitidos hasta ahora, del más viejo al más nuevo.
+    pub fn session_events(&self) -> Vec<SessionEventParams> {
+        lock(&self.session_events).clone()
+    }
+
     fn dispatch_swarm(&self, params: DispatchSwarmParams) -> Result<SwarmTask, JsonRpcError> {
         if params.task_id.trim().is_empty() {
             return Err(JsonRpcError::new(
@@ -567,6 +706,23 @@ impl ServerState {
                 let params: TaskIdParams = params_as(method, params)?;
                 to_value(self.cancel_task(params.id)?)
             }
+            methods::SESSIONS_LIST => to_value(self.sessions_list()?),
+            methods::SESSIONS_GET => {
+                let params: SessionIdParams = params_as(method, params)?;
+                self.sessions_get(params.id)
+            }
+            methods::SESSIONS_SEND => {
+                let params: SessionSendParams = params_as(method, params)?;
+                to_value(self.sessions_send(params)?)
+            }
+            methods::SESSIONS_CANCEL => {
+                let params: SessionIdParams = params_as(method, params)?;
+                to_value(self.sessions_cancel(params.id)?)
+            }
+            methods::SESSIONS_READ => {
+                let params: SessionIdParams = params_as(method, params)?;
+                to_value(self.sessions_read(params.id)?)
+            }
             other => Err(JsonRpcError::new(
                 error_codes::METHOD_NOT_FOUND,
                 format!("método desconocido: {other}"),
@@ -580,6 +736,30 @@ fn unknown_task(id: u64) -> JsonRpcError {
         error_codes::INVALID_PARAMS,
         format!("no existe la tarea {id}"),
     )
+}
+
+/// Error de una sub-sesión inexistente (HU-66).
+fn unknown_session(id: u64) -> JsonRpcError {
+    JsonRpcError::new(
+        error_codes::INVALID_PARAMS,
+        format!("no existe la sesión {id}"),
+    )
+}
+
+/// Título del hilo según su registro, si lo informa (HU-66).
+fn session_title(port: &dyn TaskPort, id: u64) -> Option<String> {
+    port.get(id)?
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Estado del hilo según su registro, si lo informa (HU-66).
+fn session_status(port: &dyn TaskPort, id: u64) -> Option<String> {
+    port.get(id)?
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 impl fmt::Debug for ServerState {
@@ -1284,6 +1464,10 @@ mod tests {
     #[derive(Default)]
     struct MemoryTasks {
         tasks: Mutex<BTreeMap<u64, Value>>,
+        /// Instrucciones recibidas por `send_session` (HU-66).
+        sent: Mutex<Vec<(u64, String)>>,
+        /// Detalle en markdown por id (HU-66).
+        details: Mutex<BTreeMap<u64, String>>,
     }
 
     impl MemoryTasks {
@@ -1291,6 +1475,29 @@ mod tests {
             if let Some(task) = lock(&self.tasks).get_mut(&id) {
                 task["status"] = json!("done");
             }
+        }
+    }
+
+    /// Puerto que delega en [`MemoryTasks`] sin sub-sesiones: usa las
+    /// implementaciones por defecto de `send_session` y `read_detail`.
+    #[derive(Default)]
+    struct TasksOnly(MemoryTasks);
+
+    impl TaskPort for TasksOnly {
+        fn dispatch(&self, title: String, prompt: String) -> u64 {
+            self.0.dispatch(title, prompt)
+        }
+
+        fn list(&self) -> Vec<Value> {
+            self.0.list()
+        }
+
+        fn get(&self, id: u64) -> Option<Value> {
+            self.0.get(id)
+        }
+
+        fn cancel(&self, id: u64) -> bool {
+            self.0.cancel(id)
         }
     }
 
@@ -1322,6 +1529,169 @@ mod tests {
                 _ => false,
             }
         }
+
+        fn send_session(&self, id: u64, instruction: String) -> Result<(), String> {
+            lock(&self.sent).push((id, instruction));
+            Ok(())
+        }
+
+        fn read_detail(&self, id: u64) -> Option<String> {
+            lock(&self.details).get(&id).cloned()
+        }
+    }
+
+    #[test]
+    fn sessions_round_trip_over_socket_hu66() {
+        let port = Arc::new(MemoryTasks::default());
+        let state = Arc::new(ServerState::with_default_config().with_task_port(port.clone()));
+        let mut server = IpcServer::with_path(temp_socket_path("hu66"), Arc::clone(&state));
+        server.start().expect("start");
+        let mut client = crate::client::IpcClient::connect(server.socket_path()).expect("connect");
+
+        // Compatibilidad (CA-2): los clientes de HU-37 abren el hilo igual que antes.
+        let dispatched = client
+            .dispatch_task("revisión de PRs", "revisa las PR de Felipe")
+            .expect("dispatchTask");
+        let id = dispatched.id;
+        assert_eq!(client.get_tasks().expect("getTasks").tasks.len(), 1);
+
+        let sessions = client.list_sessions().expect("sessions.list");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0]["title"], "revisión de PRs");
+        assert_eq!(
+            client.get_session(id).expect("sessions.get"),
+            client.get_task(id).expect("getTask"),
+            "sessions.get y getTask comparten carga útil"
+        );
+
+        assert!(client
+            .send_session(id, "  revisa también la PR 214  ")
+            .expect("sessions.send"));
+        assert_eq!(
+            lock(&port.sent).as_slice(),
+            &[(id, "revisa también la PR 214".to_string())],
+            "la instrucción llega recortada al puerto"
+        );
+
+        lock(&port.details).insert(id, "# PR 214\n\nSin hallazgos graves.".into());
+        assert_eq!(
+            client.read_session(id).expect("sessions.read"),
+            "# PR 214\n\nSin hallazgos graves."
+        );
+
+        assert!(client.cancel_session(id).expect("sessions.cancel"));
+        assert!(
+            !client.cancel_session(id).expect("cancel repetido"),
+            "cancelar un hilo terminado no es error"
+        );
+
+        let events = state.session_events();
+        let kinds: Vec<&str> = events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [session_event::INSTRUCTION, session_event::CANCELLED],
+            "un evento por envío aceptado y por cancelación efectiva"
+        );
+        assert_eq!(events[0].title.as_deref(), Some("revisión de PRs"));
+        assert_eq!(events[1].status.as_deref(), Some("cancelled"));
+        server.shutdown();
+    }
+
+    #[test]
+    fn sessions_reject_unknown_ids_and_empty_instructions_hu66() {
+        let port = Arc::new(MemoryTasks::default());
+        let state = ServerState::with_default_config().with_task_port(port.clone());
+        port.dispatch("x".into(), "y".into());
+        let cases = [
+            r#"{"jsonrpc":"2.0","method":"jarvis.sessions.get","params":{"id":99},"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"jarvis.sessions.cancel","params":{"id":99},"id":2}"#,
+            r#"{"jsonrpc":"2.0","method":"jarvis.sessions.read","params":{"id":99},"id":3}"#,
+            r#"{"jsonrpc":"2.0","method":"jarvis.sessions.send","params":{"id":99,"instruction":"a"},"id":4}"#,
+            r#"{"jsonrpc":"2.0","method":"jarvis.sessions.send","params":{"id":1,"instruction":"   "},"id":5}"#,
+            // Existe pero aún no tiene detalle.
+            r#"{"jsonrpc":"2.0","method":"jarvis.sessions.read","params":{"id":1},"id":6}"#,
+            r#"{"jsonrpc":"2.0","method":"jarvis.sessions.get","id":7}"#,
+        ];
+        for line in cases {
+            let error = call(&state, line).error.expect(line);
+            assert_eq!(error.code, error_codes::INVALID_PARAMS, "{line}");
+        }
+        let missing = call(&state, cases[1]).error.expect("error");
+        assert!(missing.message.contains("sesión 99"), "{}", missing.message);
+        assert!(lock(&port.sent).is_empty(), "nada llegó al puerto");
+        assert!(state.session_events().is_empty(), "sin eventos por errores");
+    }
+
+    #[test]
+    fn sessions_fail_explicitly_without_port_or_support_hu66() {
+        let bare = ServerState::with_default_config();
+        let list = r#"{"jsonrpc":"2.0","method":"jarvis.sessions.list","id":1}"#;
+        assert_eq!(
+            call(&bare, list).error.expect("sin puerto").code,
+            error_codes::INTERNAL_ERROR
+        );
+
+        let port = Arc::new(TasksOnly::default());
+        let state = ServerState::with_default_config().with_task_port(port.clone());
+        port.dispatch("x".into(), "y".into());
+        let send = concat!(
+            r#"{"jsonrpc":"2.0","method":"jarvis.sessions.send","#,
+            r#""params":{"id":1,"instruction":"sigue"},"id":2}"#,
+        );
+        let error = call(&state, send).error.expect("send no soportado");
+        assert_eq!(error.code, error_codes::INTERNAL_ERROR);
+        assert!(
+            error.message.contains(SEND_SESSION_UNSUPPORTED),
+            "{}",
+            error.message
+        );
+        assert!(state.session_events().is_empty(), "no se finge el envío");
+
+        let read = r#"{"jsonrpc":"2.0","method":"jarvis.sessions.read","params":{"id":1},"id":3}"#;
+        assert_eq!(
+            call(&state, read).error.expect("sin detalle").code,
+            error_codes::INVALID_PARAMS
+        );
+    }
+
+    #[test]
+    fn session_event_notification_omits_unknown_fields_and_is_bounded_hu66() {
+        let state = ServerState::with_default_config();
+        let notification = state.emit_session_event(SessionEventParams {
+            id: 3,
+            event: session_event::REPLIED.to_string(),
+            title: None,
+            status: Some("idle".into()),
+            detail: None,
+        });
+        assert_eq!(notification.method, methods::NOTIFY_SESSION_EVENT);
+        let line = serde_json::to_string(&notification).expect("serializa");
+        assert!(!line.contains("null"), "{line}");
+        let wire: Value = serde_json::from_str(&line).expect("JSON válido");
+        assert!(
+            wire.get("id").is_none(),
+            "una notificación no lleva id: {line}"
+        );
+        assert_eq!(
+            notification.params,
+            Some(json!({"id": 3, "event": "replied", "status": "idle"}))
+        );
+
+        for id in 0..(SESSION_EVENTS_CAPACITY as u64 + 10) {
+            state.emit_session_event(SessionEventParams {
+                id,
+                event: session_event::PROGRESS.to_string(),
+                title: None,
+                status: None,
+                detail: None,
+            });
+        }
+        let events = state.session_events();
+        assert_eq!(events.len(), SESSION_EVENTS_CAPACITY);
+        assert_eq!(
+            events.last().map(|e| e.id),
+            Some(SESSION_EVENTS_CAPACITY as u64 + 9)
+        );
     }
 
     #[test]

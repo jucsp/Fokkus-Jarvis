@@ -12,6 +12,11 @@ use crate::protocol::{
     CancelTaskResult, DispatchTaskResult, HelloResult, Id, JsonRpcError, PingResult,
     SetMutedResult, SpeakResult, StateResult, SwarmStatusResult, SwarmTask, TasksResult,
 };
+#[cfg(unix)]
+use crate::protocol::{
+    SessionCancelResult, SessionIdParams, SessionReadResult, SessionSendParams, SessionSendResult,
+    SessionsResult,
+};
 use crate::server::IpcError;
 
 #[cfg(unix)]
@@ -220,6 +225,42 @@ impl IpcClient {
         decode(methods::CANCEL_TASK, value)
     }
 
+    /// `jarvis.sessions.list` (HU-66): registros de las sub-sesiones, por id.
+    pub fn list_sessions(&mut self) -> Result<Vec<Value>, ClientError> {
+        let value = self.request(methods::SESSIONS_LIST, None)?;
+        decode::<SessionsResult>(methods::SESSIONS_LIST, value).map(|r| r.sessions)
+    }
+
+    /// `jarvis.sessions.get` (HU-66): registro de una sub-sesión.
+    pub fn get_session(&mut self, id: u64) -> Result<Value, ClientError> {
+        let params = to_params(&SessionIdParams { id })?;
+        self.request(methods::SESSIONS_GET, Some(params))
+    }
+
+    /// `jarvis.sessions.send` (HU-66): `true` si el hilo aceptó la instrucción.
+    pub fn send_session(&mut self, id: u64, instruction: &str) -> Result<bool, ClientError> {
+        let params = SessionSendParams {
+            id,
+            instruction: instruction.to_string(),
+        };
+        let value = self.request(methods::SESSIONS_SEND, Some(to_params(&params)?))?;
+        decode::<SessionSendResult>(methods::SESSIONS_SEND, value).map(|r| r.ok)
+    }
+
+    /// `jarvis.sessions.cancel` (HU-66): `false` si ya había terminado.
+    pub fn cancel_session(&mut self, id: u64) -> Result<bool, ClientError> {
+        let params = to_params(&SessionIdParams { id })?;
+        let value = self.request(methods::SESSIONS_CANCEL, Some(params))?;
+        decode::<SessionCancelResult>(methods::SESSIONS_CANCEL, value).map(|r| r.cancelled)
+    }
+
+    /// `jarvis.sessions.read` (HU-66): detalle en markdown del último turno.
+    pub fn read_session(&mut self, id: u64) -> Result<String, ClientError> {
+        let params = to_params(&SessionIdParams { id })?;
+        let value = self.request(methods::SESSIONS_READ, Some(params))?;
+        decode::<SessionReadResult>(methods::SESSIONS_READ, value).map(|r| r.detail)
+    }
+
     /// `jarvis.dispatchSwarm`.
     pub fn dispatch_swarm(
         &mut self,
@@ -406,6 +447,31 @@ impl IpcClient {
         _text: &str,
         _category: Option<&str>,
     ) -> Result<SpeakResult, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn list_sessions(&mut self) -> Result<Vec<Value>, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn get_session(&mut self, _id: u64) -> Result<Value, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn send_session(&mut self, _id: u64, _instruction: &str) -> Result<bool, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn cancel_session(&mut self, _id: u64) -> Result<bool, ClientError> {
+        Err(unsupported())
+    }
+
+    /// Siempre falla con [`ClientError::Transport`].
+    pub fn read_session(&mut self, _id: u64) -> Result<String, ClientError> {
         Err(unsupported())
     }
 

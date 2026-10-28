@@ -63,9 +63,25 @@ pub mod methods {
     pub const GET_TASK: &str = "jarvis.getTask";
     /// Cancela una tarea pesada por id (HU-37).
     pub const CANCEL_TASK: &str = "jarvis.cancelTask";
+    /// Lista las sub-sesiones con su estado (HU-66).
+    pub const SESSIONS_LIST: &str = "jarvis.sessions.list";
+    /// Una sub-sesión por id, con su resultado si ya terminó (HU-66).
+    pub const SESSIONS_GET: &str = "jarvis.sessions.get";
+    /// Envía una instrucción nueva a una sub-sesión (HU-66).
+    pub const SESSIONS_SEND: &str = "jarvis.sessions.send";
+    /// Cancela una sub-sesión por id (HU-66).
+    pub const SESSIONS_CANCEL: &str = "jarvis.sessions.cancel";
+    /// Detalle en markdown de una sub-sesión (HU-66).
+    pub const SESSIONS_READ: &str = "jarvis.sessions.read";
+    /// Evento de una sub-sesión (notification) (HU-66).
+    pub const NOTIFY_SESSION_EVENT: &str = "jarvis.sessionEvent";
 
     /// Catálogo completo, para el handshake y para documentación.
-    pub const ALL: [&str; 14] = [
+    ///
+    /// Debe coincidir con el catálogo documentado en
+    /// `docs/specs/sdd-contracts/sdd-hu66-ipc-sesiones.md` (lo verifica
+    /// `catalog_is_documented_hu66`).
+    pub const ALL: [&str; 20] = [
         HELLO,
         PING,
         GET_STATE,
@@ -80,6 +96,45 @@ pub mod methods {
         GET_TASKS,
         GET_TASK,
         CANCEL_TASK,
+        SESSIONS_LIST,
+        SESSIONS_GET,
+        SESSIONS_SEND,
+        SESSIONS_CANCEL,
+        SESSIONS_READ,
+        NOTIFY_SESSION_EVENT,
+    ];
+}
+
+/// Nombres de los eventos de una sub-sesión en `jarvis.sessionEvent`
+/// (HU-66), espejo de `jarvis_audio::sessions::SessionEvent`.
+pub mod session_event {
+    /// La sub-sesión acaba de abrirse.
+    pub const CREATED: &str = "created";
+    /// El agente empezó un turno.
+    pub const STARTED: &str = "started";
+    /// Avance del turno (no se lee por voz).
+    pub const PROGRESS: &str = "progress";
+    /// Llegó una instrucción nueva al hilo.
+    pub const INSTRUCTION: &str = "instruction";
+    /// Turno terminado con un resumen hablado.
+    pub const REPLIED: &str = "replied";
+    /// El agente pide una decisión al usuario.
+    pub const QUESTION: &str = "question";
+    /// La sub-sesión cambió de estado terminal (cerrada, cancelada, fallida).
+    pub const FINISHED: &str = "finished";
+    /// El usuario canceló la sub-sesión.
+    pub const CANCELLED: &str = "cancelled";
+
+    /// Catálogo completo de eventos.
+    pub const ALL: [&str; 8] = [
+        CREATED,
+        STARTED,
+        PROGRESS,
+        INSTRUCTION,
+        REPLIED,
+        QUESTION,
+        FINISHED,
+        CANCELLED,
     ];
 }
 
@@ -584,6 +639,77 @@ pub struct CancelTaskResult {
     pub cancelled: bool,
 }
 
+/// Parámetros de `jarvis.sessions.get`, `jarvis.sessions.cancel` y
+/// `jarvis.sessions.read` (HU-66).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionIdParams {
+    /// Id corto de la sub-sesión.
+    pub id: u64,
+}
+
+/// Parámetros de `jarvis.sessions.send` (HU-66).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSendParams {
+    /// Id corto de la sub-sesión.
+    pub id: u64,
+    /// Instrucción nueva para ese hilo.
+    pub instruction: String,
+}
+
+/// Resultado de `jarvis.sessions.list` (HU-66).
+///
+/// Cada elemento es el registro de la sub-sesión tal como lo serializa su
+/// gestor (`id`, `title`, `status`, `spoken_summary`…), con la misma forma que
+/// `jarvis.getTasks` mientras las sub-sesiones sean tareas de fondo.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionsResult {
+    pub sessions: Vec<Value>,
+}
+
+/// Resultado de `jarvis.sessions.send` (HU-66).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSendResult {
+    pub id: u64,
+    /// `true` si la instrucción quedó aceptada.
+    pub ok: bool,
+}
+
+/// Resultado de `jarvis.sessions.cancel` (HU-66).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionCancelResult {
+    pub id: u64,
+    /// `false` si la sub-sesión ya había terminado (no había nada que cancelar).
+    pub cancelled: bool,
+}
+
+/// Resultado de `jarvis.sessions.read` (HU-66).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionReadResult {
+    pub id: u64,
+    /// Detalle en markdown del último turno del hilo.
+    pub detail: String,
+}
+
+/// Parámetros de la notificación `jarvis.sessionEvent` (HU-66).
+///
+/// Los nombres de `event` están en [`session_event`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionEventParams {
+    /// Id corto de la sub-sesión.
+    pub id: u64,
+    /// Tipo de evento (ver [`session_event`]).
+    pub event: String,
+    /// Título del hilo, si se conoce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Estado del hilo tras el evento, si se conoce.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Resumen, avance o pregunta asociados al evento.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// Resultado de `jarvis.getState`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateResult {
@@ -804,6 +930,15 @@ mod tests {
 
     fn parse(line: &str) -> Incoming {
         Incoming::parse_line(line).expect("mensaje válido")
+    }
+
+    /// Serializa y vuelve a deserializar: *round-trip* de un tipo del protocolo.
+    fn rt<T>(value: &T) -> T
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let json = serde_json::to_value(value).expect("serializable");
+        serde_json::from_value(json).expect("re-deserializable")
     }
 
     #[test]
@@ -1035,5 +1170,93 @@ mod tests {
         assert_eq!(Id::from("x"), Id::String("x".to_string()));
         assert_eq!(Id::from(5i64).to_string(), "5");
         assert_eq!(Id::from("x").to_string(), "x");
+    }
+
+    #[test]
+    fn session_params_and_results_roundtrip_hu66() {
+        let id = SessionIdParams { id: 7 };
+        assert_eq!(rt(&id), id);
+
+        let send = SessionSendParams {
+            id: 7,
+            instruction: "revisa también la PR 214".to_string(),
+        };
+        assert_eq!(rt(&send), send);
+
+        let list = SessionsResult {
+            sessions: vec![json!({"id": 7, "title": "PR de Felipe", "status": "running"})],
+        };
+        assert_eq!(rt(&list), list);
+
+        let sent = SessionSendResult { id: 7, ok: true };
+        assert_eq!(rt(&sent), sent);
+
+        let cancelled = SessionCancelResult {
+            id: 7,
+            cancelled: true,
+        };
+        assert_eq!(rt(&cancelled), cancelled);
+
+        let read = SessionReadResult {
+            id: 7,
+            detail: "# PR 214\n\nSin hallazgos graves.".to_string(),
+        };
+        assert_eq!(rt(&read), read);
+
+        let event = SessionEventParams {
+            id: 7,
+            event: session_event::REPLIED.to_string(),
+            title: Some("PR de Felipe".to_string()),
+            status: Some("idle".to_string()),
+            detail: Some("dos PR listas".to_string()),
+        };
+        assert_eq!(rt(&event), event);
+    }
+
+    /// Los campos opcionales del evento no viajan como `null`: el cliente que
+    /// solo mira `id`/`event` no recibe ruido.
+    #[test]
+    fn session_event_omits_unknown_optional_fields_hu66() {
+        let event = SessionEventParams {
+            id: 3,
+            event: session_event::STARTED.to_string(),
+            title: None,
+            status: None,
+            detail: None,
+        };
+        let value = serde_json::to_value(&event).expect("serializable");
+        assert_eq!(value, json!({"id": 3, "event": "started"}));
+    }
+
+    #[test]
+    fn session_event_catalog_has_no_duplicates_hu66() {
+        let mut sorted = session_event::ALL.to_vec();
+        sorted.sort_unstable();
+        let before = sorted.len();
+        sorted.dedup();
+        assert_eq!(
+            before,
+            sorted.len(),
+            "hay eventos duplicados en el catálogo"
+        );
+    }
+
+    /// HU-66 · CA-3 (validación código → doc): el 100 % de los métodos del
+    /// catálogo aparece en la documentación de IPC.
+    #[test]
+    fn catalog_is_documented_hu66() {
+        let doc = include_str!("../../../docs/specs/sdd-contracts/sdd-hu66-ipc-sesiones.md");
+        for method in methods::ALL {
+            assert!(
+                doc.contains(method),
+                "el método {method} no está documentado en sdd-hu66-ipc-sesiones.md"
+            );
+        }
+        for event in session_event::ALL {
+            assert!(
+                doc.contains(&format!("\"{event}\"")) || doc.contains(&format!("`{event}`")),
+                "el evento {event} no está documentado en sdd-hu66-ipc-sesiones.md"
+            );
+        }
     }
 }
