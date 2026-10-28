@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use jarvis_audio::orchestrator::{NO_API_KEY_NOTICE, NO_CLI_NOTICE};
-use jarvis_audio::{BrainError, BrainFactory, ClaudeClient, CliBrain, TokenStream};
+use jarvis_audio::{
+    BrainError, BrainFactory, ClaudeClient, CliBrain, TokenStream, SUBAGENT_SYSTEM_PROMPT,
+};
 use jarvis_core::{BrainMode, JarvisConfig, SPHERE_OPACITY_RANGE, SPHERE_SCALE_RANGE};
 
 /// Script del formulario (ver `assets/config_form.py`).
@@ -118,7 +120,11 @@ impl BrainFactory for TaskBrainFactory {
 pub fn build_task_brain(config: &JarvisConfig, timeout: Duration) -> Result<Brain, BrainError> {
     match config.brain_mode {
         BrainMode::Cli => {
-            let brain = CliBrain::new(config.effective_cli_command())?.with_timeout(timeout);
+            // HU-60: el subagente no recibe la persona de voz y exporta
+            // `JARVIS_SUBSESSION_ID` (antirrecursión de `dev run`).
+            let brain = CliBrain::new(config.effective_cli_command())?
+                .with_timeout(timeout)
+                .with_worker_mode(true);
             if !brain.is_available() {
                 return Err(BrainError::Cli(format!(
                     "no se encontró `{}` en el PATH",
@@ -129,7 +135,9 @@ pub fn build_task_brain(config: &JarvisConfig, timeout: Duration) -> Result<Brai
         }
         BrainMode::Api => {
             let key = jarvis_audio::resolve_api_key(None)?;
-            let mut client = ClaudeClient::with_api_key(key).with_base_url(&config.api_base_url);
+            let mut client = ClaudeClient::with_api_key(key)
+                .with_base_url(&config.api_base_url)
+                .with_system_prompt(SUBAGENT_SYSTEM_PROMPT);
             if !config.api_model.trim().is_empty() {
                 client = client.with_model(config.api_model.trim());
             }
@@ -606,6 +614,28 @@ mod tests {
             factory.spawn(Duration::from_secs(5)),
             Err(BrainError::Cli(_))
         ));
+    }
+
+    #[test]
+    fn task_brain_runs_as_sub_session_worker_hu60() {
+        let config = JarvisConfig::default().with_cli_command("echo");
+        let brain = build_task_brain(&config, Duration::from_secs(5)).expect("cerebro");
+        let prompt = brain
+            .stream_tokens("revisa las PR de Felipe", &mut |_| {})
+            .unwrap()
+            .text;
+        assert!(!prompt.contains("frase breve"), "{prompt}");
+        assert!(!prompt.contains("fokkus-jarvis dev run"), "{prompt}");
+        assert!(prompt.contains("subagente de fondo"), "{prompt}");
+
+        let config = JarvisConfig::default()
+            .with_cli_command("sh -c 'echo \"$JARVIS_SUBSESSION_ID\"' {prompt}");
+        let brain = build_task_brain(&config, Duration::from_secs(5)).expect("cerebro");
+        let marked = brain.stream_tokens("hola", &mut |_| {}).unwrap().text;
+        assert!(
+            !marked.trim().is_empty(),
+            "el hijo debe ver la marca de sub-sesión"
+        );
     }
 
     #[test]

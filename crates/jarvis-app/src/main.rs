@@ -83,9 +83,47 @@ enum CliAction {
     Capture(PathBuf),
     /// `dev run <tarea>`: despacha un desarrollo al gestor de tareas (HU-37).
     DevRun(String),
+    /// `task run [--profile …] <tarea>`: despacha una tarea de revisión,
+    /// análisis o investigación con el *prompt* que corresponda (HU-61).
+    TaskRun(TaskProfile, String),
     /// `--diag-turns [segundos]`: escucha y vuelca las métricas de cierre de
     /// turno y pausas intra-turno (HU-41).
     DiagTurns(Duration),
+}
+
+/// Perfil de una tarea despachada por `task run` (HU-61).
+///
+/// El perfil elige el *prompt* del subagente a través del título: el puerto IPC
+/// usa [`jarvis_audio::tasks::DEV_TASK_TITLE`] para el prompt de ingeniería y
+/// cualquier otro título para el de solo lectura.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskProfile {
+    /// Revisión, análisis o investigación: no fuerza el prompt de ingeniería.
+    ReadOnly,
+    /// Desarrollo: mismo camino que `dev run`.
+    Dev,
+}
+
+impl TaskProfile {
+    /// Perfil por defecto de `task run`.
+    const DEFAULT: Self = Self::ReadOnly;
+
+    /// Interpreta el valor de `--profile`.
+    fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "read_only" | "read-only" | "readonly" => Ok(Self::ReadOnly),
+            "dev" => Ok(Self::Dev),
+            _ => Err(format!("perfil desconocido: {raw} (usa read_only o dev)")),
+        }
+    }
+
+    /// Título con el que se despacha la tarea: define el *prompt* del subagente.
+    fn title(self, task: &str) -> String {
+        match self {
+            Self::ReadOnly => jarvis_audio::tasks::read_only_task_title(task),
+            Self::Dev => jarvis_audio::tasks::DEV_TASK_TITLE.to_string(),
+        }
+    }
 }
 
 /// Resultado de una sonda de salud sobre un subsistema.
@@ -236,6 +274,7 @@ fn main() -> ExitCode {
         Ok(CliAction::Input(action)) => run_input(action),
         Ok(CliAction::Capture(path)) => run_capture(&path),
         Ok(CliAction::DevRun(task)) => run_dev_task(&task),
+        Ok(CliAction::TaskRun(profile, task)) => run_background_task(profile, &task),
         Ok(CliAction::DiagTurns(window)) => diag::run(window),
         Err(message) => {
             eprintln!("{message}");
@@ -256,6 +295,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         Some("--diag-turns") => diag::parse_secs(&args[1..]).map(CliAction::DiagTurns),
         Some("input") => parse_input(&args[1..]).map(CliAction::Input),
         Some("dev") => parse_dev(&args[1..]).map(CliAction::DevRun),
+        Some("task") => {
+            parse_task(&args[1..]).map(|(profile, task)| CliAction::TaskRun(profile, task))
+        }
         Some("capture") => match &args[1..] {
             [] => Ok(CliAction::Capture(PathBuf::from(DEFAULT_CAPTURE_PATH))),
             [path] => Ok(CliAction::Capture(PathBuf::from(path))),
@@ -319,6 +361,38 @@ fn parse_dev(args: &[String]) -> Result<String, String> {
     }
 }
 
+/// `task run [--profile <read_only|dev>] <palabras…>` (HU-61): une la tarea con
+/// espacios y elige el perfil. Igual que `dev run`, la tarea viaja cruda; el
+/// servidor construye el *prompt* según el título.
+fn parse_task(args: &[String]) -> Result<(TaskProfile, String), String> {
+    const USAGE: &str = "uso: task run [--profile <read_only|dev>] <tarea>";
+    let Some((verb, rest)) = args.split_first() else {
+        return Err(USAGE.to_string());
+    };
+    if verb != "run" {
+        return Err(USAGE.to_string());
+    }
+    let mut profile = TaskProfile::DEFAULT;
+    let mut words: Vec<&str> = Vec::with_capacity(rest.len());
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix("--profile=") {
+            profile = TaskProfile::parse(value)?;
+        } else if arg == "--profile" {
+            let value = iter.next().ok_or_else(|| USAGE.to_string())?;
+            profile = TaskProfile::parse(value)?;
+        } else {
+            words.push(arg);
+        }
+    }
+    let task = words.join(" ").trim().to_string();
+    if task.is_empty() {
+        Err(USAGE.to_string())
+    } else {
+        Ok((profile, task))
+    }
+}
+
 /// Texto de ayuda del binario.
 fn print_usage() {
     println!("Uso: jarvis [OPCIONES]");
@@ -343,8 +417,11 @@ fn print_usage() {
     println!("  capture [ruta.png]          Captura la pantalla activa (por defecto");
     println!("                              {DEFAULT_CAPTURE_PATH}).");
     println!();
-    println!("Desarrollo en segundo plano:");
-    println!("  dev run <tarea>             Despacha un desarrollo al gestor de tareas.");
+    println!("Tareas en segundo plano:");
+    println!("  dev run <tarea>             Despacha un desarrollo (prompt de ingeniería).");
+    println!("  task run [--profile <read_only|dev>] <tarea>");
+    println!("                              Despacha una revisión, análisis o investigación");
+    println!("                              (por defecto read_only, sin prompt de ingeniería).");
     println!();
     println!("Sin opciones, arranca Fokkus-Jarvis, levanta el servidor IPC y deja");
     println!("el socket listo para conexiones de Fokkus IDE.");
@@ -444,9 +521,45 @@ fn run_capture(path: &std::path::Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Variable de entorno con la que el cerebro CLI marca al proceso hijo como
+/// subagente de fondo ([`jarvis_audio::brain::cli::SUBSESSION_ENV`], HU-60).
+const SUBSESSION_ENV: &str = jarvis_audio::brain::cli::SUBSESSION_ENV;
+
+/// Motivo del rechazo de `dev run` dentro de una sub-sesión (HU-60).
+const SUB_SESSION_DEV_RUN_REFUSAL: &str =
+    "Error: fokkus-jarvis dev run no está permitido dentro de una sub-sesión (antirecursión)";
+
+/// Motivo del rechazo de `task run` dentro de una sub-sesión (HU-61).
+const SUB_SESSION_TASK_RUN_REFUSAL: &str =
+    "Error: fokkus-jarvis task run no está permitido dentro de una sub-sesión (antirecursión)";
+
+/// `true` si este proceso corre ya dentro de una sub-sesión de fondo: el cerebro
+/// CLI marca así al subagente, que no debe abrir otra tarea (HU-60).
+fn in_sub_session() -> bool {
+    // Basta con que exista, aunque venga vacía: la antirrecursión falla cerrada.
+    std::env::var_os(SUBSESSION_ENV).is_some()
+}
+
+/// Motivo con el que `dev run` debe negarse a correr, si corresponde (HU-60).
+fn dev_run_refusal() -> Option<&'static str> {
+    in_sub_session().then_some(SUB_SESSION_DEV_RUN_REFUSAL)
+}
+
+/// Motivo con el que `task run` debe negarse a correr, si corresponde (HU-61).
+fn task_run_refusal() -> Option<&'static str> {
+    in_sub_session().then_some(SUB_SESSION_TASK_RUN_REFUSAL)
+}
+
 /// `fokkus-jarvis dev run <tarea>`: despacha el desarrollo al gestor de tareas
 /// del orquestador a través del socket IPC y cierra el turno en segundos.
+///
+/// Dentro de una sub-sesión se niega: un subagente no abre otra tarea
+/// (antirrecursión, HU-60).
 fn run_dev_task(task: &str) -> ExitCode {
+    if let Some(refusal) = dev_run_refusal() {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
     let mut client = match IpcClient::connect_default() {
         Ok(client) => client,
         Err(e) => {
@@ -464,6 +577,40 @@ fn run_dev_task(task: &str) -> ExitCode {
         }
         Err(e) => {
             eprintln!("No se pudo despachar el desarrollo: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `fokkus-jarvis task run [--profile <read_only|dev>] <tarea>`: despacha una
+/// tarea genérica (revisión, análisis, investigación) por el socket IPC y cierra
+/// el turno de voz en segundos (HU-61).
+///
+/// El perfil viaja como título: `DEV_TASK_TITLE` para `dev` y el título de solo
+/// lectura para `read_only`, de modo que el servidor elija el *prompt* del
+/// subagente. Dentro de una sub-sesión se niega (antirecursión).
+fn run_background_task(profile: TaskProfile, task: &str) -> ExitCode {
+    if let Some(refusal) = task_run_refusal() {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
+    let mut client = match IpcClient::connect_default() {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("No se pudo conectar con Jarvis (¿está corriendo?): {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match client.dispatch_task(&profile.title(task), task) {
+        Ok(result) => {
+            println!(
+                "Tarea #{} despachada en segundo plano ({}).",
+                result.id, result.status
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("No se pudo despachar la tarea: {e}");
             ExitCode::FAILURE
         }
     }
@@ -1526,5 +1673,245 @@ mod tests {
 
         let read_only = ipc_task_prompt("tus correos", "x");
         assert!(read_only.contains("Solo lees"), "{read_only}");
+    }
+
+    /// Marca de sub-sesión puesta en el entorno del proceso de pruebas; la retira
+    /// al salir para no contaminar al resto de tests (HU-60).
+    struct SubSessionMark;
+
+    impl SubSessionMark {
+        fn set() -> Self {
+            std::env::set_var(SUBSESSION_ENV, "7");
+            Self
+        }
+    }
+
+    impl Drop for SubSessionMark {
+        fn drop(&mut self) {
+            std::env::remove_var(SUBSESSION_ENV);
+        }
+    }
+
+    /// Serializa los tests que tocan `JARVIS_SUBSESSION_ID`: es una variable del
+    /// proceso, así que dos tests en paralelo se pisarían la marca.
+    static SUBSESSION_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_subsession_env() -> std::sync::MutexGuard<'static, ()> {
+        SUBSESSION_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn dev_run_is_refused_inside_a_sub_session_hu60() {
+        let _env = lock_subsession_env();
+        // El resultado no debe depender del entorno heredado de quien lanza los
+        // tests: se parte siempre de un proceso sin marca de sub-sesión.
+        std::env::remove_var(SUBSESSION_ENV);
+
+        // Turno de voz normal: nada que vetar.
+        assert!(!in_sub_session());
+        assert_eq!(dev_run_refusal(), None);
+
+        // Así marca el cerebro CLI al subagente (`CliBrainMode::Worker`).
+        let _mark = SubSessionMark::set();
+        assert!(in_sub_session());
+        assert_eq!(dev_run_refusal(), Some(SUB_SESSION_DEV_RUN_REFUSAL));
+
+        // `dev run` corta antes de conectar con el IPC: no se crea otra tarea.
+        assert_eq!(run_dev_task("refactoriza el parser"), ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn task_run_parses_profile_and_task_hu61() {
+        // Sin `--profile` el perfil es `read_only` (el que no fuerza ingeniería).
+        assert_eq!(
+            parse_args(&args(&[
+                "task", "run", "revisa", "las", "PR", "de", "Felipe"
+            ])),
+            Ok(CliAction::TaskRun(
+                TaskProfile::ReadOnly,
+                "revisa las PR de Felipe".into()
+            ))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "task",
+                "run",
+                "--profile",
+                "dev",
+                "arregla",
+                "el",
+                "parser"
+            ])),
+            Ok(CliAction::TaskRun(
+                TaskProfile::Dev,
+                "arregla el parser".into()
+            ))
+        );
+        assert_eq!(
+            parse_args(&args(&[
+                "task",
+                "run",
+                "resume",
+                "el",
+                "blog",
+                "--profile=read_only"
+            ])),
+            Ok(CliAction::TaskRun(
+                TaskProfile::ReadOnly,
+                "resume el blog".into()
+            ))
+        );
+        // Alias tolerados para el perfil de solo lectura.
+        for alias in ["read-only", "readonly", "READ_ONLY"] {
+            assert_eq!(
+                parse_args(&args(&["task", "run", "--profile", alias, "x"])),
+                Ok(CliAction::TaskRun(TaskProfile::ReadOnly, "x".into())),
+                "{alias}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_run_rejects_bad_usage_hu61() {
+        for bad in [
+            &["task"][..],
+            &["task", "run"],
+            &["task", "run", "--profile"],
+            &["task", "run", "--profile", "cualquiera", "x"],
+            &["task", "foo", "x"],
+            &["task", "run", "--profile", "dev"],
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn task_run_profile_selects_the_matching_subagent_prompt_hu61() {
+        // El título es lo único que el puerto IPC mira para elegir el prompt.
+        let read_only = TaskProfile::ReadOnly.title("revisa las PR de Felipe");
+        let prompt = ipc_task_prompt(&read_only, "revisa las PR de Felipe");
+        assert!(prompt.contains("Solo lees"), "{prompt}");
+        assert!(!prompt.contains("subagente de ingeniería"), "{prompt}");
+
+        let dev = TaskProfile::Dev.title("arregla el parser");
+        assert_eq!(dev, jarvis_audio::tasks::DEV_TASK_TITLE);
+        let prompt = ipc_task_prompt(&dev, "arregla el parser");
+        assert!(prompt.contains("subagente de ingeniería"), "{prompt}");
+
+        // `read_only` manda aunque la heurística vea un desarrollo: si no, el
+        // perfil acabaría con el prompt de ingeniería que promete no forzar.
+        let title = TaskProfile::ReadOnly.title("lanza el desarrollo del pipeline");
+        assert_ne!(title, jarvis_audio::tasks::DEV_TASK_TITLE);
+        let prompt = ipc_task_prompt(&title, "lanza el desarrollo del pipeline");
+        assert!(prompt.contains("Solo lees"), "{prompt}");
+    }
+
+    /// Cerebro falso de las tareas: anota el *prompt* recibido y responde con
+    /// el formato pactado.
+    struct RecordingBrain(Arc<Mutex<Vec<String>>>);
+
+    impl jarvis_audio::TokenStream for RecordingBrain {
+        fn stream_tokens(
+            &self,
+            user_text: &str,
+            on_token: &mut dyn FnMut(&str),
+        ) -> Result<jarvis_audio::Completion, jarvis_audio::BrainError> {
+            self.0.lock().unwrap().push(user_text.to_string());
+            let reply = "RESUMEN_HABLADO: Dos PR listas.\nDETALLE: ok";
+            on_token(reply);
+            Ok(jarvis_audio::Completion {
+                text: reply.into(),
+                ..Default::default()
+            })
+        }
+
+        fn cancel(&self) {}
+
+        fn has_repo_tools(&self) -> bool {
+            true
+        }
+    }
+
+    struct RecordingFactory(Arc<Mutex<Vec<String>>>);
+
+    impl jarvis_audio::BrainFactory for RecordingFactory {
+        fn spawn(
+            &self,
+            _timeout: Duration,
+        ) -> Result<Arc<dyn jarvis_audio::TokenStream + Send + Sync>, jarvis_audio::BrainError>
+        {
+            Ok(Arc::new(RecordingBrain(Arc::clone(&self.0))))
+        }
+    }
+
+    /// HU-61 · CA-1: sin heurística de por medio, el LLM principal sigue el
+    /// `SYSTEM_PROMPT`, ejecuta `task run --profile read_only` y la petición
+    /// termina en el gestor de tareas con el *prompt* de solo lectura.
+    #[test]
+    fn llm_route_lands_pr_review_in_task_manager_hu61() {
+        assert!(jarvis_audio::brain::SYSTEM_PROMPT
+            .contains("fokkus-jarvis task run --profile read_only"));
+
+        // Lo que el LLM ejecuta (sin pasar por `classify_workload`).
+        let Ok(CliAction::TaskRun(profile, task)) = parse_args(&args(&[
+            "task",
+            "run",
+            "--profile",
+            "read_only",
+            "revisa las PR de Felipe",
+        ])) else {
+            panic!("task run debe parsear");
+        };
+
+        let prompts = Arc::new(Mutex::new(Vec::new()));
+        let dir = std::env::temp_dir().join(format!("jarvis-app-hu61-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = TaskConfig {
+            dir: dir.clone(),
+            ..TaskConfig::default()
+        };
+        let manager = TaskManager::start(
+            Arc::new(RecordingFactory(Arc::clone(&prompts))),
+            cfg,
+            jarvis_audio::tasks::SpeechQueueHandle::new(),
+        )
+        .unwrap();
+        let port = VoiceTaskPort(manager);
+        let id = port.dispatch(profile.title(&task), task.clone());
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while port.0.get(id).unwrap().status != TaskStatus::Done {
+            assert!(std::time::Instant::now() < deadline, "la tarea no terminó");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let record = port.0.get(id).unwrap();
+        assert_eq!(record.origin, TaskOrigin::Ipc);
+        assert_ne!(record.title, jarvis_audio::tasks::DEV_TASK_TITLE);
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("Solo lees"), "{}", prompts[0]);
+        assert!(prompts[0].contains("revisa las PR de Felipe"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn task_run_is_refused_inside_a_sub_session_hu61() {
+        let _env = lock_subsession_env();
+        std::env::remove_var(SUBSESSION_ENV);
+        assert_eq!(task_run_refusal(), None);
+
+        let _mark = SubSessionMark::set();
+        assert_eq!(
+            task_run_refusal(),
+            Some(SUB_SESSION_TASK_RUN_REFUSAL),
+            "una sub-sesión no abre otra tarea"
+        );
+        // Corta antes de conectar con el IPC: no se despacha nada.
+        assert_eq!(
+            run_background_task(TaskProfile::ReadOnly, "revisa las PR de Felipe"),
+            ExitCode::FAILURE
+        );
     }
 }

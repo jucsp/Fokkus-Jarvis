@@ -16,7 +16,9 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::brain::client::{BrainError, CancellationToken, Completion, Message, SYSTEM_PROMPT};
+use crate::brain::client::{
+    BrainError, CancellationToken, Completion, Message, SUBAGENT_SYSTEM_PROMPT, SYSTEM_PROMPT,
+};
 use crate::brain::DEFAULT_HISTORY_TURNS;
 
 /// Comando por defecto: Antigravity en modo no interactivo y con esfuerzo
@@ -26,8 +28,24 @@ pub const DEFAULT_CLI_COMMAND: &str = "agy --effort low --dangerously-skip-permi
 pub const PROMPT_PLACEHOLDER: &str = "{prompt}";
 /// Tiempo máximo de un turno antes de matar el proceso.
 pub const DEFAULT_CLI_TIMEOUT: Duration = Duration::from_secs(120);
+/// Variable de entorno que marca al proceso hijo como subagente de fondo
+/// (HU-60). `fokkus-jarvis dev run` la usa para negarse a crear otra tarea.
+pub const SUBSESSION_ENV: &str = "JARVIS_SUBSESSION_ID";
+/// Valor por defecto cuando el llamador no da un identificador de sub-sesión.
+pub const DEFAULT_SUBSESSION_ID: &str = "1";
 /// Bytes de stderr que se conservan para el mensaje de error.
 const STDERR_TAIL: usize = 2_048;
+
+/// Papel del cerebro CLI dentro de Jarvis (HU-60).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CliBrainMode {
+    /// Turno hablado: persona de voz y respuesta de una frase para el TTS.
+    #[default]
+    Voice,
+    /// Subagente de fondo: prompt propio, sin coletilla de voz y con
+    /// [`SUBSESSION_ENV`] en el entorno del proceso hijo.
+    Worker,
+}
 
 /// Separa un comando en argumentos respetando comillas simples y dobles.
 ///
@@ -80,6 +98,9 @@ pub struct CliBrain {
     history_turns: usize,
     history: Mutex<VecDeque<Message>>,
     timeout: Duration,
+    mode: CliBrainMode,
+    /// Identificador de sub-sesión que se exporta al proceso hijo (HU-60).
+    subsession_id: Option<String>,
     cancel: CancellationToken,
     /// Proceso en curso (para matarlo desde `cancel`).
     child: Arc<Mutex<Option<Child>>>,
@@ -98,6 +119,8 @@ impl CliBrain {
             history_turns: DEFAULT_HISTORY_TURNS,
             history: Mutex::new(VecDeque::new()),
             timeout: DEFAULT_CLI_TIMEOUT,
+            mode: CliBrainMode::Voice,
+            subsession_id: None,
             cancel: CancellationToken::new(),
             child: Arc::new(Mutex::new(None)),
         })
@@ -116,6 +139,41 @@ impl CliBrain {
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = prompt.into();
         self
+    }
+
+    /// Cambia el papel del cerebro (HU-60). En [`CliBrainMode::Worker`] se
+    /// sustituye la persona de voz por [`SUBAGENT_SYSTEM_PROMPT`]; si el
+    /// llamador quiere otro prompt, encadena [`with_system_prompt`] después.
+    ///
+    /// [`with_system_prompt`]: Self::with_system_prompt
+    pub fn with_mode(mut self, mode: CliBrainMode) -> Self {
+        self.mode = mode;
+        if mode == CliBrainMode::Worker {
+            self.system_prompt = SUBAGENT_SYSTEM_PROMPT.to_string();
+        }
+        self
+    }
+
+    /// Atajo de [`with_mode`](Self::with_mode) para subagentes de fondo.
+    pub fn with_worker_mode(self, worker: bool) -> Self {
+        let mode = if worker {
+            CliBrainMode::Worker
+        } else {
+            CliBrainMode::Voice
+        };
+        self.with_mode(mode)
+    }
+
+    /// Identificador de sub-sesión que verá el proceso hijo en
+    /// [`SUBSESSION_ENV`] (por defecto [`DEFAULT_SUBSESSION_ID`]).
+    pub fn with_subsession_id(mut self, id: impl Into<String>) -> Self {
+        self.subsession_id = Some(id.into());
+        self
+    }
+
+    /// Papel actual del cerebro.
+    pub fn mode(&self) -> CliBrainMode {
+        self.mode
     }
 
     /// Programa que se ejecuta (primer elemento del comando).
@@ -250,6 +308,10 @@ impl CliBrain {
     }
 
     /// Persona + transcripción reciente + turno actual, en texto plano.
+    ///
+    /// En [`CliBrainMode::Worker`] no se añade la coletilla de voz
+    /// ("responde únicamente … en una frase breve"): el subagente recibe su
+    /// propio prompt y el formato pactado con el gestor de tareas (HU-60).
     fn build_prompt(&self, user_text: &str) -> String {
         let mut prompt = self.system_prompt.clone();
         let history = self.lock_history();
@@ -265,9 +327,14 @@ impl CliBrain {
             }
         }
         drop(history);
-        prompt.push_str(&format!(
-            "\nUsa tus herramientas (run_command, herramientas MCP, etc.) para realizar las acciones solicitadas en el equipo cuando corresponda. Responde únicamente con lo que Jarvis debe decir en voz alta al usuario en una frase breve en español.\nUsuario: {user_text}"
-        ));
+        match self.mode {
+            CliBrainMode::Voice => prompt.push_str(&format!(
+                "\nUsa tus herramientas (run_command, herramientas MCP, etc.) para realizar las acciones solicitadas en el equipo cuando corresponda. Responde únicamente con lo que Jarvis debe decir en voz alta al usuario en una frase breve en español.\nUsuario: {user_text}"
+            )),
+            CliBrainMode::Worker => {
+                prompt.push_str(&format!("\nTarea encomendada a esta sub-sesión:\n{user_text}"))
+            }
+        }
         prompt
     }
 
@@ -311,7 +378,18 @@ impl CliBrain {
             // Google Workspace) ni script hijo debe abrir un navegador
             // (`xdg-open`, `webbrowser.open`) en medio de la pantalla.
             .env("BROWSER", "/bin/true")
-            .env("NO_BROWSER", "1")
+            .env("NO_BROWSER", "1");
+        // HU-60: el subagente sabe que corre dentro de una sub-sesión, de modo
+        // que `fokkus-jarvis dev run` se niega a crear otra tarea (antirrecursión).
+        if self.mode == CliBrainMode::Worker {
+            command.env(
+                SUBSESSION_ENV,
+                self.subsession_id
+                    .as_deref()
+                    .unwrap_or(DEFAULT_SUBSESSION_ID),
+            );
+        }
+        command
             .spawn()
             .map_err(|e| BrainError::Cli(format!("no se pudo ejecutar `{}`: {e}", self.program)))
     }
@@ -489,6 +567,49 @@ mod tests {
         let brain = CliBrain::new("sh -c 'echo \"$BROWSER|$NO_BROWSER\"' {prompt}").unwrap();
         let completion = brain.stream("hola", &mut |_| {}).expect("sh responde");
         assert_eq!(completion.text.trim(), "/bin/true|1");
+    }
+
+    #[test]
+    fn worker_mode_drops_the_voice_persona_and_marks_the_sub_session_hu60() {
+        let brain = CliBrain::new("agy -p").unwrap();
+        assert_eq!(brain.mode(), CliBrainMode::Voice);
+        let voice = brain.build_prompt("revisa las PR de Felipe");
+        assert!(voice.contains("una frase breve"), "modo voz intacto");
+        assert!(voice.contains("fokkus-jarvis dev run"));
+
+        let worker = CliBrain::new("agy -p").unwrap().with_worker_mode(true);
+        assert_eq!(worker.mode(), CliBrainMode::Worker);
+        let prompt = worker.build_prompt("revisa las PR de Felipe");
+        assert!(!prompt.contains("frase breve"), "{prompt}");
+        assert!(!prompt.contains("fokkus-jarvis dev run"), "{prompt}");
+        assert!(prompt.contains("subagente de fondo"), "{prompt}");
+        assert!(prompt.contains("gh pr view"), "{prompt}");
+        // La constitución de privacidad se conserva íntegra.
+        assert!(prompt.contains("~/.ssh/"), "{prompt}");
+    }
+
+    #[test]
+    fn worker_child_sees_the_sub_session_id_hu60() {
+        let script = "sh -c 'echo \"$JARVIS_SUBSESSION_ID\"' {prompt}";
+        let voice = CliBrain::new(script).unwrap();
+        let completion = voice.stream("hola", &mut |_| {}).expect("sh responde");
+        // El turno de voz no marca nada: el hijo hereda el entorno del proceso.
+        let inherited = std::env::var(SUBSESSION_ENV).unwrap_or_default();
+        assert_eq!(completion.text.trim(), inherited);
+
+        let worker = CliBrain::new(script)
+            .unwrap()
+            .with_worker_mode(true)
+            .with_subsession_id("7");
+        let completion = worker.stream("hola", &mut |_| {}).expect("sh responde");
+        assert_eq!(completion.text.trim(), "7");
+
+        // Sin identificador explícito se usa el valor por defecto.
+        let worker = CliBrain::new(script)
+            .unwrap()
+            .with_mode(CliBrainMode::Worker);
+        let completion = worker.stream("hola", &mut |_| {}).expect("sh responde");
+        assert_eq!(completion.text.trim(), DEFAULT_SUBSESSION_ID);
     }
 
     #[test]

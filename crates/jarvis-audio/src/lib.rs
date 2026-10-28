@@ -24,6 +24,8 @@
 //!   (HU-39).
 //! - [`orchestrator`]: cableado de punta a punta `VoiceEvent` → STT → Claude →
 //!   TTS con barge-in y silencio real (HU-9).
+//! - [`text`]: normalización léxica única de las órdenes de voz (tildes,
+//!   enclíticos y variantes fonéticas de STT) para las heurísticas (HU-59).
 
 pub mod activation;
 pub mod agent;
@@ -39,6 +41,7 @@ pub mod playback;
 pub mod speech_queue;
 pub mod stt;
 pub mod tasks;
+pub mod text;
 pub mod tts;
 pub mod vad;
 pub mod voices;
@@ -46,7 +49,7 @@ pub mod voices;
 pub use activation::{Activation, ActivationDetector};
 pub use brain::{
     resolve_api_key, store_api_key, BrainError, CancellationToken, ClaudeClient, CliBrain,
-    Completion, Message, SseEvent, SseParser, DEFAULT_CLI_COMMAND,
+    Completion, Message, SseEvent, SseParser, DEFAULT_CLI_COMMAND, SUBAGENT_SYSTEM_PROMPT,
 };
 pub use conversation::{
     barge_in, classify_intent, BackgroundTasks, ConversationCoordinator, ConversationError,

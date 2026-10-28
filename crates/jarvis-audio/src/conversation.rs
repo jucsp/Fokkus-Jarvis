@@ -185,6 +185,16 @@ pub trait TokenStream {
 
     /// Cancela la petición en curso (barge-in). Idempotente.
     fn cancel(&self);
+
+    /// `true` si el cerebro puede usar herramientas de inspección de
+    /// repositorios y código (`gh`, `git`, `rg`…) en el equipo del usuario.
+    ///
+    /// El modo API no expone herramientas, así que el valor por defecto es
+    /// `false`; una tarea que las necesite avisa "Necesito el modo CLI para
+    /// revisar repositorios" en vez de inventar el resultado (HU-60 CA-3).
+    fn has_repo_tools(&self) -> bool {
+        false
+    }
 }
 
 /// Síntesis de una frase a PCM en memoria, inyectable (tests y orquestador).
@@ -202,6 +212,11 @@ impl TokenStream for CliBrain {
     fn cancel(&self) {
         CliBrain::cancel(self);
     }
+
+    /// El CLI corre en el equipo del usuario: tiene `gh`, `git`, `rg` (HU-60).
+    fn has_repo_tools(&self) -> bool {
+        true
+    }
 }
 
 impl TokenStream for ClaudeClient {
@@ -215,6 +230,11 @@ impl TokenStream for ClaudeClient {
 
     fn cancel(&self) {
         ClaudeClient::cancel(self);
+    }
+
+    /// El modo API no expone herramientas: la tarea avisa y no inventa (HU-60).
+    fn has_repo_tools(&self) -> bool {
+        false
     }
 }
 
