@@ -1,5 +1,6 @@
 //! Configuración de usuario del asistente, persistida en TOML.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -339,6 +340,10 @@ pub struct JarvisConfig {
     /// *Endpointing* de turno (HU-41, tabla `[voice_endpoint]`). También al
     /// final, por la misma razón que `automation`.
     pub voice_endpoint: VoiceEndpointConfig,
+    /// Correcciones de transcripción del usuario (HU-70, tabla
+    /// `[stt_lexicon]`): `"variante" = "Canónico"`. Se valida al arrancar el
+    /// orquestador; `BTreeMap` fija un orden estable para el tope de entradas.
+    pub stt_lexicon: BTreeMap<String, String>,
 }
 
 /// Configuración de la capa "ojos y manos" (HU-38). Apagada por defecto:
@@ -440,6 +445,7 @@ impl Default for JarvisConfig {
             hud_max_bubbles: 3,
             automation: AutomationConfig::default(),
             voice_endpoint: VoiceEndpointConfig::default(),
+            stt_lexicon: BTreeMap::new(),
         }
     }
 }
@@ -911,6 +917,24 @@ mod tests {
         assert!(!loaded.barge_in_enabled);
         assert_eq!(loaded.brain_mode, BrainMode::Cli);
         assert_eq!(loaded.cli_command, DEFAULT_CLI_COMMAND);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn stt_lexicon_table_is_parsed() {
+        let path = temp_config_path("stt-lexicon");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "gaming_mode = true\n\n[stt_lexicon]\n\"fokus\" = \"Fokkus\"\n\"jira\" = \"Jira\"\n",
+        )
+        .unwrap();
+        let loaded = JarvisConfig::load_from(&path).expect("TOML con léxico");
+        assert!(loaded.gaming_mode);
+        assert_eq!(loaded.stt_lexicon.len(), 2);
+        assert_eq!(loaded.stt_lexicon["fokus"], "Fokkus");
+        assert!(JarvisConfig::default().stt_lexicon.is_empty());
         cleanup(&path);
     }
 

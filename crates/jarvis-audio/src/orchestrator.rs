@@ -68,6 +68,7 @@ use crate::tasks::{
     task_prompt, BrainFactory, SpeechQueueHandle, TaskConfig, TaskId, TaskManager, TaskOrigin,
     TaskRecord, TaskStatus,
 };
+use crate::text::lexicon::Lexicon;
 use crate::tts::{strip_directives, synth_chime, PcmAudio};
 
 /// Lo que dice Jarvis cuando no hay cerebro (ni CLI ni API key) y la
@@ -265,6 +266,10 @@ pub struct VoiceConfig {
     pub automation_input: Option<AutomationInput>,
     /// Caducidad del foco verbal de una sub-sesión (HU-64).
     pub focus_timeout: Duration,
+    /// Extensiones del corrector léxico desde `config.toml` (HU-70, tabla
+    /// `[stt_lexicon]`): pares `(variante, forma canónica)`. Vacío = solo
+    /// diccionario base embebido.
+    pub stt_lexicon: Vec<(String, String)>,
 }
 
 impl Default for VoiceConfig {
@@ -285,6 +290,7 @@ impl Default for VoiceConfig {
             automation_kill: None,
             automation_input: None,
             focus_timeout: FOCUS_TIMEOUT,
+            stt_lexicon: Vec::new(),
         }
     }
 }
@@ -2219,10 +2225,20 @@ impl VoiceOrchestrator {
                 .map(|join| (name, join))
         };
 
+        // Corrector léxico determinista (HU-70): el índice se construye una
+        // sola vez al arrancar; las entradas inválidas de `config.toml` se
+        // registran y se descartan sin abortar.
+        let (lexicon, rejected) = Lexicon::base().with_user_entries(&config.stt_lexicon);
+        for entry in &rejected {
+            eprintln!("[lexicon] entrada ignorada: {entry}");
+        }
+        let lexicon = Arc::new(lexicon);
+
         {
             let activation = Arc::clone(&activation);
             let stt_ready = Arc::clone(&stt_ready);
             let stt_in_flight = Arc::clone(&stt_in_flight);
+            let lexicon = Arc::clone(&lexicon);
             threads.push(spawn(
                 "jarvis-stt",
                 Box::new(move || {
@@ -2232,6 +2248,7 @@ impl VoiceOrchestrator {
                         &activation,
                         &stt_ready,
                         &stt_in_flight,
+                        &lexicon,
                     );
                 }),
             )?);
@@ -3194,6 +3211,7 @@ fn stt_loop(
     activation: &ActivationDetector,
     ready: &AtomicBool,
     in_flight: &AtomicUsize,
+    lexicon: &Lexicon,
 ) {
     let mut transcriber: Option<Box<dyn Transcriber + Send>> = None;
     // Texto de un turno largo aún abierto (HU-44).
@@ -3253,6 +3271,13 @@ fn stt_loop(
                             }
                             None => (text, segment_start),
                         };
+                        // HU-70: se corrige el turno ya ensamblado, antes que
+                        // cualquier heurística, para que un tecnicismo partido
+                        // entre dos fragmentos también se reconozca.
+                        let (text, corrections) = lexicon.correct_traced(&text);
+                        for correction in &corrections {
+                            println!("[lexicon] {correction}");
+                        }
                         println!("[stt] escuchado: {text}");
                         let cue = crate::incompleteness::incompleteness(&text);
                         if let Some(cue) = cue {

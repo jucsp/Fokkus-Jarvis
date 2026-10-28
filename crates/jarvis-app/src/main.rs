@@ -1108,6 +1108,11 @@ fn run() -> ExitCode {
                 .automation
                 .enabled
                 .then(|| automation_input(Arc::clone(&automation), &config.automation)),
+            stt_lexicon: config
+                .stt_lexicon
+                .iter()
+                .map(|(variant, canonical)| (variant.clone(), canonical.clone()))
+                .collect(),
             ..VoiceConfig::default()
         };
         match VoiceOrchestrator::start(deps, config) {

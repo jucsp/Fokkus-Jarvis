@@ -151,6 +151,8 @@ const SCRIPT: &[&str] = &[
     "Jarvis, abre otro hilo para revisar los logs de Melón", // 36: paso 5
     "Jarvis, y también agrega el módulo de facturas",        // 37: continuación anafórica
     "Jarvis, no busques en Google, dime de dónde salió la notificación", // 38: HU-71
+    "Jarvis, ¿qué es cubernetis y para qué sirve el doquer?", // 39: léxico base (HU-70)
+    "Jarvis, ¿qué opinas del proyecto focus?",               // 40: léxico de usuario (HU-70)
 ];
 
 struct ScriptTranscriber;
@@ -2946,4 +2948,39 @@ fn negated_search_reaches_the_brain_with_the_no_web_directive_hu71() {
         context.starts_with(crate::router::NO_WEB_DIRECTIVE),
         "{context}"
     );
+}
+
+/// CA-70.1: la transcripción llega corregida al cerebro, no la de whisper.
+#[test]
+fn stt_lexicon_corrects_the_transcription_before_the_brain() {
+    let brain = FakeBrain::new("Listo.");
+    let h = harness("lexico-base", Some(brain.clone()), fast());
+    h.say_line(39);
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(
+        brain.queries(),
+        vec!["¿qué es Kubernetes y para qué sirve el Docker?".to_string()]
+    );
+}
+
+/// CA-70.5: las entradas de `config.toml` se aplican y una inválida (que
+/// intenta introducir una orden protegida) se descarta sin abortar.
+#[test]
+fn stt_lexicon_applies_user_entries_and_ignores_protected_ones() {
+    let brain = FakeBrain::new("Listo.");
+    let config = VoiceConfig {
+        stt_lexicon: vec![
+            ("focus".to_string(), "Fokkus".to_string()),
+            ("proyecto".to_string(), "silencio".to_string()),
+        ],
+        ..fast()
+    };
+    let h = harness("lexico-usuario", Some(brain.clone()), config);
+    h.say_line(40);
+    h.wait_spoken_and_listening(0, 0);
+    assert_eq!(
+        brain.queries(),
+        vec!["¿qué opinas del proyecto Fokkus?".to_string()]
+    );
+    assert!(!h.activation.is_muted(), "la entrada protegida no silencia");
 }

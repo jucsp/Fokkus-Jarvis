@@ -25,7 +25,8 @@
 //! - [`orchestrator`]: cableado de punta a punta `VoiceEvent` → STT → Claude →
 //!   TTS con barge-in y silencio real (HU-9).
 //! - [`text`]: normalización léxica única de las órdenes de voz (tildes,
-//!   enclíticos y variantes fonéticas de STT) para las heurísticas (HU-59).
+//!   enclíticos y variantes fonéticas de STT) para las heurísticas (HU-59) y
+//!   corrector léxico determinista de la transcripción (HU-70).
 //! - [`sessions`]: multi-sesiones y subhilos de conversación con persistencia
 //!   (HU-62).
 //! - [`router`]: enrutamiento de turnos con `TurnPlan` y planificador LLM para
@@ -93,6 +94,7 @@ pub use tasks::{
     classify_workload, dev_task_prompt, split_task_output, summarize, task_title, BrainFactory,
     TaskConfig, TaskId, TaskManager, TaskOrigin, TaskRecord, TaskStatus, Workload, DEV_TASK_TITLE,
 };
+pub use text::lexicon::{Correction, Lexicon, RejectedEntry};
 pub use tts::{
     strip_directives, DirectedPhrase, EdgeTtsEngine, FillerCategory, Mood, PcmAudio, PhraseGrouper,
     PhraseSplitter, SpeechDirective, TtsBackend, TtsError,

@@ -25,13 +25,23 @@ pub const MIN_SAMPLES: usize = SAMPLE_RATE * 11 / 10;
 /// Idioma por defecto.
 pub const DEFAULT_LANGUAGE: &str = "es";
 
-/// *Prompt* inicial por defecto (HU-43). Sesga el decodificador hacia
-/// "Jarvis" y, sobre todo, hacia un estilo con disfluencias: whisper imita el
-/// prompt, así que con él conserva las muletillas ("eh", "o sea") y los
-/// puntos suspensivos en vez de borrarlas y cerrar la frase con un punto. Sin
-/// esas marcas el detector de incompletitud no puede ver que el usuario no
-/// terminó. Solo muletillas: palabras de contenido se alucinarían en silencio.
-pub const DEFAULT_INITIAL_PROMPT: &str = "Jarvis, eh... este, mmm, o sea, como que, igual...";
+/// *Prompt* inicial por defecto (HU-43, ampliado en HU-70). Sesga el
+/// decodificador hacia "Jarvis" y, sobre todo, hacia un estilo con
+/// disfluencias: whisper imita el prompt, así que con él conserva las
+/// muletillas ("eh", "o sea") y los puntos suspensivos en vez de borrarlas y
+/// cerrar la frase con un punto. Sin esas marcas el detector de incompletitud
+/// no puede ver que el usuario no terminó.
+///
+/// Desde HU-70 añade un **sesgo léxico** corto con los tecnicismos que más
+/// deforma ("Docker", "Kubernetes", "Spectacle"…). Las muletillas de HU-43 van
+/// **delante** y el sesgo al final, que es la parte que whisper pesa menos:
+/// así no se pierde el estilo con disfluencias.
+///
+/// El riesgo que documentaba HU-43 (whisper puede repetir palabras de contenido
+/// del prompt cuando el audio es silencio) queda acotado porque en silencio no
+/// se transcribe (CA-4.3) y porque la compuerta de activación descarta todo
+/// turno que no diga "Jarvis".
+pub const DEFAULT_INITIAL_PROMPT: &str = "Jarvis, eh... este, mmm, o sea, como que, igual, Docker, Kubernetes, Spectacle, Wayland, GitHub, JSON, deploy...";
 
 /// Máximo de hilos de CPU para la inferencia.
 pub const MAX_THREADS: usize = 8;
@@ -345,6 +355,40 @@ mod tests {
         }
         // El propio prompt termina abierto: whisper no debe aprender a cerrar
         // cada frase con un punto.
+        assert!(crate::incompleteness::is_incomplete(prompt));
+    }
+
+    /// CA-70.7: el sesgo léxico cabe en el presupuesto de tokens de whisper
+    /// (`n_text_ctx / 2` ≈ 224) y no desplaza las disfluencias de HU-43.
+    #[test]
+    fn default_prompt_biases_the_technical_lexicon_within_the_token_budget() {
+        let prompt = DEFAULT_INITIAL_PROMPT;
+        let words = prompt.split_whitespace().count();
+        assert!(
+            words <= 30,
+            "{words} palabras: demasiado largo para el sesgo"
+        );
+        assert!(
+            prompt.chars().count() <= 160,
+            "{} caracteres",
+            prompt.chars().count()
+        );
+        for term in [
+            "Docker",
+            "Kubernetes",
+            "Spectacle",
+            "Wayland",
+            "GitHub",
+            "JSON",
+        ] {
+            assert!(prompt.contains(term), "falta el sesgo {term}");
+        }
+        let bias = prompt.find("Docker").expect("sesgo léxico");
+        for filler in ["eh", "este", "mmm", "o sea", "como que", "igual"] {
+            let at = prompt.find(filler).expect(filler);
+            assert!(at < bias, "la muletilla {filler:?} quedó tras el sesgo");
+        }
+        // Y sigue siendo una frase abierta.
         assert!(crate::incompleteness::is_incomplete(prompt));
     }
 
