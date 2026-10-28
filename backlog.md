@@ -212,6 +212,11 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 - _SDD:_ [`docs/specs/sdd-epica-15-excelencia-conversacional.md`](docs/specs/sdd-epica-15-excelencia-conversacional.md)
 - _Contexto de negocio:_ Jarvis transcribe mal tecnicismos y jerga chilena, abre Google sin que se lo pidan (incluso cuando el usuario dice "no busques en Google") y no sabe de qué aplicación vienen las notificaciones del escritorio. Restricciones: 100 % local y gratuito, **Hugging Face vetado**, sin root y sin `pip`.
 - _Versión objetivo:_ v0.4.0
+- _Estado (2026-10-28):_ implementada y verificada (`make test` 938 pasados, 0 fallidos; `make deny` limpio). Pendiente para el cierre: publicar el release `models-v1` (hoy 404), método IPC `jarvis.modelStatus` y pruebas manuales 🧪 (RSS/latencia de `small-q5_1`, Spectacle en KWin). Detalle en `sprint_board.md`.
+- [x] **HU-71** Erradicación de `bare_search` y restricción dura `no_web` [Fase A · Responsable: DeepSeek · QA: Claude]
+- [x] **HU-70** Corrector léxico determinista (tecnicismos y jerga chilena) [Fase A · Responsable: DeepSeek · QA: Claude]
+- [x] **HU-69** Catálogo soberano en GitHub Releases sin Hugging Face y respaldo `stt_model` [Fase B · Responsable: Claude · QA: Claude] — pendiente release `models-v1` (PO) e IPC `jarvis.modelStatus`
+- [x] **HU-72** Introspección nativa de notificaciones vía D-Bus [Fase B · Responsable: DeepSeek · cableado y QA: Claude]
 
 ### HU-69: STT `small-q5_1` con orígenes de descarga soberanos (sin Hugging Face)
 - 📁 _Repositorio:_ `Fokkus-Jarvis`
