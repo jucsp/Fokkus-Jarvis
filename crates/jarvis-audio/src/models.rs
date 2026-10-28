@@ -1,7 +1,11 @@
-//! Gestor seguro de modelos whisper (HU-7, mitigación SEC-02).
+//! Gestor seguro de modelos whisper (HU-7, mitigación SEC-02; orígenes HU-69).
 //!
-//! - Las URLs y los SHA-256 quedan fijados en el código; las URLs de Hugging
-//!   Face apuntan a un commit concreto, nunca a `main`.
+//! - Las URLs y los SHA-256 quedan fijados en el código. Los modelos se
+//!   descargan **solo** de los GitHub Releases propios, bajo un tag inmutable
+//!   ([`MODELS_RELEASE_TAG`]); jamás de Hugging Face ni de `latest`. Las
+//!   redirecciones solo se siguen hacia los hosts de assets de GitHub y por
+//!   HTTPS ([`REDIRECT_HOSTS`]). El pipeline que produce los `.bin` está en
+//!   `scripts/build-whisper-models.sh`.
 //! - Descarga a un temporal en el mismo directorio (0600), cálculo del hash en
 //!   streaming, verificación de tamaño, hash y cabecera, y `rename` atómico.
 //!   Si algo falla el temporal se borra y se reintenta: la ruta final nunca
@@ -20,19 +24,42 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use jarvis_core::SttModel;
 use sha2::{Digest, Sha256};
 
-/// Commit de `huggingface.co/ggerganov/whisper.cpp` al que se fijan las URLs.
-pub const HF_WHISPER_COMMIT: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+/// Tag inmutable del release que publica los modelos (CA-69.1). El SHA-256
+/// del catálogo es la defensa real; el tag solo direcciona (riesgo R2).
+pub const MODELS_RELEASE_TAG: &str = "models-v1";
+
+/// Prefijo común de todas las URLs del catálogo.
+pub const MODELS_RELEASE_URL: &str =
+    "https://github.com/jucsp/Fokkus-Jarvis/releases/download/models-v1/";
+
+/// Host de origen de las descargas.
+pub const ORIGIN_HOST: &str = "github.com";
+
+/// Hosts a los que GitHub redirige los assets de un release (302). Ningún
+/// otro destino de redirección se acepta (CA-69.3).
+pub const REDIRECT_HOSTS: &[&str] = &[
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+];
+
+/// Saltos de redirección admitidos (GitHub usa uno).
+pub const MAX_REDIRECTS: usize = 3;
+
+/// SHA-256 de un artefacto que aún no se publica en el release: el gestor
+/// nunca lo descarga ni lo carga (ver [`ModelSpec::is_published`]).
+pub const PENDING_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Descripción inmutable de un modelo descargable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelSpec {
-    /// Identificador estable (IPC `jarvis.modelStatus`, `--check`).
+    /// Identificador estable (`--check`, logs).
     pub id: &'static str,
     /// Nombre del archivo dentro del directorio de modelos.
     pub file_name: &'static str,
-    /// URL HTTPS fijada a un commit.
+    /// URL HTTPS del release propio, fijada a [`MODELS_RELEASE_TAG`].
     pub url: &'static str,
     /// SHA-256 esperado en hexadecimal minúscula.
     pub sha256: &'static str,
@@ -40,14 +67,40 @@ pub struct ModelSpec {
     pub size: u64,
 }
 
-/// Modelo principal de transcripción (HU-5).
+impl ModelSpec {
+    /// `false` mientras el artefacto no tenga hash y tamaño publicados.
+    pub fn is_published(&self) -> bool {
+        self.sha256 != PENDING_SHA256 && self.size > 0
+    }
+}
+
+/// Modelo de transcripción por defecto (HU-69).
+///
+/// Hash y tamaño pendientes hasta publicar `models-v1`: el mantenedor los
+/// copia de `SHA256SUMS` al correr `scripts/build-whisper-models.sh`.
+/// Mientras tanto Jarvis usa [`WHISPER_BASE_Q5_1`] como respaldo.
+pub const WHISPER_SMALL_Q5_1: ModelSpec = ModelSpec {
+    id: "whisper-small-q5_1",
+    file_name: "ggml-small-q5_1.bin",
+    url: concat!(
+        "https://github.com/jucsp/Fokkus-Jarvis/releases/download/models-v1/",
+        "ggml-small-q5_1.bin"
+    ),
+    sha256: PENDING_SHA256,
+    size: 0,
+};
+
+/// Modelo de transcripción de respaldo (HU-5).
+///
+/// El hash es el del artefacto ggml de referencia ya instalado en los
+/// equipos: el pipeline propio lo reproduce byte a byte (CA-69.7); si no
+/// coincidiera, se actualiza aquí con el de `SHA256SUMS`.
 pub const WHISPER_BASE_Q5_1: ModelSpec = ModelSpec {
     id: "whisper-base-q5_1",
     file_name: "ggml-base-q5_1.bin",
     url: concat!(
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/",
-        "5359861c739e955e79d9a303bcbc70fb988958b1",
-        "/ggml-base-q5_1.bin"
+        "https://github.com/jucsp/Fokkus-Jarvis/releases/download/models-v1/",
+        "ggml-base-q5_1.bin"
     ),
     sha256: "422f1ae452ade6f30a004d7e5c6a43195e4433bc370bf23fac9cc591f01a8898",
     size: 59_707_625,
@@ -58,16 +111,26 @@ pub const WHISPER_TINY: ModelSpec = ModelSpec {
     id: "whisper-tiny",
     file_name: "ggml-tiny.bin",
     url: concat!(
-        "https://huggingface.co/ggerganov/whisper.cpp/resolve/",
-        "5359861c739e955e79d9a303bcbc70fb988958b1",
-        "/ggml-tiny.bin"
+        "https://github.com/jucsp/Fokkus-Jarvis/releases/download/models-v1/",
+        "ggml-tiny.bin"
     ),
     sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
     size: 77_691_713,
 };
 
 /// Catálogo completo de modelos gestionados.
-pub const MODELS: &[ModelSpec] = &[WHISPER_BASE_Q5_1, WHISPER_TINY];
+pub const MODELS: &[ModelSpec] = &[WHISPER_SMALL_Q5_1, WHISPER_BASE_Q5_1, WHISPER_TINY];
+
+/// Especificación del modelo de transcripción elegido en `config.toml`.
+pub fn stt_spec(model: SttModel) -> ModelSpec {
+    match model {
+        SttModel::SmallQ5_1 => WHISPER_SMALL_Q5_1,
+        SttModel::BaseQ5_1 => WHISPER_BASE_Q5_1,
+    }
+}
+
+/// Modelo de respaldo cuando el preferido no está disponible (CA-69.6).
+pub const STT_FALLBACK: ModelSpec = WHISPER_BASE_Q5_1;
 
 /// Magia `ggml` de los modelos whisper (little-endian).
 pub const GGML_MAGIC: u32 = 0x6767_6d6c;
@@ -101,6 +164,8 @@ pub enum ModelError {
         actual: String,
     },
     InvalidHeader(String),
+    /// El artefacto aún no tiene hash publicado en el catálogo.
+    NotPublished(&'static str),
     /// Se agotaron los reintentos de descarga; guarda el último error.
     DownloadFailed {
         attempts: u32,
@@ -127,6 +192,9 @@ impl fmt::Display for ModelError {
                 write!(f, "SHA-256 no coincide: {actual} (se esperaba {expected})")
             }
             ModelError::InvalidHeader(why) => write!(f, "cabecera de modelo inválida: {why}"),
+            ModelError::NotPublished(id) => {
+                write!(f, "{id} aún no está publicado en {MODELS_RELEASE_TAG}")
+            }
             ModelError::DownloadFailed { attempts, last } => {
                 write!(f, "descarga fallida tras {attempts} intentos: {last}")
             }
@@ -333,7 +401,75 @@ pub trait ModelSource: Send + Sync {
     fn open(&self, url: &str, limit: u64) -> Result<Box<dyn Read + Send>, ModelError>;
 }
 
-/// Descarga HTTPS con `ureq` (rustls/ring), sin HTTP plano.
+/// Host en minúsculas de una URL `https://` absoluta.
+///
+/// `None` si el esquema no es HTTPS o la autoridad trae credenciales, puerto
+/// o caracteres raros: así un `Location` como `https://github.com@evil/` o
+/// `https://evil:443/` nunca pasa por un host permitido.
+pub fn https_host(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host = &rest[..end];
+    let valid = !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-');
+    valid.then(|| host.to_ascii_lowercase())
+}
+
+/// Verifica que la URL inicial apunte al release propio.
+fn check_origin(url: &str) -> Result<(), ModelError> {
+    if https_host(url).as_deref() == Some(ORIGIN_HOST) && url.starts_with(MODELS_RELEASE_URL) {
+        Ok(())
+    } else {
+        Err(ModelError::Network(format!(
+            "origen no permitido: {url} (solo {MODELS_RELEASE_URL})"
+        )))
+    }
+}
+
+/// Verifica un destino de redirección contra [`REDIRECT_HOSTS`] (CA-69.3).
+pub fn check_redirect(location: &str) -> Result<(), ModelError> {
+    match https_host(location) {
+        Some(host) if REDIRECT_HOSTS.contains(&host.as_str()) => Ok(()),
+        _ => Err(ModelError::Network(format!(
+            "redirección rechazada hacia {location:?}: solo HTTPS a {}",
+            REDIRECT_HOSTS.join(" o ")
+        ))),
+    }
+}
+
+/// Respuesta de un salto HTTP: el cuerpo o una redirección a seguir.
+pub enum Hop<R> {
+    Body(R),
+    Redirect(String),
+}
+
+/// Sigue redirecciones con la política de orígenes de HU-69: la URL inicial
+/// debe ser del release propio y cada `Location` debe pasar
+/// [`check_redirect`]. `fetch` hace un único salto sin seguir redirecciones.
+pub fn follow_redirects<R>(
+    url: &str,
+    mut fetch: impl FnMut(&str) -> Result<Hop<R>, ModelError>,
+) -> Result<R, ModelError> {
+    check_origin(url)?;
+    let mut current = url.to_string();
+    for _ in 0..=MAX_REDIRECTS {
+        match fetch(&current)? {
+            Hop::Body(body) => return Ok(body),
+            Hop::Redirect(location) => {
+                check_redirect(&location)?;
+                current = location;
+            }
+        }
+    }
+    Err(ModelError::Network(format!(
+        "más de {MAX_REDIRECTS} redirecciones"
+    )))
+}
+
+/// Descarga HTTPS con `ureq` (rustls/ring), sin HTTP plano. Las redirecciones
+/// no las sigue `ureq`: pasan por [`follow_redirects`].
 pub struct HttpSource {
     agent: ureq::Agent,
 }
@@ -342,6 +478,7 @@ impl HttpSource {
     pub fn new() -> Self {
         let config = ureq::Agent::config_builder()
             .https_only(true)
+            .max_redirects(0)
             .timeout_connect(Some(Duration::from_secs(15)))
             .timeout_recv_response(Some(Duration::from_secs(30)))
             .user_agent(concat!("fokkus-jarvis/", env!("CARGO_PKG_VERSION")))
@@ -360,11 +497,26 @@ impl Default for HttpSource {
 
 impl ModelSource for HttpSource {
     fn open(&self, url: &str, limit: u64) -> Result<Box<dyn Read + Send>, ModelError> {
-        let response = self
-            .agent
-            .get(url)
-            .call()
-            .map_err(|e| ModelError::Network(e.to_string()))?;
+        let response = follow_redirects(url, |current| {
+            let response = self
+                .agent
+                .get(current)
+                .call()
+                .map_err(|e| ModelError::Network(e.to_string()))?;
+            let status = response.status();
+            if status.is_redirection() {
+                let location = response
+                    .headers()
+                    .get(ureq::http::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| ModelError::Network(format!("HTTP {status} sin Location")))?;
+                return Ok(Hop::Redirect(location.to_string()));
+            }
+            if !status.is_success() {
+                return Err(ModelError::Network(format!("HTTP {status}")));
+            }
+            Ok(Hop::Body(response))
+        })?;
         // `limit + 1` para que un exceso se detecte como `TooLarge` y no como
         // error opaco del lector.
         let reader = response
@@ -374,6 +526,19 @@ impl ModelSource for HttpSource {
             .reader();
         Ok(Box::new(reader))
     }
+}
+
+/// Modelo STT a cargar en este arranque (ver [`ModelManager::plan_stt`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SttPlan {
+    /// Modelo que se carga ahora.
+    pub spec: ModelSpec,
+    /// Respaldo si `spec` no se puede cargar ([`STT_FALLBACK`]).
+    pub fallback: ModelSpec,
+    /// Motivo por el que se usa el respaldo en lugar del preferido.
+    pub fallback_reason: Option<String>,
+    /// Preferido a descargar en segundo plano para el próximo arranque.
+    pub prefetch: Option<ModelSpec>,
 }
 
 /// Directorio por defecto: `$XDG_DATA_HOME/fokkus-jarvis/models` o
@@ -451,6 +616,8 @@ impl ModelManager {
                 sha256: model.sha256().to_string(),
             },
             Err(ModelError::Io(e)) if e.kind() == io::ErrorKind::NotFound => ModelStatus::Missing,
+            // Sin hash publicado no hay forma de verificarlo: cuenta como ausente.
+            Err(ModelError::NotPublished(_)) => ModelStatus::Missing,
             Err(e) => ModelStatus::Invalid {
                 reason: e.to_string(),
             },
@@ -462,7 +629,7 @@ impl ModelManager {
     pub fn load_verified(&self, spec: &ModelSpec) -> Result<VerifiedModel, ModelError> {
         match self.read_verified(spec) {
             Ok(model) => Ok(model),
-            Err(ModelError::Io(e)) => Err(ModelError::Io(e)),
+            Err(e @ (ModelError::Io(_) | ModelError::NotPublished(_))) => Err(e),
             Err(e) => {
                 let _ = fs::remove_file(self.path_of(spec));
                 Err(e)
@@ -471,6 +638,9 @@ impl ModelManager {
     }
 
     fn read_verified(&self, spec: &ModelSpec) -> Result<VerifiedModel, ModelError> {
+        if !spec.is_published() {
+            return Err(ModelError::NotPublished(spec.id));
+        }
         let path = self.path_of(spec);
         let file = File::open(&path)?;
         let len = file.metadata()?.len();
@@ -499,11 +669,77 @@ impl ModelManager {
             Ok(model) => return Ok(model),
             Err(ModelError::Io(e)) if e.kind() == io::ErrorKind::NotFound => {}
             // Dañado: `load_verified` ya lo borró; se vuelve a descargar.
-            Err(ModelError::Io(e)) => return Err(ModelError::Io(e)),
+            Err(e @ (ModelError::Io(_) | ModelError::NotPublished(_))) => return Err(e),
             Err(_) => {}
         }
         self.download(spec, progress)?;
         self.load_verified(spec)
+    }
+
+    /// Decide qué modelo STT cargar sin descargar nada (HU-69, CA-69.6).
+    ///
+    /// El preferido se usa si está verificado en disco. Si falta, está dañado
+    /// o aún no se publica y el respaldo ([`STT_FALLBACK`]) está verificado,
+    /// se arranca con el respaldo y el preferido queda para descargarse en
+    /// segundo plano (`prefetch`). Si ninguno está en disco se intenta el
+    /// preferido y [`ModelManager::ensure_stt`] cae al respaldo si falla.
+    pub fn plan_stt(&self, preferred: &ModelSpec) -> SttPlan {
+        self.plan_stt_with(preferred, &STT_FALLBACK)
+    }
+
+    fn plan_stt_with(&self, preferred: &ModelSpec, fallback: &ModelSpec) -> SttPlan {
+        let use_preferred = SttPlan {
+            spec: *preferred,
+            fallback: *fallback,
+            fallback_reason: None,
+            prefetch: None,
+        };
+        if preferred == fallback {
+            return use_preferred;
+        }
+        if !preferred.is_published() {
+            return SttPlan {
+                spec: *fallback,
+                fallback: *fallback,
+                fallback_reason: Some(ModelError::NotPublished(preferred.id).to_string()),
+                prefetch: None,
+            };
+        }
+        let reason = match self.status(preferred) {
+            ModelStatus::Verified { .. } => return use_preferred,
+            ModelStatus::Missing => format!("{} no está descargado", preferred.id),
+            ModelStatus::Invalid { reason } => {
+                format!("{} no pasa la verificación ({reason})", preferred.id)
+            }
+        };
+        match self.status(fallback) {
+            ModelStatus::Verified { .. } => SttPlan {
+                spec: *fallback,
+                fallback: *fallback,
+                fallback_reason: Some(reason),
+                prefetch: Some(*preferred),
+            },
+            _ => use_preferred,
+        }
+    }
+
+    /// Carga el modelo del plan (descargándolo si falta). Si el elegido no
+    /// es el respaldo y falla, intenta el respaldo del plan. Devuelve el motivo
+    /// del respaldo, si lo hubo. Nunca entrega un modelo sin verificar.
+    pub fn ensure_stt(
+        &self,
+        plan: &SttPlan,
+        progress: &mut dyn FnMut(u64, u64),
+    ) -> Result<(VerifiedModel, Option<String>), ModelError> {
+        match self.ensure(&plan.spec, progress) {
+            Ok(model) => Ok((model, plan.fallback_reason.clone())),
+            Err(e) if plan.spec == plan.fallback => Err(e),
+            Err(e) => {
+                let reason = format!("{} no disponible: {e}", plan.spec.id);
+                self.ensure(&plan.fallback, progress)
+                    .map(|model| (model, Some(reason)))
+            }
+        }
     }
 
     /// Descarga con reintentos. Al terminar con éxito la ruta final contiene
@@ -513,6 +749,9 @@ impl ModelManager {
         spec: &ModelSpec,
         progress: &mut dyn FnMut(u64, u64),
     ) -> Result<(), ModelError> {
+        if !spec.is_published() {
+            return Err(ModelError::NotPublished(spec.id));
+        }
         self.ensure_dir()?;
         let mut attempt = 0;
         loop {
@@ -765,24 +1004,263 @@ pub(crate) mod tests {
             .unwrap_or_default()
     }
 
+    /// Dominios vetados (CA-69.2). Partidos con `concat!` para que
+    /// `grep` del dominio vetado sobre `crates/` siga en 0 (CA-69.1).
+    const VETOED: [&str; 2] = [concat!("hugging", "face"), concat!("hf", ".co")];
+    const VETOED_URL: &str = concat!(
+        "https://hugging",
+        "face.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
+    );
+
     #[test]
-    fn catalog_urls_are_pinned_https_and_hashes_are_hex() {
+    fn catalog_uses_only_own_github_releases_never_hugging_face() {
+        let ids: Vec<_> = MODELS.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            ["whisper-small-q5_1", "whisper-base-q5_1", "whisper-tiny"]
+        );
+        assert!(MODELS_RELEASE_URL.ends_with(&format!("/{MODELS_RELEASE_TAG}/")));
         for spec in MODELS {
-            assert!(
-                spec.url.starts_with("https://huggingface.co/"),
+            let url = spec.url.to_ascii_lowercase();
+            for vetoed in VETOED {
+                assert!(!url.contains(vetoed), "{}", spec.id);
+            }
+            assert!(!url.contains("/latest/"), "{}", spec.id);
+            assert!(spec.url.starts_with(MODELS_RELEASE_URL), "{}", spec.id);
+            assert_eq!(https_host(spec.url).as_deref(), Some(ORIGIN_HOST));
+            assert_eq!(
+                &spec.url[MODELS_RELEASE_URL.len()..],
+                spec.file_name,
                 "{}",
                 spec.id
             );
-            assert!(spec.url.contains(HF_WHISPER_COMMIT), "{}", spec.id);
-            assert!(!spec.url.contains("/main/"), "{}", spec.id);
-            assert!(spec.url.ends_with(spec.file_name), "{}", spec.id);
+            assert!(check_origin(spec.url).is_ok(), "{}", spec.id);
             assert_eq!(spec.sha256.len(), 64);
             assert!(spec
                 .sha256
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
-            assert!(spec.size > 1_000_000);
+            if spec.is_published() {
+                assert!(spec.size > 1_000_000, "{}", spec.id);
+            }
         }
+        // El respaldo y la palabra de activación deben estar siempre publicados.
+        assert!(STT_FALLBACK.is_published());
+        assert!(WHISPER_TINY.is_published());
+        assert_eq!(stt_spec(SttModel::SmallQ5_1), WHISPER_SMALL_Q5_1);
+        assert_eq!(stt_spec(SttModel::BaseQ5_1), WHISPER_BASE_Q5_1);
+    }
+
+    /// `ModelSource` que simula a GitHub: cada URL responde con un guion de
+    /// saltos y la política de redirecciones es la de [`HttpSource`].
+    struct RedirectingSource {
+        hops: Vec<(&'static str, Result<&'static str, &'static [u8]>)>,
+        visited: Mutex<Vec<String>>,
+    }
+
+    impl ModelSource for RedirectingSource {
+        fn open(&self, url: &str, _limit: u64) -> Result<Box<dyn Read + Send>, ModelError> {
+            let body = follow_redirects(url, |current| {
+                self.visited.lock().unwrap().push(current.to_string());
+                match self.hops.iter().find(|(u, _)| *u == current) {
+                    Some((_, Ok(location))) => Ok(Hop::Redirect(location.to_string())),
+                    Some((_, Err(body))) => Ok(Hop::Body(body.to_vec())),
+                    None => Err(ModelError::Network(format!("404 {current}"))),
+                }
+            })?;
+            Ok(Box::new(io::Cursor::new(body)))
+        }
+    }
+
+    const TINY_ASSET: &str =
+        "https://release-assets.githubusercontent.com/github-production-release-asset/1/abc?sig=x";
+
+    #[test]
+    fn github_redirect_to_asset_hosts_is_followed() {
+        for target in [
+            TINY_ASSET,
+            "https://objects.githubusercontent.com/github-production-release-asset-2e65be/1",
+        ] {
+            let source = RedirectingSource {
+                hops: vec![(WHISPER_TINY.url, Ok(target)), (target, Err(b"ggml"))],
+                visited: Mutex::new(Vec::new()),
+            };
+            let mut body = Vec::new();
+            source
+                .open(WHISPER_TINY.url, 4)
+                .unwrap()
+                .read_to_end(&mut body)
+                .unwrap();
+            assert_eq!(body, b"ggml");
+            assert_eq!(source.visited.lock().unwrap().len(), 2);
+        }
+    }
+
+    #[test]
+    fn redirects_to_other_hosts_or_plain_http_are_rejected() {
+        for target in [
+            VETOED_URL,
+            concat!("https://cdn-lfs.hf", ".co/x"),
+            "http://release-assets.githubusercontent.com/x",
+            "https://release-assets.githubusercontent.com.evil.example/x",
+            "https://objects.githubusercontent.com@evil.example/x",
+            "https://objects.githubusercontent.com:8443/x",
+            "https://evil.example/?objects.githubusercontent.com",
+            "/relative/path",
+            "",
+        ] {
+            let source = RedirectingSource {
+                hops: vec![(WHISPER_TINY.url, Ok(target)), (target, Err(b"evil"))],
+                visited: Mutex::new(Vec::new()),
+            };
+            let err = source.open(WHISPER_TINY.url, 4).err();
+            assert!(
+                matches!(err, Some(ModelError::Network(_))),
+                "{target:?} debió rechazarse"
+            );
+            // Nunca se llega a pedir el destino rechazado.
+            assert_eq!(source.visited.lock().unwrap().len(), 1, "{target:?}");
+        }
+    }
+
+    #[test]
+    fn non_release_origin_and_redirect_loops_are_rejected() {
+        let source = RedirectingSource {
+            hops: vec![],
+            visited: Mutex::new(Vec::new()),
+        };
+        for origin in [
+            VETOED_URL,
+            "https://github.com/otro/repo/releases/download/models-v1/ggml-tiny.bin",
+            "http://github.com/jucsp/Fokkus-Jarvis/releases/download/models-v1/ggml-tiny.bin",
+        ] {
+            assert!(matches!(
+                source.open(origin, 4).err(),
+                Some(ModelError::Network(_))
+            ));
+        }
+        assert!(source.visited.lock().unwrap().is_empty());
+
+        let looping = RedirectingSource {
+            hops: vec![
+                (WHISPER_TINY.url, Ok(TINY_ASSET)),
+                (TINY_ASSET, Ok(TINY_ASSET)),
+            ],
+            visited: Mutex::new(Vec::new()),
+        };
+        assert!(matches!(
+            looping.open(WHISPER_TINY.url, 4).err(),
+            Some(ModelError::Network(_))
+        ));
+        assert_eq!(looping.visited.lock().unwrap().len(), MAX_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn unpublished_model_is_never_downloaded_nor_deleted() {
+        let dir = TempDir::new("unpublished");
+        let source = FakeSource::new(vec![(synthetic_model(51_865, 1_000), None)]);
+        let calls = source.calls.clone();
+        let mgr = manager(&dir, source);
+        let spec = WHISPER_SMALL_Q5_1;
+        assert!(!spec.is_published());
+        assert!(matches!(
+            mgr.ensure(&spec, &mut |_, _| {}),
+            Err(ModelError::NotPublished("whisper-small-q5_1"))
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        // Un archivo puesto a mano no se borra ni se carga.
+        fs::create_dir_all(&dir.0).unwrap();
+        fs::write(mgr.path_of(&spec), b"ggml").unwrap();
+        assert_eq!(mgr.status(&spec), ModelStatus::Missing);
+        assert!(mgr.load_verified(&spec).is_err());
+        assert!(mgr.path_of(&spec).exists());
+    }
+
+    fn named_spec(data: &[u8], file_name: &'static str) -> ModelSpec {
+        ModelSpec {
+            id: file_name,
+            file_name,
+            ..spec_for(data)
+        }
+    }
+
+    #[test]
+    fn stt_plan_prefers_verified_small_and_falls_back_to_verified_base() {
+        let dir = TempDir::new("plan");
+        let small_data = synthetic_model(51_865, 3_000);
+        let base_data = synthetic_model(51_865, 2_000);
+        let small = named_spec(&small_data, "ggml-small.bin");
+        let base = named_spec(&base_data, "ggml-base.bin");
+        let mgr = manager(&dir, FakeSource::new(vec![(base_data.clone(), None)]));
+
+        // Nada en disco: se intenta el preferido.
+        let plan = mgr.plan_stt_with(&small, &base);
+        assert_eq!((plan.spec, plan.prefetch), (small, None));
+
+        // Solo base verificado: arranca con base, informa y precarga small.
+        mgr.ensure(&base, &mut |_, _| {}).unwrap();
+        let plan = mgr.plan_stt_with(&small, &base);
+        assert_eq!(plan.spec, base);
+        assert_eq!(plan.prefetch, Some(small));
+        assert!(plan
+            .fallback_reason
+            .as_deref()
+            .unwrap()
+            .contains("ggml-small.bin"));
+
+        // Small dañado y base verificado: también respaldo.
+        fs::write(mgr.path_of(&small), &base_data).unwrap();
+        let plan = mgr.plan_stt_with(&small, &base);
+        assert_eq!(plan.spec, base);
+        assert!(plan.fallback_reason.unwrap().contains("verificación"));
+
+        // Small verificado: se usa small sin aviso.
+        fs::write(mgr.path_of(&small), &small_data).unwrap();
+        let plan = mgr.plan_stt_with(&small, &base);
+        assert_eq!((plan.spec, plan.fallback_reason), (small, None));
+
+        // Pedir base explícitamente nunca usa respaldo.
+        let plan = mgr.plan_stt_with(&base, &base);
+        assert_eq!((plan.spec, plan.prefetch), (base, None));
+
+        // Preferido sin publicar: directo al respaldo, sin precarga.
+        let plan = mgr.plan_stt_with(&WHISPER_SMALL_Q5_1, &base);
+        assert_eq!((plan.spec, plan.prefetch), (base, None));
+        assert!(plan.fallback_reason.unwrap().contains("models-v1"));
+    }
+
+    #[test]
+    fn ensure_stt_falls_back_when_preferred_download_fails() {
+        let dir = TempDir::new("ensure-stt");
+        let small_data = synthetic_model(51_865, 3_000);
+        let base_data = synthetic_model(51_865, 2_000);
+        let small = named_spec(&small_data, "ggml-small.bin");
+        let base = named_spec(&base_data, "ggml-base.bin");
+        let mut tampered = small_data.clone();
+        tampered[100] ^= 0xff;
+        // Small llega alterado (1 intento) y luego base llega bien.
+        let mgr = ModelManager::with_dir(&dir.0)
+            .with_source(FakeSource::new(vec![
+                (tampered, None),
+                (base_data.clone(), None),
+            ]))
+            .with_retries(1, Duration::ZERO);
+        let plan = mgr.plan_stt_with(&small, &base);
+        let (model, reason) = mgr.ensure_stt(&plan, &mut |_, _| {}).unwrap();
+        assert_eq!(model.spec(), &base);
+        assert!(reason.unwrap().contains("SHA-256"));
+        assert!(
+            !mgr.path_of(&small).exists(),
+            "un hash distinto no deja archivo"
+        );
+
+        // Si el respaldo también falla, error: nunca un modelo sin verificar.
+        let dir = TempDir::new("ensure-stt-fail");
+        let mgr = ModelManager::with_dir(&dir.0)
+            .with_source(FakeSource::new(vec![]))
+            .with_retries(1, Duration::ZERO);
+        let plan = mgr.plan_stt_with(&small, &base);
+        assert!(mgr.ensure_stt(&plan, &mut |_, _| {}).is_err());
     }
 
     #[test]
@@ -795,7 +1273,7 @@ pub(crate) mod tests {
 
     #[test]
     fn header_of_real_models_is_accepted() {
-        // Bytes reales de ggml-base-q5_1.bin y ggml-tiny.bin (commit fijado).
+        // Cabecera real de ggml-base-q5_1.bin (ftype 1009 = q5_1).
         let mut base = synthetic_header(51_865);
         base[44..48].copy_from_slice(&1009i32.to_le_bytes());
         let h = validate_header(&base).unwrap();

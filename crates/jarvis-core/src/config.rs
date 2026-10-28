@@ -334,6 +334,10 @@ pub struct JarvisConfig {
     /// Máximo de burbujas simultáneas del HUD (1–3, default 3).
     #[serde(default = "default_hud_max_bubbles")]
     hud_max_bubbles: u8,
+    /// Modelo whisper de transcripción (HU-69): `"small-q5_1"` (por defecto)
+    /// o `"base-q5_1"`. Un valor inválido cae al por defecto con aviso; ver
+    /// [`JarvisConfig::stt_model`]. La palabra de activación no depende de esto.
+    pub stt_model: String,
     /// Automatización de escritorio (HU-38, tabla `[automation]`). Va al final:
     /// en TOML las tablas se emiten después de los valores simples.
     pub automation: AutomationConfig,
@@ -347,6 +351,37 @@ pub struct JarvisConfig {
     /// Introspección de notificaciones del escritorio (HU-72, tabla
     /// `[notifications]`).
     pub notifications: NotificationsConfig,
+}
+
+/// Modelo whisper de transcripción seleccionable en `config.toml` (HU-69).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SttModel {
+    /// `ggml-small-q5_1`: más preciso con tecnicismos y español chileno.
+    SmallQ5_1,
+    /// `ggml-base-q5_1`: respaldo más liviano.
+    BaseQ5_1,
+}
+
+impl SttModel {
+    pub const DEFAULT: SttModel = SttModel::SmallQ5_1;
+
+    /// Valor canónico en `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SttModel::SmallQ5_1 => "small-q5_1",
+            SttModel::BaseQ5_1 => "base-q5_1",
+        }
+    }
+
+    /// Interpreta el valor de `config.toml` (sin distinguir mayúsculas ni
+    /// espacios en los extremos).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "small-q5_1" => Some(SttModel::SmallQ5_1),
+            "base-q5_1" => Some(SttModel::BaseQ5_1),
+            _ => None,
+        }
+    }
 }
 
 /// Privacidad de la introspección de notificaciones (HU-72, CA-72.3).
@@ -483,6 +518,7 @@ impl Default for JarvisConfig {
             cli_timeout_secs: 120,
             hud_enabled: true,
             hud_max_bubbles: 3,
+            stt_model: SttModel::DEFAULT.as_str().to_string(),
             automation: AutomationConfig::default(),
             voice_endpoint: VoiceEndpointConfig::default(),
             stt_lexicon: BTreeMap::new(),
@@ -691,6 +727,22 @@ impl JarvisConfig {
     pub fn hud_max_bubbles(&self) -> u8 {
         self.hud_max_bubbles
             .clamp(*HUD_MAX_BUBBLES_RANGE.start(), *HUD_MAX_BUBBLES_RANGE.end())
+    }
+
+    /// Modelo STT elegido (HU-69, CA-69.5). Un valor desconocido cae a
+    /// [`SttModel::DEFAULT`] y devuelve el aviso a registrar; nunca aborta.
+    pub fn stt_model(&self) -> (SttModel, Option<String>) {
+        match SttModel::parse(&self.stt_model) {
+            Some(model) => (model, None),
+            None => (
+                SttModel::DEFAULT,
+                Some(format!(
+                    "stt_model = {:?} no es válido (se admite \"small-q5_1\" o \"base-q5_1\"); se usa {}",
+                    self.stt_model,
+                    SttModel::DEFAULT.as_str()
+                )),
+            ),
+        }
     }
 
     /// Configuración de *endpointing* con todos los valores ya saturados
@@ -1023,6 +1075,31 @@ mod tests {
         assert!(!JarvisConfig::ensure_file(&path).expect("existe"));
         assert!(JarvisConfig::load_from(&path).unwrap().gaming_mode);
         cleanup(&path);
+    }
+
+    #[test]
+    fn stt_model_defaults_to_small_and_invalid_values_fall_back() {
+        let config = JarvisConfig::default();
+        assert_eq!(config.stt_model, "small-q5_1");
+        assert_eq!(config.stt_model(), (SttModel::SmallQ5_1, None));
+        let toml = toml::to_string(&config).expect("serializa");
+        assert!(toml.contains("stt_model = \"small-q5_1\""), "{toml}");
+
+        let config: JarvisConfig = toml::from_str("stt_model = \" Base-Q5_1 \"\n").unwrap();
+        assert_eq!(config.stt_model(), (SttModel::BaseQ5_1, None));
+
+        for bad in ["large-v3", "", "tiny", "../ggml-evil.bin"] {
+            let config = JarvisConfig {
+                stt_model: bad.to_string(),
+                ..JarvisConfig::default()
+            };
+            let (model, warning) = config.stt_model();
+            assert_eq!(model, SttModel::SmallQ5_1, "{bad:?}");
+            assert!(warning.is_some_and(|w| w.contains("small-q5_1")), "{bad:?}");
+        }
+        // Un archivo sin la clave conserva el valor por defecto.
+        let config: JarvisConfig = toml::from_str("gaming_mode = true\n").unwrap();
+        assert_eq!(config.stt_model().0, SttModel::DEFAULT);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, TryRecvError};
-use jarvis_audio::models::{ModelManager, ModelStatus, WHISPER_BASE_Q5_1};
+use jarvis_audio::models::{ModelManager, ModelStatus, SttPlan};
 use jarvis_audio::WhisperEngine;
 use jarvis_core::{AudioLevel, JarvisConfig, JarvisState, Opacity, SphereVisualState};
 use jarvis_render::{OpacityFade, Pixmap, RenderError, SphereRenderer};
@@ -464,12 +464,12 @@ pub enum SttAvailability {
 }
 
 impl SttAvailability {
-    /// Sonda única sobre el gestor de modelos.
-    pub fn probe(manager: &ModelManager) -> Self {
-        match manager.status(&WHISPER_BASE_Q5_1) {
+    /// Sonda única sobre el modelo elegido por el plan (HU-69).
+    pub fn probe(manager: &ModelManager, plan: &SttPlan) -> Self {
+        match manager.status(&plan.spec) {
             ModelStatus::Verified { .. } => SttAvailability::Ready,
             ModelStatus::Missing => {
-                SttAvailability::MissingModel(Some(manager.path_of(&WHISPER_BASE_Q5_1)))
+                SttAvailability::MissingModel(Some(manager.path_of(&plan.spec)))
             }
             ModelStatus::Invalid { reason } => SttAvailability::InvalidModel(reason),
         }
@@ -529,15 +529,17 @@ impl ProgressLog {
 /// Resultado de la carga de whisper en segundo plano.
 pub type SttLoad<T> = Receiver<Result<T, String>>;
 
-/// Verifica (y si falta, descarga) el modelo whisper y lo carga **una sola
-/// vez** en un hilo de fondo (HU-7). Nunca bloquea el arranque ni el render:
-/// el resultado llega por el canal y lo recoge [`poll_stt_loader`].
-pub fn spawn_stt_loader(manager: ModelManager) -> Option<SttLoad<WhisperEngine>> {
+/// Verifica (y si falta, descarga) el modelo whisper del plan y lo carga
+/// **una sola vez** en un hilo de fondo (HU-7). Si el preferido no está
+/// disponible cae al respaldo verificado y lo informa (HU-69, CA-69.6). Nunca
+/// bloquea el arranque ni el render: el resultado llega por el canal y lo
+/// recoge [`poll_stt_loader`].
+pub fn spawn_stt_loader(manager: ModelManager, plan: SttPlan) -> Option<SttLoad<WhisperEngine>> {
     let (tx, rx) = crossbeam_channel::bounded(1);
     let spawned = std::thread::Builder::new()
         .name("jarvis-models".to_string())
         .spawn(move || {
-            let spec = WHISPER_BASE_Q5_1;
+            let spec = plan.spec;
             // Dañado también se descarga: `ensure` lo borra antes.
             if !matches!(manager.status(&spec), ModelStatus::Verified { .. }) {
                 println!(
@@ -555,9 +557,13 @@ pub fn spawn_stt_loader(manager: ModelManager) -> Option<SttLoad<WhisperEngine>>
             };
             let started = Instant::now();
             let result = manager
-                .ensure(&spec, &mut progress)
+                .ensure_stt(&plan, &mut progress)
                 .map_err(|e| format!("modelo no disponible: {e}"))
-                .and_then(|model| {
+                .and_then(|(model, fallback)| {
+                    if let Some(reason) = fallback {
+                        println!("[stt] respaldo: se usa {} porque {reason}", model.spec().id);
+                    }
+                    let spec = *model.spec();
                     let sha = model.sha256().to_string();
                     // El prompt por defecto ya sesga hacia "Jarvis" y conserva
                     // las muletillas (HU-43).
@@ -572,6 +578,18 @@ pub fn spawn_stt_loader(manager: ModelManager) -> Option<SttLoad<WhisperEngine>>
                         })
                 });
             let _ = tx.send(result);
+            // El preferido se descarga después, ya con el STT funcionando:
+            // se usará en el próximo arranque.
+            if let Some(preferred) = plan.prefetch {
+                println!(
+                    "[stt] descargando {} para el próximo arranque…",
+                    preferred.id
+                );
+                match manager.download(&preferred, &mut |_, _| {}) {
+                    Ok(()) => println!("[stt] {} listo; se usará al reiniciar.", preferred.id),
+                    Err(e) => eprintln!("[stt] no se pudo descargar {}: {e}", preferred.id),
+                }
+            }
         });
     match spawned {
         Ok(_) => Some(rx),
@@ -1203,9 +1221,13 @@ mod tests {
         // Un directorio sin modelo se clasifica como modelo faltante.
         let dir = std::env::temp_dir().join(format!("jarvis-stt-probe-{}", std::process::id()));
         let manager = ModelManager::with_dir(&dir);
-        match SttAvailability::probe(&manager) {
+        let plan = manager.plan_stt(&jarvis_audio::models::WHISPER_BASE_Q5_1);
+        match SttAvailability::probe(&manager, &plan) {
             SttAvailability::MissingModel(Some(path)) => {
-                assert_eq!(path, manager.path_of(&WHISPER_BASE_Q5_1));
+                assert_eq!(
+                    path,
+                    manager.path_of(&jarvis_audio::models::WHISPER_BASE_Q5_1)
+                );
             }
             other => panic!("se esperaba MissingModel(Some), se obtuvo {other:?}"),
         }

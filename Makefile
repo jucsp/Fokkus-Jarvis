@@ -2,7 +2,7 @@
 # Cargo y rustc están instalados en ~/.cargo/bin.
 CARGO := $(HOME)/.cargo/bin/cargo
 
-.PHONY: build test check fmt fmt-check lint deny whisper-version run audit clean
+.PHONY: build test check fmt fmt-check lint deny whisper-version models-build run audit clean
 
 build:
 	$(CARGO) build --workspace
@@ -30,6 +30,10 @@ deny:
 whisper-version:
 	scripts/check-whisper-version.sh --self-test
 	scripts/check-whisper-version.sh
+
+# HU-69: pipeline del mantenedor para el release de modelos (sin Hugging Face).
+models-build:
+	scripts/build-whisper-models.sh
 
 run:
 	$(CARGO) run -p jarvis-app

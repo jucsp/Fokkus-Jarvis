@@ -41,9 +41,10 @@ use jarvis_audio::io::{AudioBackend, CpalBackend, InputPort, OutputPort, PortSha
 use jarvis_audio::sessions::{sessions_dir, SessionStore};
 use jarvis_audio::{
     ActivationDetector, AudioEngine, AudioPlayback, ConversationCoordinator, DspThreadConfig,
-    EdgeTtsEngine, EndpointConfig, EngineConfig, EngineControl, ModelManager, ModelStatus,
-    SpeechPriority, TaskConfig, TaskManager, TaskOrigin, TaskRecord, TaskStatus, TtsBackend,
-    VoiceConfig, VoiceDeps, VoiceOrchestrator, VoiceSpeaker, WhisperEngine, WHISPER_BASE_Q5_1,
+    EdgeTtsEngine, EndpointConfig, EngineConfig, EngineControl, ModelManager, ModelSpec,
+    ModelStatus, SpeechPriority, TaskConfig, TaskManager, TaskOrigin, TaskRecord, TaskStatus,
+    TtsBackend, VoiceConfig, VoiceDeps, VoiceOrchestrator, VoiceSpeaker, WhisperEngine,
+    MODELS_RELEASE_TAG,
 };
 use jarvis_automation::{
     ActionRiskLevel, AutomationGuard, Capabilities, CaptureTarget, InputAction, InputSynth, Key,
@@ -988,6 +989,7 @@ fn run() -> ExitCode {
             JarvisConfig::default()
         }
     };
+    let stt_model = stt_model_from(&config);
 
     // Un único núcleo: la esfera, el IPC y el orquestador ven el mismo estado.
     let core = SharedCore::new(JarvisCore::new(config.clone()));
@@ -1158,16 +1160,20 @@ fn run() -> ExitCode {
 
     // STT: sonda única. whisper se verifica (y si falta, se descarga) y se
     // carga una sola vez en segundo plano; la escucha arranca al instalarlo.
-    let model_manager = ModelManager::new().ok();
+    // El modelo preferido (HU-69) cae al respaldo verificado si no está listo.
+    let model_manager = ModelManager::new().ok().map(|mgr| {
+        let plan = mgr.plan_stt(&stt_model);
+        (mgr, plan)
+    });
     let stt = match &model_manager {
-        Some(mgr) => SttAvailability::probe(mgr),
+        Some((mgr, plan)) => SttAvailability::probe(mgr, plan),
         None => SttAvailability::NoDataDir,
     };
     if let Some(warning) = stt.warning() {
         eprintln!("{warning}");
     }
     let mut stt_pending = match model_manager {
-        Some(manager) if orchestrator.is_some() => runtime::spawn_stt_loader(manager),
+        Some((manager, plan)) if orchestrator.is_some() => runtime::spawn_stt_loader(manager, plan),
         _ => None,
     };
 
@@ -1542,6 +1548,16 @@ fn tray_menu_sessions(records: &[TaskRecord]) -> Vec<jarvis_shell::tray::TraySes
 /// backends TTS/STT y el socket IPC. Devuelve un código de error solo si algún
 /// subsistema queda en [`Health::Fail`]; las degradaciones ([`Health::Warn`])
 /// se informan pero no bloquean la salida.
+/// Modelo STT de `config.toml` (HU-69, CA-69.5); un valor inválido cae al
+/// por defecto con aviso.
+fn stt_model_from(config: &JarvisConfig) -> ModelSpec {
+    let (model, warning) = config.stt_model();
+    if let Some(warning) = warning {
+        eprintln!("[config] {warning}");
+    }
+    jarvis_audio::stt_spec(model)
+}
+
 fn run_health_check() -> ExitCode {
     println!(
         "Fokkus-Jarvis {} — diagnóstico de subsistemas",
@@ -1603,42 +1619,56 @@ fn run_health_check() -> ExitCode {
         )),
     }
 
-    // 4. Backend STT: el modelo se verifica y se carga en whisper de verdad.
+    // 4. Backend STT: el modelo elegido (o su respaldo, HU-69) se verifica y
+    //    se carga en whisper de verdad.
+    let stt_model = stt_model_from(&config);
     match ModelManager::new() {
-        Ok(manager) => match manager.status(&WHISPER_BASE_Q5_1) {
-            ModelStatus::Verified { .. } => {
-                let started = std::time::Instant::now();
-                match manager
-                    .load_verified(&WHISPER_BASE_Q5_1)
-                    .map_err(|e| e.to_string())
-                    .and_then(|model| {
-                        WhisperEngine::from_verified(model).map_err(|e| e.to_string())
-                    }) {
-                    Ok(engine) => checks.push((
-                        "STT",
-                        Health::Ok,
-                        format!(
-                            "{} cargado en whisper en {} ms (sha256 {})",
-                            engine.model_id(),
-                            started.elapsed().as_millis(),
-                            engine.model_sha256()
-                        ),
-                    )),
-                    Err(e) => checks.push(("STT", Health::Fail, format!("no carga: {e}"))),
+        Ok(manager) => {
+            let plan = manager.plan_stt(&stt_model);
+            if let Some(reason) = &plan.fallback_reason {
+                checks.push((
+                    "STT respaldo",
+                    Health::Warn,
+                    format!("{} en lugar de {}: {reason}", plan.spec.id, stt_model.id),
+                ));
+            }
+            let spec = plan.spec;
+            match manager.status(&spec) {
+                ModelStatus::Verified { .. } => {
+                    let started = std::time::Instant::now();
+                    match manager
+                        .load_verified(&spec)
+                        .map_err(|e| e.to_string())
+                        .and_then(|model| {
+                            WhisperEngine::from_verified(model).map_err(|e| e.to_string())
+                        }) {
+                        Ok(engine) => checks.push((
+                            "STT",
+                            Health::Ok,
+                            format!(
+                                "{} cargado en whisper en {} ms (sha256 {})",
+                                engine.model_id(),
+                                started.elapsed().as_millis(),
+                                engine.model_sha256()
+                            ),
+                        )),
+                        Err(e) => checks.push(("STT", Health::Fail, format!("no carga: {e}"))),
+                    }
+                }
+                ModelStatus::Missing => checks.push((
+                    "STT",
+                    Health::Warn,
+                    format!(
+                        "{} no descargado aún en {} (se descarga al arrancar desde {MODELS_RELEASE_TAG})",
+                        spec.id,
+                        manager.path_of(&spec).display()
+                    ),
+                )),
+                ModelStatus::Invalid { reason } => {
+                    checks.push(("STT", Health::Fail, format!("modelo corrupto: {reason}")))
                 }
             }
-            ModelStatus::Missing => checks.push((
-                "STT",
-                Health::Warn,
-                format!(
-                    "modelo no descargado aún en {} (se descarga al arrancar)",
-                    manager.path_of(&WHISPER_BASE_Q5_1).display()
-                ),
-            )),
-            ModelStatus::Invalid { reason } => {
-                checks.push(("STT", Health::Fail, format!("modelo corrupto: {reason}")))
-            }
-        },
+        }
         Err(_) => checks.push((
             "STT",
             Health::Warn,

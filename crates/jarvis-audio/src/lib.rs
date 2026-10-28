@@ -74,8 +74,9 @@ pub use io::{
     PlayOutcome, Player,
 };
 pub use models::{
-    default_models_dir, validate_header, HttpSource, ModelError, ModelHeader, ModelManager,
-    ModelSource, ModelSpec, ModelStatus, VerifiedModel, MODELS, WHISPER_BASE_Q5_1, WHISPER_TINY,
+    default_models_dir, stt_spec, validate_header, HttpSource, ModelError, ModelHeader,
+    ModelManager, ModelSource, ModelSpec, ModelStatus, SttPlan, VerifiedModel, MODELS,
+    MODELS_RELEASE_TAG, STT_FALLBACK, WHISPER_BASE_Q5_1, WHISPER_SMALL_Q5_1, WHISPER_TINY,
 };
 pub use notifications::{NotificationIntrospection, NotificationQuery, NotificationSource};
 pub use orchestrator::{
