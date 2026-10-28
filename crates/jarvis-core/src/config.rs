@@ -344,6 +344,46 @@ pub struct JarvisConfig {
     /// `[stt_lexicon]`): `"variante" = "Canónico"`. Se valida al arrancar el
     /// orquestador; `BTreeMap` fija un orden estable para el tope de entradas.
     pub stt_lexicon: BTreeMap<String, String>,
+    /// Introspección de notificaciones del escritorio (HU-72, tabla
+    /// `[notifications]`).
+    pub notifications: NotificationsConfig,
+}
+
+/// Privacidad de la introspección de notificaciones (HU-72, CA-72.3).
+///
+/// El anillo vive solo en memoria; estos valores acotan cuánto y durante
+/// cuánto tiempo se recuerda.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Interruptor de la función (opt-out). Con `false` no se observa el bus.
+    pub introspection: bool,
+    /// Minutos que se recuerda cada notificación.
+    pub ttl_minutes: u32,
+    /// Aplicaciones (id o fragmento del nombre) cuyas notificaciones nunca se
+    /// guardan, además de la lista fija (gestores de contraseñas, 2FA/OTP).
+    pub excluded_apps: Vec<String>,
+}
+
+/// Rango de `notifications.ttl_minutes`.
+pub const NOTIFICATIONS_TTL_MINUTES_RANGE: (u32, u32) = (1, 24 * 60);
+
+impl NotificationsConfig {
+    /// TTL saturado a [`NOTIFICATIONS_TTL_MINUTES_RANGE`].
+    pub fn ttl(&self) -> std::time::Duration {
+        let (min, max) = NOTIFICATIONS_TTL_MINUTES_RANGE;
+        std::time::Duration::from_secs(u64::from(self.ttl_minutes.clamp(min, max)) * 60)
+    }
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            introspection: true,
+            ttl_minutes: 30,
+            excluded_apps: Vec::new(),
+        }
+    }
 }
 
 /// Configuración de la capa "ojos y manos" (HU-38). Apagada por defecto:
@@ -446,6 +486,7 @@ impl Default for JarvisConfig {
             automation: AutomationConfig::default(),
             voice_endpoint: VoiceEndpointConfig::default(),
             stt_lexicon: BTreeMap::new(),
+            notifications: NotificationsConfig::default(),
         }
     }
 }
@@ -935,6 +976,34 @@ mod tests {
         assert_eq!(loaded.stt_lexicon.len(), 2);
         assert_eq!(loaded.stt_lexicon["fokus"], "Fokkus");
         assert!(JarvisConfig::default().stt_lexicon.is_empty());
+        cleanup(&path);
+    }
+
+    #[test]
+    fn notifications_table_is_parsed_and_ttl_is_clamped() {
+        let defaults = JarvisConfig::default().notifications;
+        assert!(defaults.introspection);
+        assert_eq!(defaults.ttl(), std::time::Duration::from_secs(30 * 60));
+        assert!(defaults.excluded_apps.is_empty());
+
+        let path = temp_config_path("notifications");
+        cleanup(&path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "[notifications]\nintrospection = false\nttl_minutes = 0\nexcluded_apps = [\"signal\"]\n",
+        )
+        .unwrap();
+        let loaded = JarvisConfig::load_from(&path).expect("TOML con notificaciones");
+        assert!(!loaded.notifications.introspection);
+        assert_eq!(
+            loaded.notifications.ttl(),
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(
+            loaded.notifications.excluded_apps,
+            vec!["signal".to_string()]
+        );
         cleanup(&path);
     }
 

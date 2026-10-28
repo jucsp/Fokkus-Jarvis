@@ -55,6 +55,10 @@ use crate::conversation::{barge_in, ConversationCoordinator, ConversationError, 
 use crate::dsp::ConnectorSignal;
 use crate::events::{CloseReason, HudEvent, SessionView, TurnId, VoiceEvent};
 use crate::io::{to_output_pcm, AudioEngine, EngineShared, PlayOutcome, Player};
+use crate::notifications::{
+    empty_answer, notification_query, NotificationQuery, NotificationSource,
+    NOTIFICATIONS_UNAVAILABLE_PHRASE,
+};
 use crate::playback::AudioPlayback;
 use crate::router::{
     fuse_ack_and_foreground, resolve_in_roster, voice_aliases, BrainTurnPlanner, PlannerTrace,
@@ -270,6 +274,9 @@ pub struct VoiceConfig {
     /// `[stt_lexicon]`): pares `(variante, forma canónica)`. Vacío = solo
     /// diccionario base embebido.
     pub stt_lexicon: Vec<(String, String)>,
+    /// Introspección de notificaciones del escritorio (HU-72). `None` = no
+    /// disponible: las consultas lo dicen y nunca van a la web.
+    pub notifications: Option<NotificationSource>,
 }
 
 impl Default for VoiceConfig {
@@ -291,6 +298,7 @@ impl Default for VoiceConfig {
             automation_input: None,
             focus_timeout: FOCUS_TIMEOUT,
             stt_lexicon: Vec::new(),
+            notifications: None,
         }
     }
 }
@@ -557,6 +565,14 @@ pub enum LocalCommand {
     },
     /// Acción de pantalla vía `jarvis-automation` ("pausa", "escribe …").
     Screen(ScreenAction),
+    /// Consulta de las notificaciones del escritorio (HU-72): "¿de dónde vino
+    /// esa notificación?". Se responde con plantilla local, nunca con la web.
+    Notifications {
+        query: NotificationQuery,
+        /// `true` si el turno nombra la notificación. Una consulta implícita
+        /// ("¿qué dijo Spectacle?") sin coincidencias vuelve al router.
+        explicit: bool,
+    },
 }
 
 impl LocalCommand {
@@ -1018,6 +1034,13 @@ pub fn local_command(query: &str) -> Option<LocalCommand> {
     Some(command)
 }
 
+/// Consulta de notificaciones (HU-72) sobre el texto ya en minúsculas.
+fn notification_command(text: &str) -> Option<(NotificationQuery, bool)> {
+    let folded = fold_accents(text);
+    let words: Vec<&str> = folded.split_whitespace().collect();
+    notification_query(&words)
+}
+
 fn unconstrained_local_command(query: &str) -> Option<LocalCommand> {
     let text: String = query
         .to_lowercase()
@@ -1051,6 +1074,9 @@ fn unconstrained_local_command(query: &str) -> Option<LocalCommand> {
         Some(command)
     } else if has(LIST_TASK_PHRASES) {
         Some(LocalCommand::ListTasks)
+    } else if let Some((query, explicit)) = notification_command(&text) {
+        // HU-72 (CA-72.5): antes de cualquier ruta web.
+        Some(LocalCommand::Notifications { query, explicit })
     } else if let Some(command) = web_or_automation_command(query) {
         Some(command)
     } else {
@@ -2276,6 +2302,7 @@ impl VoiceOrchestrator {
                 launcher: Arc::clone(&config.launcher),
                 automation_kill: config.automation_kill.clone(),
                 automation_input: config.automation_input.clone(),
+                notifications: config.notifications.clone(),
                 stats: Arc::clone(&stats),
                 ready: Arc::clone(&ready),
                 speaking: None,
@@ -3449,6 +3476,8 @@ struct BrainLoop {
     automation_kill: Option<AutomationKill>,
     /// Entrada sintética para órdenes de pantalla (HU-38).
     automation_input: Option<AutomationInput>,
+    /// Introspección de notificaciones (HU-72).
+    notifications: Option<NotificationSource>,
     stats: Arc<VoiceStats>,
     ready: Arc<AtomicBool>,
     /// Locución en curso: (generación, qué hacer al terminar).
@@ -3999,6 +4028,27 @@ impl BrainLoop {
     }
 
     /// "¿Qué tareas tengo?": tareas vivas y resultados por decir.
+    /// Responde una consulta de notificaciones con plantilla local (HU-72).
+    ///
+    /// El contenido de la notificación solo se **habla**: no pasa por
+    /// `local_command`, ni por el router, ni por el cerebro (CA-72.4).
+    fn answer_notifications(&mut self, query: &NotificationQuery, explicit: bool, turn: &str) {
+        let source = self
+            .notifications
+            .clone()
+            .filter(|source| source.is_available());
+        let answer = source.as_ref().and_then(|source| source.answer(query));
+        let phrase = match (answer, &source) {
+            (Some(answer), _) => answer,
+            // "¿Qué dijo Einstein?" no era sobre notificaciones.
+            (None, _) if !explicit => return self.route_turn(turn),
+            (None, None) => NOTIFICATIONS_UNAVAILABLE_PHRASE.to_string(),
+            (None, Some(_)) => empty_answer(query),
+        };
+        self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+        self.say(&phrase, AfterSpeech::Listen);
+    }
+
     fn list_tasks(&mut self) {
         self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
         let Some(tasks) = self.tasks.clone() else {
@@ -4125,6 +4175,10 @@ impl BrainLoop {
                 }
             }
             Some(LocalCommand::Screen(action)) => self.screen_action(&action),
+            Some(LocalCommand::Notifications {
+                query: notification,
+                explicit,
+            }) => self.answer_notifications(&notification, explicit, query),
             // HU-63: el turno conversacional (o compuesto) lo decide el router.
             None => self.route_turn(query),
         }

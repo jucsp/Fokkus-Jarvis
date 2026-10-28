@@ -41,6 +41,7 @@ pub mod events;
 pub mod incompleteness;
 pub mod io;
 pub mod models;
+pub mod notifications;
 pub mod orchestrator;
 pub mod playback;
 pub mod router;
@@ -76,6 +77,7 @@ pub use models::{
     default_models_dir, validate_header, HttpSource, ModelError, ModelHeader, ModelManager,
     ModelSource, ModelSpec, ModelStatus, VerifiedModel, MODELS, WHISPER_BASE_Q5_1, WHISPER_TINY,
 };
+pub use notifications::{NotificationIntrospection, NotificationQuery, NotificationSource};
 pub use orchestrator::{
     AppLauncher, AudioSink, AutomationInput, AutomationKill, CaptureControl, EngineControl,
     LocalClock, VoiceConfig, VoiceDeps, VoiceOrchestrator, VoiceSpeaker, VoiceStatsSnapshot,

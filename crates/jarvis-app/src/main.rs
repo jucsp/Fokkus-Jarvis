@@ -24,6 +24,7 @@
 mod diag;
 mod hud;
 mod logging;
+mod notifications;
 mod presence;
 mod runtime;
 mod settings;
@@ -1076,6 +1077,13 @@ fn run() -> ExitCode {
         );
     }
 
+    // Introspección de notificaciones (HU-72): monitor-only en el bus de
+    // sesión; con `[notifications] introspection = false` no abre conexión.
+    let desktop_notifications = Arc::new(notifications::DesktopNotifications::start(
+        &config.notifications,
+    ));
+    println!("[notificaciones] {}", desktop_notifications.describe());
+
     // Orquestador de voz (HU-9).
     let orchestrator = engine.as_ref().and_then(|engine| {
         let deps = VoiceDeps {
@@ -1113,6 +1121,9 @@ fn run() -> ExitCode {
                 .iter()
                 .map(|(variant, canonical)| (variant.clone(), canonical.clone()))
                 .collect(),
+            notifications: Some(
+                Arc::clone(&desktop_notifications) as jarvis_audio::NotificationSource
+            ),
             ..VoiceConfig::default()
         };
         match VoiceOrchestrator::start(deps, config) {
@@ -1386,8 +1397,8 @@ fn run() -> ExitCode {
     );
 
     // Apagado ordenado: automatización en curso → script de KWin →
-    // superficie → orquestador (y coordinador) → streams y DSP → IPC (borra
-    // el socket) → lock.
+    // superficie → orquestador (y coordinador) → monitor de notificaciones →
+    // streams y DSP → IPC (borra el socket) → lock.
     if automation.is_acting() {
         automation.kill(KillReason::Shutdown);
     }
@@ -1406,6 +1417,8 @@ fn run() -> ExitCode {
         }
     }
     drop(orchestrator);
+    desktop_notifications.shutdown();
+    drop(desktop_notifications);
     if let Some(engine) = engine.as_mut() {
         engine.shutdown();
     }

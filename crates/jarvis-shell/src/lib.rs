@@ -6,8 +6,9 @@
 //!   `zwlr_layer_shell_v1` (KWin, Hyprland, Sway…).
 //! - [`HeadlessSurface`]: sin ventana; valida frames y regula el ritmo del bucle.
 //!
-//! [`window_watch`] detecta ventanas a pantalla completa (HU-35) y [`tray`]
-//! publica el icono de la bandeja del sistema (StatusNotifierItem).
+//! [`window_watch`] detecta ventanas a pantalla completa (HU-35), [`tray`]
+//! publica el icono de la bandeja del sistema (StatusNotifierItem) y
+//! [`notification_watch`] observa las notificaciones del escritorio (HU-72).
 //!
 //! El backend `winit` (X11, Windows, macOS, GNOME) llega en otra tarea.
 
@@ -18,6 +19,7 @@ pub use jarvis_core::Opacity;
 
 mod headless;
 pub mod menu;
+pub mod notification_watch;
 #[cfg(all(test, target_os = "linux"))]
 mod test_bus;
 pub mod tray;
