@@ -200,6 +200,41 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
+## 🧵 Épica 14 (E-14): Hilo Central + Sub-sesiones Ramificadas — ✅ v0.3.0
+- _Propuesta técnica:_ [`docs/specs/propuesta-multi-sesiones-subhilos.md`](docs/specs/propuesta-multi-sesiones-subhilos.md)
+- [x] **HU-59** Normalización léxica STT para clasificación (`text/normalize.rs`) · **HU-60** subagentes desacoplados · **HU-61** subcomando `task run` [Fase A]
+- [x] **HU-62** Gestor de sub-sesiones persistentes · **HU-63** `TurnRouter` con planificador · **HU-64** direccionamiento verbal y foco · **HU-65** roster en contexto efímero [Fase B]
+- [x] **HU-66** Protocolo IPC y CLI de sub-sesiones · **HU-67/68** chips HUD, menú de bandeja y métricas de enrutamiento [Fase C]
+
+---
+
+## 🛡️ Épica 15 (E-15): Excelencia Conversacional, STT Seguro e Introspección Nativa del Sistema (Grado Comercial)
+- _SDD:_ [`docs/specs/sdd-epica-15-excelencia-conversacional.md`](docs/specs/sdd-epica-15-excelencia-conversacional.md)
+- _Contexto de negocio:_ Jarvis transcribe mal tecnicismos y jerga chilena, abre Google sin que se lo pidan (incluso cuando el usuario dice "no busques en Google") y no sabe de qué aplicación vienen las notificaciones del escritorio. Restricciones: 100 % local y gratuito, **Hugging Face vetado**, sin root y sin `pip`.
+- _Versión objetivo:_ v0.4.0
+
+### HU-69: STT `small-q5_1` con orígenes de descarga soberanos (sin Hugging Face)
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-audio/src/models.rs`, `stt.rs`, `crates/jarvis-core` (config), `crates/jarvis-app` (`runtime.rs`, `main.rs`), `scripts/`, GitHub Releases.
+- 📌 _Objetivo técnico:_ Usar `small-q5_1` por defecto y `base-q5_1` como respaldo. Migrar **los tres** modelos (tiny, base y small; hoy los dos actuales salen de HF) a GitHub Releases propios con SHA-256 y tamaño fijados y redirecciones limitadas a hosts de GitHub. El CDN de OpenAI solo publica `.pt`, así que el mantenedor convierte y cuantiza offline con un pipeline reproducible y sin `pip`. RAM y latencia se miden, no se suponen.
+
+### HU-70: Corrector léxico/fonético determinista (tecnicismos y jerga chilena)
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-audio/src/text/` (módulo nuevo, separado de `normalize.rs` de HU-59), `stt.rs` (`initial_prompt`), config `[stt_lexicon]`.
+- 📌 _Objetivo técnico:_ Corrección post-STT por palabra completa y frase más larga que conserve tildes y mayúsculas, con < 1 ms por turno, diccionario base de ≥ 60 entradas con tabla de negativos y extensión acotada del usuario que no pueda inyectar wake-word ni comandos de anulación.
+
+### HU-71: Erradicación de `bare_search` y restricciones negativas del turno
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-audio/src/orchestrator.rs` (`local_command`, `site_request`, `bare_search`), `router/` (`TurnPlan`, planificador), `brain/client.rs`.
+- 📌 _Objetivo técnico:_ "Busca X" sin sitio deja de ir a Google. Una negación explícita ("no busques en Google") pasa a ser una restricción dura `no_web` que se extrae **antes** de `local_command` y que ni las heurísticas, ni el planificador, ni el cerebro pueden saltarse. Bug actual: `site_request` abre Google con "no busques en Google, dime X".
+
+### HU-72: Introspección nativa de notificaciones de escritorio vía D-Bus
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-shell` (zbus), `crates/jarvis-audio/src/orchestrator.rs`, `crates/jarvis-core`, `crates/jarvis-app`.
+- 📌 _Objetivo técnico:_ Monitor monitor-only de `org.freedesktop.Notifications.Notify` en el bus de sesión (sin root), con emisor verificado por PID → `/proc/<pid>/exe`. Anillo solo en memoria, con TTL, exclusiones y enmascarado de OTP. El contenido se trata como dato no confiable (anti inyección de prompt) y las preguntas sobre el origen se responden en local, sin web.
+
+---
+
 ## 🧾 Deuda técnica
 
 - [ ] **Cablear el pipeline de voz en el binario** (hallazgo QA v0.2.1, bloqueante para "escucha y habla"): `jarvis-app` nunca abre streams `cpal` ni lanza `spawn_dsp_thread`/VAD/`WhisperEngine`/`ClaudeClient`/salida TTS. `start_listening()` solo cambia la máquina de estados. Los componentes existen y están testeados en `jarvis-audio`; falta el orquestador captura → DSP → VAD/endpointing → STT → activación → `run_turn_streaming` → playback. Brief listo para DeepSeek V4 Pro: [`docs/specs/brief-hu9-orquestador-voz.md`](docs/specs/brief-hu9-orquestador-voz.md) (HU-ORQ-1 a HU-ORQ-5).
