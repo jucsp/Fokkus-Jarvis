@@ -140,6 +140,16 @@ const SCRIPT: &[&str] = &[
     "Jarvis, deja un monitor ping corriendo en segundo plano", // 25: tarea operacional (HU-57)
     "Jarvis, detén el proceso",                              // 26: cancelación flexible (HU-57)
     "Jarvis, revísame las PR de Felipe en segundo plano mientras me sintetizas un mensaje para Oscar", // 27: compuesto (HU-63)
+    "Jarvis, ¿cómo va lo de las PR?",                        // 28: §3.8 paso 3 (HU-64)
+    "Jarvis, en la revisión de PRs, enfócate en el módulo de pagos", // 29: paso 4
+    "Jarvis, entra al hilo de PRs",                          // 30: paso 7
+    "Jarvis, léeme lo de la 214",                            // 31: paso 8
+    "Jarvis, vuelve al hilo principal",                      // 32: paso 9
+    "Jarvis, cierra el hilo de los logs",                    // 33: paso 10
+    "Jarvis, cancela la de Felipe",                          // 34: CA-2
+    "Jarvis, ¿cómo va?",                                     // 35: CA-3
+    "Jarvis, abre otro hilo para revisar los logs de Melón", // 36: paso 5
+    "Jarvis, y también agrega el módulo de facturas",        // 37: continuación anafórica
 ];
 
 struct ScriptTranscriber;
@@ -2461,4 +2471,193 @@ fn screen_commands_without_automation_answer_locally() {
     h.wait_spoken_and_listening(0, 0);
     assert_eq!(h.stats().local_commands, 1);
     assert!(brain.queries().is_empty(), "no cae al cerebro CLI");
+}
+
+// ------------------------------------------------------------ HU-64 foco
+
+/// Respuesta del planificador (y de los subagentes) para el guion §3.8.
+const HU64_PLANNER_REPLY: &str = r#"{"foreground": "Sintetiza un mensaje breve para Oscar.", "spawn": [{"title": "la revisión de PR de Felipe", "aliases": ["prs", "felipe"], "profile": "read_only", "instruction": "Revisa los PR abiertos de Felipe"}], "route": [], "query": [], "control": []}"#;
+
+impl Harness {
+    /// Dice la línea y devuelve lo que Jarvis locutó en ese turno (HUD).
+    fn spoken(&self, line: usize) -> String {
+        self.say_line(line);
+        let events = self.hud_until(|e| matches!(e, HudEvent::JarvisDone { .. }));
+        let text = events
+            .iter()
+            .filter_map(|e| match e {
+                HudEvent::JarvisPhrase { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.wait_state(JarvisState::Listening);
+        text
+    }
+
+    fn task_count(&self) -> usize {
+        self.orchestrator
+            .tasks()
+            .expect("gestor de tareas")
+            .list()
+            .len()
+    }
+}
+
+/// Arnés con #1 "la revisión de PR de Felipe" abierta (paso 1 de §3.8).
+fn hu64_harness(name: &str, config: VoiceConfig) -> (Harness, Arc<FakeBrain>) {
+    let brain = FakeBrain::new("Para Oscar: listo.");
+    let factory = FakeFactory::new(HU64_PLANNER_REPLY, Duration::ZERO);
+    let h = harness_full(
+        name,
+        Some(brain.clone()),
+        config,
+        Duration::ZERO,
+        Some(factory as Arc<dyn BrainFactory>),
+    );
+    h.spoken(27);
+    wait_until("sub-sesión de PRs", || h.task_count() == 1);
+    (h, brain)
+}
+
+#[test]
+fn reference_script_steps_run_through_the_brain_loop_hu64() {
+    // CA-1: pasos 3, 4, 7, 8, 9 y 10 de §3.8 con cerebro falso.
+    let (h, brain) = hu64_harness("hu64-guion", tasks_config("hu64-guion"));
+    let central = brain.queries().len();
+
+    // Paso 3: "¿cómo va lo de las PR?" → estado de #1, sin LLM.
+    let said = h.spoken(28);
+    assert!(said.contains("la revisión de PR de Felipe"), "{said}");
+
+    // Paso 4: instrucción dirigida → route(#1).
+    let said = h.spoken(29);
+    assert!(
+        said.contains("Le pasé la indicación a la revisión de PR de Felipe."),
+        "{said}"
+    );
+    wait_until("indicación encolada", || h.task_count() == 2);
+    let tasks = h.orchestrator.tasks().unwrap();
+    assert!(tasks.list()[1]
+        .prompt
+        .contains("enfócate en el módulo de pagos"));
+
+    // Paso 5: segundo hilo.
+    let said = h.spoken(36);
+    assert!(said.contains("logs"), "{said}");
+    wait_until("hilo de logs", || h.task_count() == 3);
+
+    // Paso 7: foco.
+    let said = h.spoken(30);
+    assert!(
+        said.contains("Estoy en la revisión de PR de Felipe."),
+        "{said}"
+    );
+
+    // Paso 8: con foco, "léeme lo de la 214" va a #1 y no al hilo central.
+    let said = h.spoken(31);
+    assert!(
+        said.contains("Le pasé la indicación a la revisión de PR de Felipe."),
+        "{said}"
+    );
+    wait_until("continuación encolada", || h.task_count() == 4);
+    assert!(tasks.list()[3].prompt.contains("lo de la 214"));
+
+    // Paso 9: salir del foco; la continuación vuelve al hilo central.
+    let said = h.spoken(32);
+    assert!(said.contains(UNFOCUS_PHRASE), "{said}");
+    h.spoken(37);
+    assert_eq!(
+        h.task_count(),
+        4,
+        "sin foco no se enruta a ninguna sub-sesión"
+    );
+
+    // Paso 10: cerrar por alias.
+    let said = h.spoken(33);
+    assert!(said.starts_with("Cerré") && said.contains("logs"), "{said}");
+    // El subagente falso ya terminó: lo que importa es que sale del roster.
+    assert_eq!(h.spoken(33), NO_SUCH_SESSION_PHRASE);
+
+    // Los turnos dirigidos no pasaron por el cerebro conversacional; solo la
+    // continuación sin foco (paso 9).
+    assert_eq!(brain.queries().len(), central + 1, "{:?}", brain.queries());
+}
+
+#[test]
+fn cancel_by_name_finds_the_felipe_review_hu64() {
+    // CA-2.
+    let (h, _brain) = hu64_harness("hu64-cancela", tasks_config("hu64-cancela"));
+    let said = h.spoken(34);
+    assert_eq!(said, "Cancelé la revisión de PR de Felipe.");
+    // Con el hilo cerrado ya no se encuentra.
+    let said = h.spoken(34);
+    assert_eq!(said, NO_SUCH_SESSION_PHRASE);
+}
+
+#[test]
+fn how_is_it_going_follows_focus_single_session_or_lists_hu64() {
+    // CA-3.
+    let (h, _brain) = hu64_harness("hu64-como-va", tasks_config("hu64-como-va"));
+    // Una sola sesión, sin foco: responde sobre ella.
+    let said = h.spoken(35);
+    assert!(said.contains("la revisión de PR de Felipe"), "{said}");
+
+    // Con varias y sin foco: lista (o avisa que no hay ninguna en curso).
+    h.spoken(36);
+    wait_until("hilo de logs", || h.task_count() == 2);
+    let said = h.spoken(35);
+    assert!(said.contains("hilo"), "listado: {said}");
+    assert!(!said.contains("Le pasé"), "{said}");
+
+    // En foco: responde sobre la enfocada aunque haya varias.
+    h.spoken(30);
+    let said = h.spoken(35);
+    assert!(said.contains("la revisión de PR de Felipe"), "{said}");
+    assert!(!said.contains("logs"), "{said}");
+}
+
+#[test]
+fn focus_expires_after_the_timeout_and_is_announced_hu64() {
+    let config = VoiceConfig {
+        focus_timeout: Duration::from_millis(300),
+        ..tasks_config("hu64-caduca")
+    };
+    let (h, brain) = hu64_harness("hu64-caduca", config);
+    h.spoken(30);
+    // Dentro del plazo la continuación va al foco.
+    h.spoken(37);
+    wait_until("continuación al foco", || h.task_count() == 2);
+
+    std::thread::sleep(Duration::from_millis(350));
+    let central = brain.queries().len();
+    h.spoken(37);
+    assert_eq!(h.task_count(), 2, "con el foco caducado no se enruta");
+    let queries = brain.queries();
+    assert_eq!(queries.len(), central + 1);
+    let last = queries.last().unwrap();
+    assert!(
+        last.contains(UNFOCUS_PHRASE),
+        "se anuncia la caducidad: {last}"
+    );
+    assert!(last.contains("agrega el módulo de facturas"), "{last}");
+}
+
+#[test]
+fn focus_timeout_defaults_to_five_minutes_hu64() {
+    assert_eq!(
+        VoiceConfig::default().focus_timeout,
+        Duration::from_secs(300)
+    );
+    let now = Instant::now();
+    assert!(!focus_expired(
+        now,
+        now + Duration::from_secs(299),
+        FOCUS_TIMEOUT
+    ));
+    assert!(focus_expired(
+        now,
+        now + Duration::from_secs(300),
+        FOCUS_TIMEOUT
+    ));
 }

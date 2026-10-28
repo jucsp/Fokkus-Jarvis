@@ -39,6 +39,7 @@
 //! [`ConnectorSignal::signal`] (el turno nuevo espera el silencio extendido)
 //! y ambos textos se unen en una sola consulta.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
@@ -56,8 +57,9 @@ use crate::events::{CloseReason, HudEvent, TurnId, VoiceEvent};
 use crate::io::{to_output_pcm, AudioEngine, EngineShared, PlayOutcome, Player};
 use crate::playback::AudioPlayback;
 use crate::router::{
-    fuse_ack_and_foreground, BrainTurnPlanner, RouteContext, SessionControl, SessionQuery,
-    SessionRef, SpawnSpec, TurnPlan, TurnPlanner, TurnRouter,
+    fuse_ack_and_foreground, resolve_in_roster, voice_aliases, BrainTurnPlanner, RosterEntry,
+    RouteContext, SessionControl, SessionQuery, SessionRef, SpawnSpec, TurnPlan, TurnPlanner,
+    TurnRouter,
 };
 use crate::sessions::SessionId;
 use crate::speech_queue::{Delivery, DeliveryGate, SpeechPriority};
@@ -85,6 +87,30 @@ pub const NO_TASKS_PHRASE: &str = "No tengo tareas de fondo activadas.";
 
 /// Respuesta cuando se cae la red a mitad de una respuesta (CA-6.4).
 pub const NETWORK_ERROR_PHRASE: &str = "Perdí la conexión. Inténtalo de nuevo en un momento.";
+
+/// Caducidad del foco verbal (HU-64, §3.4): cinco minutos sin turnos dirigidos
+/// a la sub-sesión devuelven el hilo central al mando.
+pub const FOCUS_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `true` si el foco fijado en `at` ya caducó en `now` (HU-64).
+pub fn focus_expired(at: Instant, now: Instant, timeout: Duration) -> bool {
+    now.saturating_duration_since(at) >= timeout
+}
+
+/// Frase al volver al hilo central (HU-64).
+pub const UNFOCUS_PHRASE: &str = "Volvimos al hilo principal.";
+
+/// Frase cuando el usuario nombra una sub-sesión que no existe (HU-64).
+pub const NO_SUCH_SESSION_PHRASE: &str = "No encontré ese hilo.";
+
+/// Sub-sesión abierta por voz, tal como la nombra el usuario (HU-64).
+#[derive(Debug, Clone)]
+struct VoiceThread {
+    /// "la revisión de PR de Felipe".
+    title: String,
+    /// "prs", "felipe"…
+    aliases: Vec<String>,
+}
 
 /// Control del micrófono (lo implementa el motor de audio).
 pub trait CaptureControl: Send + Sync {
@@ -223,6 +249,8 @@ pub struct VoiceConfig {
     /// Manos de la automatización para las órdenes locales de pantalla
     /// ("pausa", "escribe en pantalla …"). `None` = automatización apagada.
     pub automation_input: Option<AutomationInput>,
+    /// Caducidad del foco verbal de una sub-sesión (HU-64).
+    pub focus_timeout: Duration,
 }
 
 impl Default for VoiceConfig {
@@ -242,6 +270,7 @@ impl Default for VoiceConfig {
             tasks: None,
             automation_kill: None,
             automation_input: None,
+            focus_timeout: FOCUS_TIMEOUT,
         }
     }
 }
@@ -1507,27 +1536,64 @@ pub fn time_phrase(hour: u32, minute: u32) -> String {
     format!("{verb} {article} {hour}:{minute:02}.")
 }
 
-/// Resuelve una [`SessionRef`] contra las sub-sesiones abiertas (HU-63).
+/// Resultado de resolver una [`SessionRef`] hablada (HU-64).
+#[derive(Debug)]
+enum Resolution {
+    Found(TaskRecord),
+    /// Varias sub-sesiones coinciden: hay que preguntar cuál.
+    Ambiguous(Vec<TaskRecord>),
+    Missing,
+}
+
+/// Resuelve una [`SessionRef`] contra las sub-sesiones abiertas por voz (HU-64).
 ///
-/// En HU-63 la sub-sesión vive en el [`TaskManager`], así que la referencia se
-/// resuelve contra sus títulos. HU-64 añadirá ordinales ("el primero"), el id
-/// hablado y la desambiguación cuando haya más de una coincidencia; el foco
-/// requerirá el `SessionManager` de HU-62.
-fn resolve_session(tasks: &TaskManager, reference: &SessionRef) -> Option<TaskRecord> {
-    match reference {
-        SessionRef::Id(id) => tasks.get(TaskId::from(*id)),
-        SessionRef::Alias(alias) => tasks
-            .find_by_title(alias)
-            .into_iter()
-            .filter_map(|id| tasks.get(id))
-            .next(),
-        // "la última": la sub-sesión viva más reciente.
-        SessionRef::Latest => tasks
-            .active()
-            .into_iter()
-            .max_by_key(|record| (record.created_at_ms, record.id)),
-        // Sin foco persistido no hay nada que resolver todavía (HU-64).
-        SessionRef::Focused => None,
+/// El roster manda para alias, ordinales ("el primero" = la más antigua,
+/// ordenadas por apertura) y "la última"; el id hablado también vale para
+/// tareas que no abrió el router (p. ej. `task run`).
+fn resolve_session(
+    tasks: &TaskManager,
+    roster: &[RosterEntry],
+    focus: Option<SessionId>,
+    reference: &SessionRef,
+) -> Resolution {
+    let ids = match reference {
+        SessionRef::Id(id) => vec![*id],
+        other => resolve_in_roster(other, roster, focus),
+    };
+    let mut records: Vec<TaskRecord> = ids
+        .into_iter()
+        .filter_map(|id| tasks.get(TaskId::from(id)))
+        .collect();
+    match records.len() {
+        0 => Resolution::Missing,
+        1 => Resolution::Found(records.remove(0)),
+        _ => Resolution::Ambiguous(records),
+    }
+}
+
+/// Id de sub-sesión de una tarea del gestor (los ids hablados caben en `u32`).
+fn session_id(id: TaskId) -> SessionId {
+    SessionId::try_from(id).unwrap_or(SessionId::MAX)
+}
+
+/// Estado en palabras para el roster (§3.5).
+fn status_word(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Queued => "en cola",
+        TaskStatus::Running => "trabajando",
+        TaskStatus::Done => "lista",
+        TaskStatus::Failed => "falló",
+        TaskStatus::Cancelled => "cancelada",
+        TaskStatus::TimedOut => "agotó el tiempo",
+    }
+}
+
+/// "¿La revisión de PR de Felipe o la de Oscar?"
+fn disambiguation_phrase(titles: &[String]) -> String {
+    match titles {
+        [] => NO_SUCH_SESSION_PHRASE.to_string(),
+        [one] => format!("¿{one}?"),
+        [init @ .., last] => format!("¿{} o {last}?", init.join(", ")),
     }
 }
 
@@ -1816,6 +1882,10 @@ impl VoiceOrchestrator {
                 speaking: None,
                 tasks: tasks.clone(),
                 planner,
+                focus: None,
+                focus_at: None,
+                focus_timeout: config.focus_timeout,
+                threads: HashMap::new(),
                 last_assistant_response: None,
                 queue: queue.clone(),
                 last_voice_activity: Arc::clone(&last_voice_activity),
@@ -2971,6 +3041,17 @@ struct BrainLoop {
     tasks: Option<TaskManager>,
     /// Planificador de turnos compuestos (HU-63); `None` = solo heurística.
     planner: Option<Arc<dyn TurnPlanner>>,
+    /// Sub-sesión enfocada por voz (HU-64): a quién van las continuaciones.
+    focus: Option<SessionId>,
+    /// Cuándo se dirigió el usuario por última vez a la sub-sesión enfocada.
+    focus_at: Option<Instant>,
+    /// Caducidad del foco (HU-64); configurable para poder probarla.
+    focus_timeout: Duration,
+    /// Sub-sesiones abiertas por voz (id → título hablado y alias). El
+    /// registro del gestor guarda un título corto pensado para elegir el
+    /// *prompt*; de oído se usan estos. Es el roster que resuelve las
+    /// referencias habladas (HU-64).
+    threads: HashMap<SessionId, VoiceThread>,
     /// Última respuesta completa del asistente (contexto para aprobar
     /// desarrollos, Issue #7).
     last_assistant_response: Option<String>,
@@ -3078,29 +3159,110 @@ impl BrainLoop {
         }
     }
 
-    /// Turno conversacional enrutado (HU-63).
+    /// Turno conversacional enrutado (HU-63, HU-64).
     ///
     /// Sustituye la bifurcación binaria `Heavy/Light` de HU-37: el
     /// [`TurnRouter`] decide si el turno se responde en el hilo central, si abre
-    /// una sub-sesión, o las dos cosas a la vez.
+    /// una sub-sesión, si va a una ya abierta (direccionamiento o foco), o las
+    /// dos cosas a la vez.
     fn route_turn(&mut self, query: &str) {
+        let notice = self.expire_focus(Instant::now());
+        let roster = self.roster();
         let plan = TurnRouter::route(
             query,
             &RouteContext {
                 planner: self.planner.as_deref(),
-                // El roster de sub-sesiones activas llega con HU-65.
-                roster: &[],
+                roster: &roster,
+                focus: self.focus,
             },
         );
-        self.apply_plan(plan, query);
+        self.apply_plan(plan, query, notice);
+    }
+
+    /// Suelta el foco si pasó `focus_timeout` sin turnos dirigidos a él y
+    /// devuelve el aviso hablado (§3.4, etapa 5).
+    fn expire_focus(&mut self, now: Instant) -> Option<String> {
+        let at = self.focus_at?;
+        if !focus_expired(at, now, self.focus_timeout) {
+            return None;
+        }
+        self.clear_focus();
+        Some(UNFOCUS_PHRASE.to_string())
+    }
+
+    fn clear_focus(&mut self) {
+        self.focus = None;
+        self.focus_at = None;
+    }
+
+    /// Fija (o refresca) el foco en `id`.
+    fn set_focus(&mut self, id: SessionId) {
+        self.focus = Some(id);
+        self.focus_at = Some(Instant::now());
+    }
+
+    /// Refresca la caducidad si el turno fue dirigido a la sub-sesión enfocada.
+    fn touch_focus(&mut self, id: SessionId) {
+        if self.focus == Some(id) {
+            self.focus_at = Some(Instant::now());
+        }
+    }
+
+    /// Sub-sesiones abiertas por voz que siguen en el registro, por id.
+    fn roster(&self) -> Vec<RosterEntry> {
+        let Some(tasks) = &self.tasks else {
+            return Vec::new();
+        };
+        let mut roster: Vec<RosterEntry> = self
+            .threads
+            .iter()
+            .filter_map(|(id, thread)| {
+                let record = tasks.get(TaskId::from(*id))?;
+                Some(RosterEntry {
+                    id: *id,
+                    title: thread.title.clone(),
+                    aliases: thread.aliases.clone(),
+                    status: status_word(record.status).to_string(),
+                    progress: None,
+                })
+            })
+            .collect();
+        roster.sort_by_key(|entry| entry.id);
+        roster
+    }
+
+    /// Título hablado de una sub-sesión (el del gestor si no la abrió la voz).
+    fn spoken_title(&self, record: &TaskRecord) -> String {
+        self.threads
+            .get(&session_id(record.id))
+            .map(|thread| thread.title.clone())
+            .unwrap_or_else(|| record.title.clone())
+    }
+
+    /// Resuelve la referencia o devuelve la frase con la que preguntar.
+    fn resolve(&self, tasks: &TaskManager, reference: &SessionRef) -> Result<TaskRecord, String> {
+        let roster = self.roster();
+        match resolve_session(tasks, &roster, self.focus, reference) {
+            Resolution::Found(record) => Ok(record),
+            Resolution::Ambiguous(records) => Err(disambiguation_phrase(
+                &records
+                    .iter()
+                    .map(|record| self.spoken_title(record))
+                    .collect::<Vec<_>>(),
+            )),
+            Resolution::Missing => Err(NO_SUCH_SESSION_PHRASE.to_string()),
+        }
     }
 
     /// Ejecuta el plan en orden (§3.4): `control` → `spawn` → `route`/`query` →
     /// `foreground`, fundiendo los acuses con la respuesta del hilo central en
-    /// una sola locución.
-    fn apply_plan(&mut self, plan: TurnPlan, query: &str) {
+    /// una sola locución. `notice` (foco caducado) abre la locución.
+    fn apply_plan(&mut self, plan: TurnPlan, query: &str, notice: Option<String>) {
         if plan.is_empty() {
-            self.converse_or_say(query);
+            match notice {
+                Some(notice) => self.converse_or_say(&fuse_ack_and_foreground(&notice, query)),
+                None => self.converse_or_say(query),
+            }
             return;
         }
         // Sin gestor de tareas no hay sub-sesiones donde despachar: el hilo
@@ -3110,7 +3272,7 @@ impl BrainLoop {
             return;
         }
 
-        let mut phrases: Vec<String> = Vec::new();
+        let mut phrases: Vec<String> = notice.into_iter().collect();
         for control in &plan.control {
             if let Some(phrase) = self.apply_session_control(control) {
                 phrases.push(phrase);
@@ -3152,6 +3314,18 @@ impl BrainLoop {
         let title = spec.task_title();
         let prompt = spec.task_prompt(self.last_assistant_response.as_deref());
         let id = tasks.submit(title, prompt, TaskOrigin::Voice);
+        let aliases = if spec.aliases.is_empty() {
+            voice_aliases(&spec.title, &spec.instruction, 3)
+        } else {
+            spec.aliases.clone()
+        };
+        self.threads.insert(
+            session_id(id),
+            VoiceThread {
+                title: spec.title.clone(),
+                aliases,
+            },
+        );
         println!(
             "[tareas] #{id} sub-sesión «{}» abierta en segundo plano (perfil {:?}).",
             spec.title, spec.profile
@@ -3161,40 +3335,65 @@ impl BrainLoop {
 
     /// Pasa una instrucción nueva a una sub-sesión ya abierta.
     ///
-    /// En HU-63 la sub-sesión es todavía una tarea del gestor (un disparo): la
-    /// indicación se encola como un turno nuevo con el mismo título. HU-64 la
-    /// enviará con `SessionManager::send` cuando esté cableado.
+    /// La sub-sesión es todavía una tarea del gestor (un disparo): la
+    /// indicación se encola como un turno nuevo con el mismo título, y el hilo
+    /// hablado sigue siendo el original. Pasará a `SessionManager::send` cuando
+    /// el gestor de HU-62 esté cableado en el orquestador.
     fn apply_session_route(&mut self, id: SessionId, instruction: &str) -> Option<String> {
         let tasks = self.tasks.clone()?;
-        let record = tasks.get(TaskId::from(id))?;
+        let Some(record) = tasks.get(TaskId::from(id)) else {
+            return Some(NO_SUCH_SESSION_PHRASE.to_string());
+        };
         self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+        self.touch_focus(id);
         tasks.submit(
             record.title.clone(),
             task_prompt(instruction),
             TaskOrigin::Voice,
         );
-        Some(format!("Le pasé la indicación a {}.", record.title))
+        Some(format!(
+            "Le pasé la indicación a {}.",
+            self.spoken_title(&record)
+        ))
     }
 
-    /// Enfoca, cierra o cancela una sub-sesión.
+    /// Enfoca, desenfoca, cierra o cancela una sub-sesión.
     fn apply_session_control(&mut self, control: &SessionControl) -> Option<String> {
+        if *control == SessionControl::Unfocus {
+            self.clear_focus();
+            return Some(UNFOCUS_PHRASE.to_string());
+        }
         let tasks = self.tasks.clone()?;
+        let reference = match control {
+            SessionControl::Focus(r) | SessionControl::Cancel(r) | SessionControl::Close(r) => r,
+            SessionControl::Unfocus => unreachable!("atendido arriba"),
+        };
+        let record = match self.resolve(&tasks, reference) {
+            Ok(record) => record,
+            Err(phrase) => return Some(phrase),
+        };
+        self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+        let id = session_id(record.id);
+        let title = self.spoken_title(&record);
         match control {
-            // El foco verbal se persiste cuando el orquestador tenga el
-            // `SessionManager` de HU-62 cableado (HU-64).
-            SessionControl::Focus(_) | SessionControl::Unfocus => None,
-            SessionControl::Cancel(reference) => {
-                let record = resolve_session(&tasks, reference)?;
-                self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
-                tasks.cancel(record.id);
-                Some(format!("Cancelé el hilo de {}.", record.title))
+            SessionControl::Focus(_) => {
+                self.set_focus(id);
+                Some(format!("Estoy en {title}."))
             }
-            SessionControl::Close(reference) => {
-                let record = resolve_session(&tasks, reference)?;
-                self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
+            SessionControl::Cancel(_) | SessionControl::Close(_) => {
                 tasks.cancel(record.id);
-                Some(format!("Cerré el hilo de {}.", record.title))
+                self.threads.remove(&id);
+                if self.focus == Some(id) {
+                    self.clear_focus();
+                }
+                let verb = if matches!(control, SessionControl::Cancel(_)) {
+                    "Cancelé"
+                } else {
+                    "Cerré"
+                };
+                Some(format!("{verb} {title}."))
             }
+            SessionControl::Unfocus => unreachable!("atendido arriba"),
         }
     }
 
@@ -3202,30 +3401,38 @@ impl BrainLoop {
     fn apply_session_query(&mut self, query: &SessionQuery) -> Option<String> {
         let tasks = self.tasks.clone()?;
         self.stats.local_commands.fetch_add(1, Ordering::Relaxed);
-        match query {
-            SessionQuery::Status(reference) => {
-                let record = resolve_session(&tasks, reference)?;
-                Some(describe_task(&record))
+        let reference = match query {
+            SessionQuery::Status(r) | SessionQuery::ReadDetail(r) => r,
+            SessionQuery::ListAll => {
+                let titles: Vec<String> = self
+                    .roster()
+                    .into_iter()
+                    .filter(|entry| {
+                        entry.status == status_word(TaskStatus::Running)
+                            || entry.status == status_word(TaskStatus::Queued)
+                    })
+                    .map(|entry| entry.title)
+                    .collect();
+                return Some(match titles.as_slice() {
+                    [] => "No tienes hilos en curso.".to_string(),
+                    [one] => format!("Tienes un hilo en curso: {one}."),
+                    many => format!("Tienes {} hilos en curso: {}.", many.len(), many.join(", ")),
+                });
             }
-            SessionQuery::ReadDetail(reference) => {
-                let record = resolve_session(&tasks, reference)?;
-                Some(match record.detail_path {
-                    Some(path) => {
-                        format!(
-                            "El detalle de {} quedó en {}.",
-                            record.title,
-                            path.display()
-                        )
-                    }
-                    None => format!("{} todavía no tiene detalle.", record.title),
-                })
-            }
-            SessionQuery::ListAll => Some(match tasks.active().as_slice() {
-                [] => "No tienes hilos en curso.".to_string(),
-                [one] => format!("Tienes un hilo en curso: {}.", one.title),
-                many => format!("Tienes {} hilos en curso.", many.len()),
-            }),
-        }
+        };
+        let record = match self.resolve(&tasks, reference) {
+            Ok(record) => record,
+            Err(phrase) => return Some(phrase),
+        };
+        self.touch_focus(session_id(record.id));
+        let title = self.spoken_title(&record);
+        Some(match query {
+            SessionQuery::ReadDetail(_) => match &record.detail_path {
+                Some(path) => format!("El detalle de {title} quedó en {}.", path.display()),
+                None => format!("{title} todavía no tiene detalle."),
+            },
+            _ => describe_task(&TaskRecord { title, ..record }),
+        })
     }
 
     /// Turno del hilo central con el cerebro conversacional (o el aviso de que

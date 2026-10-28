@@ -31,9 +31,22 @@
 //! `SpawnSpec::instruction`, `TurnPlan::foreground` o `route`. No hay
 //! `std::process` en este módulo (CA-4).
 //!
-//! El direccionamiento verbal completo (referencias por id hablado, ordinales,
-//! desambiguación y caducidad de foco) llega con HU-64; aquí el plan ya tiene
-//! los campos y el orquestador ya los ejecuta.
+//! # Direccionamiento verbal (HU-64)
+//!
+//! Antes del planificador, [`addressing_plan`] resuelve la **etapa 2** de §3.4:
+//! reconocer que el usuario está hablándole a una sub-sesión concreta y no al
+//! hilo central. Es determinista (sin LLM, sin latencia) y reconoce:
+//!
+//! - *"en la revisión de PRs, enfócate en el módulo de pagos"* → `route`;
+//! - *"entra al hilo de PRs"*, *"vuelve al hilo principal"* → foco;
+//! - *"¿cómo va lo de las PR?"*, *"léeme el detalle de los logs"* → consulta;
+//! - *"cierra el hilo de los logs"*, *"cancela la de Felipe"* → control.
+//!
+//! Las referencias (`<ref>`) se resuelven a [`SessionRef`]: id hablado ("hilo
+//! 2"), ordinal ("el primero", "el último"), alias coloquial ("felipe", "logs")
+//! o la sesión enfocada. La etapa 5 (modo foco) cierra el módulo: con un foco
+//! activo, una continuación anafórica (*"ahora revisa pagos"*, *"léeme lo de la
+//! 214"*) se enruta a esa sub-sesión en vez de al hilo central.
 
 pub mod planner;
 
@@ -45,7 +58,7 @@ use crate::tasks::{
     dev_task_prompt, is_dev_task, is_operational_task, read_only_task_title, task_prompt,
     task_title, Workload,
 };
-use crate::text::normalize::{normalize, HEAVY_VERBS};
+use crate::text::normalize::{normalize, Normalized, HEAVY_VERBS};
 use serde::{Deserialize, Serialize};
 
 pub use planner::{BrainTurnPlanner, PlanError, PlanRequest, TurnPlanner, PLANNER_TIMEOUT};
@@ -140,12 +153,22 @@ impl SpawnSpec {
     }
 }
 
-/// Referencia verbal a una sub-sesión.
+/// Referencia verbal a una sub-sesión (HU-64).
+///
+/// Es lo que el usuario dice, no lo que existe: la resolución contra el registro
+/// real (títulos, alias, historial) la hace el orquestador, que es el único que
+/// conoce las sub-sesiones abiertas.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionRef {
+    /// Id hablado: "hilo 2" → `Id(2)`.
     Id(SessionId),
+    /// Posición entre las abiertas: "el primero" → `Ordinal(0)`.
+    Ordinal(usize),
+    /// Nombre o alias coloquial: "felipe", "logs", "PR".
     Alias(String),
+    /// La sub-sesión más reciente ("la última").
     Latest,
+    /// La sub-sesión enfocada en este momento.
     Focused,
 }
 
@@ -227,6 +250,9 @@ impl TurnPlan {
 pub struct RosterEntry {
     pub id: SessionId,
     pub title: String,
+    /// Palabras con las que el usuario puede nombrarla por voz (HU-64).
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// Estado en palabras ("trabajando", "lista").
     pub status: String,
     #[serde(default)]
@@ -249,6 +275,15 @@ impl RosterEntry {
             _ => format!("#{} {} — {}", self.id, self.title, self.status),
         }
     }
+
+    /// Palabras con las que se puede nombrar esta sub-sesión (título + alias).
+    fn tokens(&self) -> Vec<String> {
+        let mut tokens = normalize(&self.title).tokens().to_vec();
+        for alias in &self.aliases {
+            tokens.extend(normalize(alias).tokens().iter().cloned());
+        }
+        tokens
+    }
 }
 
 /// Contexto del enrutamiento.
@@ -257,6 +292,8 @@ pub struct RouteContext<'a> {
     pub planner: Option<&'a dyn TurnPlanner>,
     /// Sub-sesiones activas (roster) para el prompt del planificador.
     pub roster: &'a [RosterEntry],
+    /// Sub-sesión enfocada (HU-64): a quién van las continuaciones anafóricas.
+    pub focus: Option<SessionId>,
 }
 
 impl RouteContext<'_> {
@@ -265,6 +302,7 @@ impl RouteContext<'_> {
         Self {
             planner: None,
             roster: &[],
+            focus: None,
         }
     }
 }
@@ -275,11 +313,16 @@ pub struct TurnRouter;
 impl TurnRouter {
     /// Construye el plan del turno.
     ///
-    /// Solo un turno **compuesto** (conector de simultaneidad y una mitad
-    /// pesada junto a otra ligera) llega al planificador; cualquier otro se
-    /// resuelve con la heurística, sin llamar al LLM (CA-3). Si el planificador
-    /// falla o devuelve un plan vacío, se cae en la heurística (CA-2).
+    /// Orden: direccionamiento verbal explícito (HU-64, etapa 2) y modo foco
+    /// (etapa 5) antes que nada; después, solo un turno **compuesto** (conector
+    /// de simultaneidad y una mitad pesada junto a otra ligera) llega al
+    /// planificador, y cualquier otro se resuelve con la heurística sin llamar
+    /// al LLM (CA-3). Si el planificador falla o devuelve un plan vacío, se cae
+    /// en la heurística (CA-2).
     pub fn route(query: &str, ctx: &RouteContext<'_>) -> TurnPlan {
+        if let Some(plan) = addressing_plan(query, ctx) {
+            return plan;
+        }
         if !is_composite(query) {
             return Self::heuristic_plan(query);
         }
@@ -336,6 +379,684 @@ pub fn is_composite(query: &str) -> bool {
         Some((first, second)) => is_heavy(first) != is_heavy(second),
         None => false,
     }
+}
+
+// ─── Etapa 2 y 5: direccionamiento verbal y modo foco (HU-64) ────────────────
+
+/// Sustantivos que nombran una sub-sesión de forma explícita.
+pub const SESSION_NOUNS: &[&str] = &[
+    "hilo",
+    "hilos",
+    "sesion",
+    "sesiones",
+    "tarea",
+    "tareas",
+    "revision",
+    "revisiones",
+    "conversacion",
+    "conversaciones",
+    "subsesion",
+    "subsesiones",
+    "chat",
+    "chats",
+];
+
+/// Determinantes, conectores y muletillas que no forman parte de la referencia.
+const REF_STOPWORDS: &[&str] = &[
+    "el", "la", "los", "las", "lo", "un", "una", "unos", "unas", "de", "del", "al", "a", "que",
+    "mi", "mis", "tu", "tus", "su", "sus", "este", "esta", "estos", "estas", "ese", "esa", "esos",
+    "esas", "aquel", "aquella", "ahi", "oye", "favor",
+];
+
+/// Preposiciones que enlazan el verbo con el sustantivo ("entra **al** hilo").
+const LINK_WORDS: &[&str] = &["a", "al", "de", "del", "en", "hacia", "para"];
+
+/// Verbos que abren el foco en una sub-sesión ya existente.
+const FOCUS_VERBS: &[&str] = &[
+    "entra",
+    "entrar",
+    "entremos",
+    "metete",
+    "vamos",
+    "vete",
+    "pasa",
+    "pasate",
+    "pasemos",
+    "cambia",
+    "cambiar",
+    "cambiate",
+    "vuelve",
+    "volvamos",
+    "volvemos",
+    "regresa",
+    "regresemos",
+];
+
+/// Verbos que cierran una sub-sesión.
+const CLOSE_VERBS: &[&str] = &[
+    "cierra",
+    "cerrar",
+    "cierrame",
+    "cerremos",
+    "finaliza",
+    "finalizar",
+    "acaba",
+    "acabar",
+];
+
+/// Verbos que cancelan una sub-sesión por su nombre.
+const CANCEL_VERBS: &[&str] = &[
+    "cancela",
+    "cancelar",
+    "cancelame",
+    "deten",
+    "detener",
+    "para",
+    "parar",
+    "aborta",
+    "abortar",
+    "mata",
+    "matar",
+    "termina",
+    "terminar",
+];
+
+/// Verbos que piden leer el detalle de una sub-sesión.
+const DETAIL_VERBS: &[&str] = &[
+    "lee",
+    "leeme",
+    "leelo",
+    "dime",
+    "cuentame",
+    "muestra",
+    "muestrame",
+    "detalla",
+    "detallame",
+    "explica",
+    "explicame",
+];
+
+/// Frases que piden el detalle (no la instrucción) de una sub-sesión.
+///
+/// "Lo de la 214" queda **fuera** a propósito: es un elemento *dentro* de la
+/// sub-sesión (el PR 214), no una sub-sesión, y debe enrutarse como instrucción.
+const DETAIL_PHRASES: &[&str] = &[
+    "el detalle",
+    "lo que encontro",
+    "lo que encontraste",
+    "el resultado completo",
+    "el informe completo",
+    "las conclusiones",
+];
+
+/// Frases con las que se pregunta por el estado de una sub-sesión.
+const STATUS_PHRASES: &[&str] = &[
+    "como va",
+    "como van",
+    "que tal va",
+    "que tal van",
+    "como marcha",
+    "como marchan",
+    "en que va",
+    "en que van",
+    "como sigue",
+    "como siguen",
+];
+
+/// Verbos que abren una instrucción dirigida a la sub-sesión enfocada.
+const INSTRUCTION_MARKERS: &[&str] = &[
+    "enfocate",
+    "centrate",
+    "concentrate",
+    "revisa",
+    "revisar",
+    "lee",
+    "leer",
+    "mira",
+    "mirar",
+    "analiza",
+    "analizar",
+    "busca",
+    "buscar",
+    "agrega",
+    "anade",
+    "incluye",
+    "suma",
+    "quita",
+    "elimina",
+    "corrige",
+    "arregla",
+    "prioriza",
+    "descarta",
+    "cambia",
+    "actualiza",
+    "compara",
+    "resume",
+    "completa",
+    "amplia",
+    "profundiza",
+    "continua",
+    "sigue",
+    "empieza",
+    "prueba",
+    "valida",
+    "comprueba",
+    "escribe",
+    "prepara",
+    "haz",
+];
+
+/// Muletillas anafóricas: el turno sigue la conversación anterior.
+const ANAPHORS: &[&str] = &[
+    "tambien", "ademas", "ahora", "luego", "despues", "aparte", "y", "entonces",
+];
+
+/// Verbos que, al inicio del turno, marcan una instrucción sobre el foco.
+const FOCUS_INSTRUCTION_VERBS: &[&str] = &[
+    "agrega",
+    "anade",
+    "incluye",
+    "suma",
+    "quita",
+    "elimina",
+    "sigue",
+    "continua",
+    "enfocate",
+    "centrate",
+    "concentrate",
+    "prioriza",
+    "descarta",
+    "revisa",
+    "lee",
+    "mira",
+    "chequea",
+    "analiza",
+    "busca",
+    "compara",
+    "resume",
+    "detalla",
+    "amplia",
+    "profundiza",
+    "corrige",
+    "arregla",
+    "actualiza",
+    "cambia",
+    "dale",
+    "pon",
+    "vuelve",
+    "dime",
+    "explica",
+    "cuentame",
+    "empieza",
+    "termina",
+    "prueba",
+    "valida",
+    "haz",
+    "apunta",
+    "anota",
+];
+
+/// Temas que siempre son del hilo central, aunque haya un foco activo.
+const GENERAL_TOPICS: &[&str] = &[
+    "el clima",
+    "la hora",
+    "que hora",
+    "un chiste",
+    "las noticias",
+    "quien eres",
+    "que dia es",
+    "que significa",
+    "el pronostico",
+];
+
+/// Aperturas de pregunta general (no de continuación sobre el foco).
+const QUESTION_OPENERS: &[&str] = &[
+    "que", "quien", "quienes", "donde", "cuando", "cuanto", "cuanta", "cuantos", "cuantas", "cual",
+    "cuales", "como", "por",
+];
+
+/// Plan de direccionamiento verbal explícito (etapa 2) o de continuación sobre
+/// la sub-sesión enfocada (etapa 5). `None` deja el turno al resto del router.
+pub fn addressing_plan(query: &str, ctx: &RouteContext<'_>) -> Option<TurnPlan> {
+    let normalized = normalize(query);
+    if normalized.is_empty() {
+        return None;
+    }
+    let spans = word_spans(query);
+    if spans.is_empty() {
+        return None;
+    }
+    let tokens = span_tokens(query, &spans);
+    if is_unfocus_turn(&tokens) {
+        return Some(TurnPlan {
+            control: vec![SessionControl::Unfocus],
+            ..TurnPlan::default()
+        });
+    }
+    if let Some(plan) = addressed_instruction(query, &spans, &tokens, ctx) {
+        return Some(plan);
+    }
+    if let Some(plan) = status_plan(&tokens, ctx) {
+        return Some(plan);
+    }
+    if let Some(plan) = detail_plan(&tokens, ctx) {
+        return Some(plan);
+    }
+    if let Some(plan) = control_plan(&tokens, ctx) {
+        return Some(plan);
+    }
+    focus_continuation(&normalized, query, ctx.focus?)
+}
+
+/// `true` si el turno pide volver al hilo central ("vuelve al hilo principal",
+/// "sal del hilo", "desenfócate").
+fn is_unfocus_turn(tokens: &[String]) -> bool {
+    let has = |word: &str| tokens.iter().any(|token| token == word);
+    if ["desenfoca", "desenfocate", "desenfocar", "desenfocame"]
+        .iter()
+        .any(|word| has(word))
+    {
+        return true;
+    }
+    if tokens
+        .windows(2)
+        .any(|w| w[0] == "hilo" && matches!(w[1].as_str(), "principal" | "central"))
+    {
+        return true;
+    }
+    if tokens
+        .windows(2)
+        .any(|w| matches!(w[0].as_str(), "lo" | "hilo" | "al" | "a") && w[1] == "general")
+    {
+        return true;
+    }
+    let returns = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "vuelve" | "volvamos" | "volvemos" | "regresa" | "regresemos"
+        )
+    });
+    if returns && has("contigo") {
+        return true;
+    }
+    let exits = tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "sal" | "salte" | "salir" | "salgamos" | "suelta" | "sueltame"
+        )
+    });
+    exits && has("hilo")
+}
+
+/// `en (el|la) (hilo|sesión|tarea|revisión) (de)? <ref>, <instrucción>`.
+///
+/// El corte entre la referencia y la instrucción se hace por el verbo de la
+/// instrucción, no por la coma: Whisper no la escribe de forma fiable.
+fn addressed_instruction(
+    query: &str,
+    spans: &[(usize, usize)],
+    tokens: &[String],
+    ctx: &RouteContext<'_>,
+) -> Option<TurnPlan> {
+    let mut i = tokens
+        .iter()
+        .position(|token| !LEADING_FILLERS.contains(&token.as_str()))?;
+    if tokens.get(i).map(String::as_str) != Some("en") {
+        return None;
+    }
+    i += 1;
+    if i < tokens.len() && DETERMINERS.contains(&tokens[i].as_str()) {
+        i += 1;
+    }
+    if i >= tokens.len() || !SESSION_NOUNS.contains(&tokens[i].as_str()) {
+        return None;
+    }
+    i += 1;
+    if i < tokens.len() && LINK_WORDS.contains(&tokens[i].as_str()) {
+        i += 1;
+    }
+    let start = i;
+    let marker =
+        (start..tokens.len()).find(|k| INSTRUCTION_MARKERS.contains(&tokens[*k].as_str()))?;
+    let reference = session_ref(&tokens[start..marker]).unwrap_or_else(|| default_reference(ctx));
+    let id = resolve_reference(&reference, ctx)?;
+    let instruction = query[spans[marker].0..].trim();
+    if instruction.is_empty() {
+        return None;
+    }
+    Some(TurnPlan {
+        route: vec![(id, instruction.to_string())],
+        ..TurnPlan::default()
+    })
+}
+
+/// `¿cómo va(n) …?` → consulta de estado (o listado si no hay a quién preguntar).
+fn status_plan(tokens: &[String], ctx: &RouteContext<'_>) -> Option<TurnPlan> {
+    let end = phrase_end(tokens, STATUS_PHRASES)?;
+    let query = match session_ref(&tokens[end..]) {
+        Some(reference) => SessionQuery::Status(reference),
+        // Sin referencia explícita: el foco manda; si no, la única abierta; si
+        // hay varias, se listan (CA-3).
+        None if ctx.focus.is_some() => SessionQuery::Status(SessionRef::Focused),
+        None if ctx.roster.len() == 1 => SessionQuery::Status(SessionRef::Latest),
+        None => SessionQuery::ListAll,
+    };
+    Some(TurnPlan {
+        query: vec![query],
+        ..TurnPlan::default()
+    })
+}
+
+/// `léeme (el detalle|lo que encontró) (de)? <ref>` → consulta de detalle.
+fn detail_plan(tokens: &[String], ctx: &RouteContext<'_>) -> Option<TurnPlan> {
+    if !tokens
+        .iter()
+        .any(|token| DETAIL_VERBS.contains(&token.as_str()))
+    {
+        return None;
+    }
+    let end = phrase_end(tokens, DETAIL_PHRASES)?;
+    let reference = session_ref(&tokens[end..]).unwrap_or_else(|| default_reference(ctx));
+    Some(TurnPlan {
+        query: vec![SessionQuery::ReadDetail(reference)],
+        ..TurnPlan::default()
+    })
+}
+
+/// Foco, cierre o cancelación de una sub-sesión.
+fn control_plan(tokens: &[String], ctx: &RouteContext<'_>) -> Option<TurnPlan> {
+    // El orden importa: "termina"/"para" valen para cerrar y para cancelar;
+    // cancelar es la lectura que espera el usuario.
+    [
+        (CANCEL_VERBS, ControlKind::Cancel),
+        (CLOSE_VERBS, ControlKind::Close),
+        (FOCUS_VERBS, ControlKind::Focus),
+    ]
+    .into_iter()
+    .find_map(|(verbs, kind)| control_with(tokens, verbs, kind, ctx))
+}
+
+/// Qué control pide el verbo encontrado.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlKind {
+    Focus,
+    Close,
+    Cancel,
+}
+
+fn control_with(
+    tokens: &[String],
+    verbs: &[&str],
+    kind: ControlKind,
+    ctx: &RouteContext<'_>,
+) -> Option<TurnPlan> {
+    let at = tokens
+        .iter()
+        .position(|token| verbs.contains(&token.as_str()))?;
+    let reference = reference_after_verb(&tokens[at + 1..], kind, ctx)?;
+    let control = match kind {
+        ControlKind::Focus => SessionControl::Focus(reference),
+        ControlKind::Close => SessionControl::Close(reference),
+        ControlKind::Cancel => SessionControl::Cancel(reference),
+    };
+    Some(TurnPlan {
+        control: vec![control],
+        ..TurnPlan::default()
+    })
+}
+
+/// Referencia que sigue a un verbo de control.
+///
+/// Exige un sustantivo de sub-sesión o la forma "la de <nombre>": así "para el
+/// monitor" o "compra un cable para el hilo" no se leen como órdenes de control.
+fn reference_after_verb(
+    rest: &[String],
+    kind: ControlKind,
+    ctx: &RouteContext<'_>,
+) -> Option<SessionRef> {
+    let skip = |from: usize| -> usize {
+        let mut i = from;
+        while i < rest.len()
+            && (DETERMINERS.contains(&rest[i].as_str()) || LINK_WORDS.contains(&rest[i].as_str()))
+        {
+            i += 1;
+        }
+        i
+    };
+    // "cancela la de Felipe": artículo + "de" + nombre. (`DETERMINERS` incluye
+    // "de", así que aquí solo se saltan artículos.)
+    let named_at = rest
+        .iter()
+        .position(|token| !matches!(token.as_str(), "el" | "la" | "los" | "las" | "lo"))
+        .unwrap_or(rest.len());
+    let named =
+        named_at > 0 && matches!(rest.get(named_at).map(String::as_str), Some("de" | "del"));
+    let mut i = skip(0);
+    let saw_noun = i < rest.len() && SESSION_NOUNS.contains(&rest[i].as_str());
+    if saw_noun {
+        i = skip(i + 1);
+    }
+    // "cierra el primero", "entra al último": el ordinal ya nombra un hilo.
+    let ordinal = rest[i..]
+        .first()
+        .is_some_and(|token| spoken_ordinal(token).is_some());
+    let has_target = saw_noun || named || ordinal;
+    if !has_target {
+        return None;
+    }
+    match session_ref(&rest[i..]) {
+        Some(reference) => Some(reference),
+        None if kind == ControlKind::Focus && !saw_noun => None,
+        None => Some(default_reference(ctx)),
+    }
+}
+
+/// Referencia por defecto cuando el usuario no nombra la sub-sesión.
+fn default_reference(ctx: &RouteContext<'_>) -> SessionRef {
+    if ctx.focus.is_some() {
+        SessionRef::Focused
+    } else {
+        SessionRef::Latest
+    }
+}
+
+/// Resuelve una referencia contra el roster (`None` si no hay coincidencia).
+fn resolve_reference(reference: &SessionRef, ctx: &RouteContext<'_>) -> Option<SessionId> {
+    match reference {
+        // El id hablado se pasa tal cual: quien conoce el registro es el
+        // orquestador, y responder "no existe" es su trabajo.
+        SessionRef::Id(id) => Some(*id),
+        other => resolve_in_roster(other, ctx.roster, ctx.focus)
+            .first()
+            .copied(),
+    }
+}
+
+/// Candidatas del roster para una referencia hablada (HU-64).
+///
+/// Vacío = nada coincide; más de una = ambigüedad que el orquestador debe
+/// preguntar ("¿La de Felipe o la de Oscar?"). Los ordinales cuentan por id
+/// creciente (el orden de apertura); "la última" es el id mayor.
+pub fn resolve_in_roster(
+    reference: &SessionRef,
+    roster: &[RosterEntry],
+    focus: Option<SessionId>,
+) -> Vec<SessionId> {
+    match reference {
+        SessionRef::Id(id) => roster
+            .iter()
+            .filter(|entry| entry.id == *id)
+            .map(|entry| entry.id)
+            .collect(),
+        SessionRef::Ordinal(index) => {
+            let mut ids: Vec<SessionId> = roster.iter().map(|entry| entry.id).collect();
+            ids.sort_unstable();
+            ids.get(*index).copied().into_iter().collect()
+        }
+        SessionRef::Latest => roster
+            .iter()
+            .map(|entry| entry.id)
+            .max()
+            .into_iter()
+            .collect(),
+        SessionRef::Focused => focus.into_iter().collect(),
+        SessionRef::Alias(alias) => roster_candidates(alias, roster),
+    }
+}
+
+/// `true` si dos palabras nombran lo mismo, tolerando el plural ("prs"/"pr").
+fn same_word(a: &str, b: &str) -> bool {
+    let singular = |word: &str| -> String {
+        match word.strip_suffix("es").or_else(|| word.strip_suffix('s')) {
+            Some(stem) if stem.len() >= 2 => stem.to_string(),
+            _ => word.to_string(),
+        }
+    };
+    a == b || singular(a) == singular(b)
+}
+
+/// Sub-sesiones del roster con el mejor *score* por tokens para `alias`.
+///
+/// Empate = ambigüedad; se devuelven de la más reciente a la más antigua.
+fn roster_candidates(alias: &str, roster: &[RosterEntry]) -> Vec<SessionId> {
+    let needle = normalize(alias);
+    let wanted = needle.tokens();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+    let mut best = 0;
+    let mut ids: Vec<SessionId> = Vec::new();
+    for entry in roster {
+        let tokens = entry.tokens();
+        let score = wanted
+            .iter()
+            .filter(|word| tokens.iter().any(|token| same_word(word, token)))
+            .count();
+        if score == 0 || score < best {
+            continue;
+        }
+        if score > best {
+            best = score;
+            ids.clear();
+        }
+        ids.push(entry.id);
+    }
+    ids.sort_unstable_by(|a, b| b.cmp(a));
+    ids
+}
+
+/// Primera aparición de alguna de `phrases`; devuelve el índice siguiente.
+fn phrase_end(tokens: &[String], phrases: &[&str]) -> Option<usize> {
+    for phrase in phrases {
+        let needle: Vec<String> = normalize(phrase).tokens().to_vec();
+        if needle.is_empty() || needle.len() > tokens.len() {
+            continue;
+        }
+        for start in 0..=(tokens.len() - needle.len()) {
+            if tokens[start..start + needle.len()] == needle[..] {
+                return Some(start + needle.len());
+            }
+        }
+    }
+    None
+}
+
+/// Referencia hablada a partir de sus palabras ("hilo 2", "el primero", "felipe").
+fn session_ref(tokens: &[String]) -> Option<SessionRef> {
+    let kept: Vec<&str> = tokens
+        .iter()
+        .map(String::as_str)
+        .filter(|token| !REF_STOPWORDS.contains(token) && !SESSION_NOUNS.contains(token))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    if kept.len() == 1 {
+        if let Some(id) = spoken_number(kept[0]) {
+            return Some(SessionRef::Id(id));
+        }
+    }
+    for token in &kept {
+        if let Some(ordinal) = spoken_ordinal(token) {
+            return Some(ordinal);
+        }
+    }
+    Some(SessionRef::Alias(kept.join(" ")))
+}
+
+/// Número dicho en voz alta ("2", "dos").
+fn spoken_number(token: &str) -> Option<SessionId> {
+    if !token.is_empty() && token.chars().all(|c| c.is_ascii_digit()) {
+        return token.parse().ok().filter(|n: &SessionId| *n > 0);
+    }
+    match token {
+        "uno" => Some(1),
+        "dos" => Some(2),
+        "tres" => Some(3),
+        "cuatro" => Some(4),
+        "cinco" => Some(5),
+        "seis" => Some(6),
+        _ => None,
+    }
+}
+
+/// Ordinal hablado ("el primero", "el último").
+fn spoken_ordinal(token: &str) -> Option<SessionRef> {
+    let index = match token {
+        "primero" | "primera" | "primer" => 0,
+        "segundo" | "segunda" => 1,
+        "tercero" | "tercera" | "tercer" => 2,
+        "cuarto" | "cuarta" => 3,
+        "quinto" | "quinta" => 4,
+        "sexto" | "sexta" => 5,
+        "ultimo" | "ultima" => return Some(SessionRef::Latest),
+        _ => return None,
+    };
+    Some(SessionRef::Ordinal(index))
+}
+
+/// `true` si el turno es una pregunta general y no una instrucción al foco.
+fn is_general_question(normalized: &Normalized) -> bool {
+    if normalized.has_any(GENERAL_TOPICS) {
+        return true;
+    }
+    let first = normalized
+        .tokens()
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
+    QUESTION_OPENERS.contains(&first)
+}
+
+/// `true` si el turno continúa la conversación de la sub-sesión enfocada.
+fn is_focused_continuation(normalized: &Normalized) -> bool {
+    let first = normalized
+        .tokens()
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
+    if FOCUS_INSTRUCTION_VERBS.contains(&first) || ANAPHORS.contains(&first) {
+        return true;
+    }
+    normalized.has_any(&[
+        "lo de",
+        "otra cosa",
+        "sigue con",
+        "vuelve a",
+        "el detalle de",
+    ])
+}
+
+/// Etapa 5: con un foco activo, una instrucción o continuación va a esa
+/// sub-sesión; una pregunta general sigue en el hilo central.
+fn focus_continuation(normalized: &Normalized, query: &str, focus: SessionId) -> Option<TurnPlan> {
+    if is_general_question(normalized) || !is_focused_continuation(normalized) {
+        return None;
+    }
+    Some(TurnPlan {
+        route: vec![(focus, query.trim().to_string())],
+        ..TurnPlan::default()
+    })
 }
 
 /// Impide que el planificador suba el perfil por su cuenta (CA-4).
@@ -403,6 +1124,14 @@ fn read_only_title(instruction: &str) -> String {
 
 /// Alias por los que el usuario podrá nombrar la sub-sesión.
 fn spawn_aliases(title: &str, instruction: &str) -> Vec<String> {
+    voice_aliases(title, instruction, 3)
+}
+
+/// Palabras útiles con las que el usuario puede nombrar una sub-sesión por voz.
+///
+/// Las usa el router al abrir una sub-sesión (HU-63) y el orquestador al
+/// construir el roster que resuelve las referencias habladas (HU-64).
+pub fn voice_aliases(title: &str, instruction: &str, max: usize) -> Vec<String> {
     let mut aliases: Vec<String> = Vec::new();
     for normalized in [normalize(title), normalize(instruction)] {
         for token in normalized.tokens() {
@@ -412,14 +1141,17 @@ fn spawn_aliases(title: &str, instruction: &str) -> Vec<String> {
             if usable {
                 aliases.push(token.clone());
             }
-            if aliases.len() >= 3 {
+            if aliases.len() >= max {
                 return aliases;
             }
         }
     }
     if aliases.is_empty() {
         // Sin palabras útiles ("revisa eso"): el título tal cual.
-        aliases.push(normalize(title).text().trim().to_string());
+        let whole = normalize(title).text().trim().to_string();
+        if !whole.is_empty() {
+            aliases.push(whole);
+        }
     }
     aliases
 }

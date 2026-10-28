@@ -72,6 +72,7 @@ fn route_with(query: &str, planner: &dyn TurnPlanner) -> TurnPlan {
         &RouteContext {
             planner: Some(planner),
             roster: &[],
+            focus: None,
         },
     )
 }
@@ -251,6 +252,7 @@ fn planner_prompt_is_concise_and_carries_the_roster() {
     let roster = vec![RosterEntry {
         id: 3,
         title: "revisión de PRs de Felipe".into(),
+        aliases: Vec::new(),
         status: "trabajando".into(),
         progress: Some("PR #212, 2 de 5".into()),
     }];
@@ -392,4 +394,168 @@ fn plan_helpers_report_what_they_carry() {
             .as_deref(),
         Some("Abrí la revisión de PR de Felipe en segundo plano.")
     );
+}
+
+// ─── HU-64: direccionamiento verbal y foco ──────────────────────────────────
+
+fn entry(id: SessionId, title: &str, aliases: &[&str]) -> RosterEntry {
+    RosterEntry {
+        id,
+        title: title.into(),
+        aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        status: "trabajando".into(),
+        progress: None,
+    }
+}
+
+/// Roster del guion §3.8: #1 PRs de Felipe, #2 logs de Melón.
+fn script_roster() -> Vec<RosterEntry> {
+    vec![
+        entry(1, "la revisión de PR de Felipe", &["prs", "felipe"]),
+        entry(2, "los logs de Melón", &["logs", "melon"]),
+    ]
+}
+
+fn route_in(query: &str, roster: &[RosterEntry], focus: Option<SessionId>) -> TurnPlan {
+    // Planificador que falla si se le llama: el direccionamiento es determinista.
+    let planner = FakePlanner::failing(PlanError::Timeout);
+    let plan = TurnRouter::route(
+        query,
+        &RouteContext {
+            planner: Some(&planner),
+            roster,
+            focus,
+        },
+    );
+    assert_eq!(planner.calls(), 0, "sin LLM: {query}");
+    plan
+}
+
+#[test]
+fn script_steps_are_addressed_without_the_planner_hu64() {
+    let roster = script_roster();
+    // Paso 3.
+    let plan = route_in("¿Cómo va lo de las PR?", &roster, None);
+    assert_eq!(
+        plan.query,
+        vec![SessionQuery::Status(SessionRef::Alias("pr".into()))]
+    );
+    // Paso 4.
+    let plan = route_in(
+        "En la revisión de PRs, enfócate en el módulo de pagos",
+        &roster,
+        None,
+    );
+    assert_eq!(
+        plan.route,
+        vec![(1, "enfócate en el módulo de pagos".to_string())]
+    );
+    // Paso 7.
+    let plan = route_in("Entra al hilo de PRs", &roster, None);
+    assert_eq!(
+        plan.control,
+        vec![SessionControl::Focus(SessionRef::Alias("pr".into()))]
+    );
+    // Paso 8: con foco, "lo de la 214" es una instrucción a #1.
+    let plan = route_in("Léeme lo de la 214", &roster, Some(1));
+    assert_eq!(plan.route, vec![(1, "Léeme lo de la 214".to_string())]);
+    // Paso 9.
+    let plan = route_in("Vuelve al hilo principal", &roster, Some(1));
+    assert_eq!(plan.control, vec![SessionControl::Unfocus]);
+    // Paso 10.
+    let plan = route_in("Cierra el hilo de los logs", &roster, None);
+    assert_eq!(
+        plan.control,
+        vec![SessionControl::Close(SessionRef::Alias("logs".into()))]
+    );
+}
+
+#[test]
+fn cancel_by_name_resolves_the_felipe_review_hu64() {
+    let roster = script_roster();
+    let plan = route_in("Cancela la de Felipe", &roster, None);
+    let [SessionControl::Cancel(reference)] = plan.control.as_slice() else {
+        panic!("{plan:?}");
+    };
+    assert_eq!(resolve_in_roster(reference, &roster, None), vec![1]);
+}
+
+#[test]
+fn how_is_it_going_depends_on_focus_and_roster_size_hu64() {
+    let roster = script_roster();
+    assert_eq!(
+        route_in("¿Cómo va?", &roster, Some(2)).query,
+        vec![SessionQuery::Status(SessionRef::Focused)]
+    );
+    assert_eq!(
+        route_in("¿Cómo va?", &roster[..1], None).query,
+        vec![SessionQuery::Status(SessionRef::Latest)]
+    );
+    assert_eq!(
+        route_in("¿Cómo va?", &roster, None).query,
+        vec![SessionQuery::ListAll]
+    );
+}
+
+#[test]
+fn spoken_ids_and_ordinals_resolve_against_the_roster_hu64() {
+    let roster = script_roster();
+    let first = SessionRef::Ordinal(0);
+    assert_eq!(resolve_in_roster(&first, &roster, None), vec![1]);
+    assert_eq!(
+        resolve_in_roster(&SessionRef::Ordinal(1), &roster, None),
+        vec![2]
+    );
+    assert!(resolve_in_roster(&SessionRef::Ordinal(5), &roster, None).is_empty());
+    assert_eq!(
+        resolve_in_roster(&SessionRef::Latest, &roster, None),
+        vec![2]
+    );
+    assert_eq!(
+        resolve_in_roster(&SessionRef::Id(2), &roster, None),
+        vec![2]
+    );
+    assert!(resolve_in_roster(&SessionRef::Id(9), &roster, None).is_empty());
+    assert_eq!(
+        route_in("Cierra el primero", &roster, None).control,
+        vec![SessionControl::Close(SessionRef::Ordinal(0))],
+    );
+    assert_eq!(
+        route_in("Entra al hilo 2", &roster, None).control,
+        vec![SessionControl::Focus(SessionRef::Id(2))],
+    );
+}
+
+#[test]
+fn ambiguous_alias_returns_every_tied_candidate_hu64() {
+    let roster = vec![
+        entry(1, "la revisión de PR de Felipe", &["prs", "felipe"]),
+        entry(2, "la revisión de PR de Oscar", &["prs", "oscar"]),
+    ];
+    let both = resolve_in_roster(&SessionRef::Alias("prs".into()), &roster, None);
+    assert_eq!(
+        both,
+        vec![2, 1],
+        "empate: de la más reciente a la más antigua"
+    );
+    let one = resolve_in_roster(&SessionRef::Alias("pr de oscar".into()), &roster, None);
+    assert_eq!(one, vec![2]);
+}
+
+#[test]
+fn focus_keeps_general_questions_in_the_central_thread_hu64() {
+    let roster = script_roster();
+    for query in [
+        "¿Qué hora es en Tokio?",
+        "Cuéntame un chiste",
+        "¿Qué es Rust?",
+    ] {
+        let plan = route_in(query, &roster, Some(1));
+        assert!(plan.route.is_empty(), "{query}: {plan:?}");
+    }
+    // Sin foco, la misma continuación no va a ninguna sub-sesión.
+    let plan = route_in("Ahora revisa pagos", &roster, None);
+    assert!(plan.route.is_empty(), "{plan:?}");
+    let plan = route_in("Ahora revisa pagos", &roster, Some(1));
+    assert_eq!(plan.route, vec![(1, "Ahora revisa pagos".to_string())]);
 }
