@@ -168,6 +168,8 @@ struct FakeBrain {
     fail_network: AtomicBool,
     cancelled: AtomicBool,
     queries: Mutex<Vec<String>>,
+    /// Contexto efímero de cada turno (HU-65), alineado con `queries`.
+    contexts: Mutex<Vec<Option<String>>>,
 }
 
 impl FakeBrain {
@@ -185,6 +187,10 @@ impl FakeBrain {
     fn queries(&self) -> Vec<String> {
         self.queries.lock().unwrap().clone()
     }
+
+    fn contexts(&self) -> Vec<Option<String>> {
+        self.contexts.lock().unwrap().clone()
+    }
 }
 
 impl TokenStream for FakeBrain {
@@ -193,9 +199,23 @@ impl TokenStream for FakeBrain {
         user_text: &str,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion, BrainError> {
+        self.stream_tokens_with_context(None, user_text, on_token)
+    }
+
+    /// Como los clientes reales: el contexto no se mezcla con el turno.
+    fn stream_tokens_with_context(
+        &self,
+        context: Option<&str>,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError> {
         // Como `ClaudeClient::stream`: cada turno arranca sin cancelación.
         self.cancelled.store(false, Ordering::SeqCst);
         self.queries.lock().unwrap().push(user_text.to_string());
+        self.contexts
+            .lock()
+            .unwrap()
+            .push(context.map(String::from));
         if self.fail_network.load(Ordering::SeqCst) {
             return Err(BrainError::Network("red caída".into()));
         }
@@ -2660,4 +2680,137 @@ fn focus_timeout_defaults_to_five_minutes_hu64() {
         now + Duration::from_secs(300),
         FOCUS_TIMEOUT
     ));
+}
+
+// ------------------------------------------------------------------ HU-65
+
+fn roster_record(id: TaskId, title: &str, status: TaskStatus, summary: Option<&str>) -> TaskRecord {
+    let created = now_ms().saturating_sub(4 * 60_000);
+    TaskRecord {
+        id,
+        title: title.to_string(),
+        prompt: String::new(),
+        origin: TaskOrigin::Voice,
+        status,
+        created_at_ms: created + id,
+        finished_at_ms: summary.map(|_| created + 3 * 60_000),
+        spoken_summary: summary.map(String::from),
+        detail_path: None,
+        error: None,
+    }
+}
+
+#[test]
+fn roster_context_fits_the_budget_with_twenty_sessions_hu65() {
+    // CA-1: 20 sesiones con títulos y resultados largos ≤ 1600 caracteres.
+    let long = "revisión exhaustiva del módulo de pagos y facturación ".repeat(4);
+    let tasks: Vec<TaskRecord> = (1..=20)
+        .map(|id| {
+            let status = if id % 2 == 0 {
+                TaskStatus::Running
+            } else {
+                TaskStatus::Done
+            };
+            let summary = (status == TaskStatus::Done).then_some(long.as_str());
+            roster_record(id, &format!("{long} {id}"), status, summary)
+        })
+        .collect();
+    let block = format_roster_context(&tasks, ROSTER_CONTEXT_MAX_CHARS).expect("bloque");
+    assert!(
+        block.chars().count() <= ROSTER_CONTEXT_MAX_CHARS,
+        "{} caracteres",
+        block.chars().count()
+    );
+    assert!(block.starts_with(ROSTER_CONTEXT_HEADER), "{block}");
+    // Las activas van primero y la más reciente encabeza.
+    let first = block.lines().nth(1).unwrap();
+    assert!(first.starts_with("#20 "), "{first}");
+    assert!(block.lines().count() > 2, "cabe más de una sesión: {block}");
+
+    // Presupuesto mínimo: la primera línea entra recortada, nunca se excede.
+    let tiny = format_roster_context(&tasks, 60).expect("bloque recortado");
+    assert!(tiny.chars().count() <= 60, "{tiny}");
+    assert_eq!(tiny.lines().count(), 2, "{tiny}");
+    assert!(format_roster_context(&tasks, ROSTER_CONTEXT_HEADER.len()).is_none());
+}
+
+#[test]
+fn roster_context_is_absent_without_sessions_and_carries_results_hu65() {
+    assert!(format_roster_context(&[], ROSTER_CONTEXT_MAX_CHARS).is_none());
+    let tasks = [
+        roster_record(
+            1,
+            "la revisión de PR de Felipe",
+            TaskStatus::Done,
+            Some("La 214 rompe el cálculo de IVA."),
+        ),
+        roster_record(2, "los logs de Melón", TaskStatus::Running, None),
+    ];
+    let mut progress = HashMap::new();
+    progress.insert(2, "leyendo el log de ayer".to_string());
+    let block =
+        format_roster_context_with_progress(&tasks, &progress, ROSTER_CONTEXT_MAX_CHARS).unwrap();
+    let lines: Vec<&str> = block.lines().collect();
+    assert_eq!(lines[0], ROSTER_CONTEXT_HEADER);
+    assert!(
+        lines[1].starts_with("#2 los logs de Melón — trabajando"),
+        "{block}"
+    );
+    assert!(
+        lines[1].contains("progreso: \"leyendo el log de ayer\""),
+        "{block}"
+    );
+    assert!(
+        lines[2].starts_with("#1 la revisión de PR de Felipe"),
+        "{block}"
+    );
+    assert!(
+        lines[2].contains("resultado: \"La 214 rompe el cálculo de IVA.\""),
+        "{block}"
+    );
+}
+
+#[test]
+fn free_question_reaches_converse_with_the_roster_hu65() {
+    // CA-2 y CA-3: la pregunta libre llega al cerebro con el roster como
+    // contexto; el HUD (y el historial) guardan solo lo que dijo el usuario.
+    let (h, brain) = hu64_harness("hu65-roster", tasks_config("hu65-roster"));
+    let before = brain.queries().len();
+    h.say_line(37);
+    let events = h.hud_until(|e| matches!(e, HudEvent::JarvisDone { .. }));
+    h.wait_state(JarvisState::Listening);
+
+    let queries = brain.queries();
+    assert_eq!(queries.len(), before + 1, "{queries:?}");
+    assert!(
+        queries
+            .last()
+            .unwrap()
+            .ends_with("agrega el módulo de facturas"),
+        "{queries:?}"
+    );
+    let context = brain.contexts().last().cloned().flatten().expect("roster");
+    assert!(context.starts_with(ROSTER_CONTEXT_HEADER), "{context}");
+    assert!(
+        context.contains("#1 la revisión de PR de Felipe"),
+        "{context}"
+    );
+    // Lo que realmente viaja con la implementación por defecto del trait.
+    let sent = crate::conversation::with_context(&context, queries.last().unwrap());
+    assert!(sent.contains("\n\nUsuario: "), "{sent}");
+
+    let user_said: Vec<&str> = events
+        .iter()
+        .filter_map(|e| match e {
+            HudEvent::UserSaid { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(!user_said.is_empty());
+    assert!(
+        user_said
+            .iter()
+            .all(|text| !text.contains(ROSTER_CONTEXT_HEADER)),
+        "{user_said:?}"
+    );
 }

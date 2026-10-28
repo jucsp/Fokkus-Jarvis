@@ -183,6 +183,24 @@ pub trait TokenStream {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion, BrainError>;
 
+    /// Como [`stream_tokens`](Self::stream_tokens) con un bloque de contexto
+    /// efímero (p. ej. `[Sub-sesiones activas]`, HU-65) antepuesto al turno.
+    ///
+    /// El contexto viaja solo en esta petición: las implementaciones con
+    /// historial guardan únicamente `user_text`. La implementación por
+    /// defecto concatena ambos textos (dobles de test sin historial).
+    fn stream_tokens_with_context(
+        &self,
+        context: Option<&str>,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError> {
+        match context {
+            Some(ctx) => self.stream_tokens(&with_context(ctx, user_text), on_token),
+            None => self.stream_tokens(user_text, on_token),
+        }
+    }
+
     /// Cancela la petición en curso (barge-in). Idempotente.
     fn cancel(&self);
 
@@ -197,6 +215,11 @@ pub trait TokenStream {
     }
 }
 
+/// Turno del usuario precedido por un bloque de contexto efímero (HU-65).
+pub fn with_context(context: &str, user_text: &str) -> String {
+    format!("{context}\n\nUsuario: {user_text}")
+}
+
 /// Síntesis de una frase a PCM en memoria, inyectable (tests y orquestador).
 pub type SynthesizeFn = dyn Fn(&str) -> Result<PcmAudio, TtsError> + Send;
 
@@ -207,6 +230,15 @@ impl TokenStream for CliBrain {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion, BrainError> {
         self.stream(user_text, on_token)
+    }
+
+    fn stream_tokens_with_context(
+        &self,
+        context: Option<&str>,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError> {
+        self.stream_with_context(context, user_text, on_token)
     }
 
     fn cancel(&self) {
@@ -226,6 +258,15 @@ impl TokenStream for ClaudeClient {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion, BrainError> {
         self.stream(user_text, on_token)
+    }
+
+    fn stream_tokens_with_context(
+        &self,
+        context: Option<&str>,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError> {
+        self.stream_with_context(context, user_text, on_token)
     }
 
     fn cancel(&self) {
@@ -542,6 +583,23 @@ impl ConversationCoordinator {
         C: TokenStream + ?Sized,
         F: FnMut(&str, &PcmAudio),
     {
+        self.run_turn_streaming_with_context(client, None, user_text, on_phrase_audio)
+    }
+
+    /// Igual que [`run_turn_streaming_with`](Self::run_turn_streaming_with)
+    /// con un bloque de contexto efímero para esta petición (HU-65): el
+    /// roster de sub-sesiones llega al cerebro, pero no al historial.
+    pub fn run_turn_streaming_with_context<C, F>(
+        &mut self,
+        client: &C,
+        context: Option<&str>,
+        user_text: &str,
+        on_phrase_audio: &mut F,
+    ) -> Result<Completion, ConversationError>
+    where
+        C: TokenStream + ?Sized,
+        F: FnMut(&str, &PcmAudio),
+    {
         let generation = self.utterance_generation;
         let mut splitter = PhraseSplitter::new();
         // HU-50: la primera frase sale sola; las siguientes con la misma voz
@@ -554,25 +612,9 @@ impl ConversationCoordinator {
         let mut saw_phrase = false;
         let mut aborted = false;
 
-        let stream_result = client.stream_tokens(user_text, &mut |token: &str| {
-            // Barge-in en curso: detiene el stream y no sintetiza más.
-            if self.interrupted || self.playback.is_stop_requested() {
-                client.cancel();
-                aborted = true;
-                let _ = self
-                    .core
-                    .transition_from(JarvisState::Speaking, JarvisState::Listening);
-                return;
-            }
-
-            splitter.push(token);
-            let now = Instant::now();
-            let mut ready = Vec::new();
-            for phrase in splitter.drain_directed() {
-                ready.extend(grouper.push(phrase, now));
-            }
-            ready.extend(grouper.poll(now));
-            for phrase in ready {
+        let stream_result =
+            client.stream_tokens_with_context(context, user_text, &mut |token: &str| {
+                // Barge-in en curso: detiene el stream y no sintetiza más.
                 if self.interrupted || self.playback.is_stop_requested() {
                     client.cancel();
                     aborted = true;
@@ -582,26 +624,15 @@ impl ConversationCoordinator {
                     return;
                 }
 
-                // Primera frase de respuesta real: `Thinking → Speaking`.
-                if !saw_phrase {
-                    match self
-                        .core
-                        .transition_from(JarvisState::Thinking, JarvisState::Speaking)
-                    {
-                        Some(Ok(_)) => saw_phrase = true,
-                        // Otro hilo cambió el estado (barge-in, silencio):
-                        // la respuesta ya no debe sonar.
-                        Some(Err(_)) | None => {
-                            client.cancel();
-                            aborted = true;
-                            return;
-                        }
-                    }
+                splitter.push(token);
+                let now = Instant::now();
+                let mut ready = Vec::new();
+                for phrase in splitter.drain_directed() {
+                    ready.extend(grouper.push(phrase, now));
                 }
-
-                if let Ok(pcm) = self.synthesize_directed(&phrase) {
-                    // Locución obsoleta por barge-in: descarta y aborta.
-                    if self.is_stale(generation) {
+                ready.extend(grouper.poll(now));
+                for phrase in ready {
+                    if self.interrupted || self.playback.is_stop_requested() {
                         client.cancel();
                         aborted = true;
                         let _ = self
@@ -609,10 +640,38 @@ impl ConversationCoordinator {
                             .transition_from(JarvisState::Speaking, JarvisState::Listening);
                         return;
                     }
-                    on_phrase_audio(&phrase.text, &pcm);
+
+                    // Primera frase de respuesta real: `Thinking → Speaking`.
+                    if !saw_phrase {
+                        match self
+                            .core
+                            .transition_from(JarvisState::Thinking, JarvisState::Speaking)
+                        {
+                            Some(Ok(_)) => saw_phrase = true,
+                            // Otro hilo cambió el estado (barge-in, silencio):
+                            // la respuesta ya no debe sonar.
+                            Some(Err(_)) | None => {
+                                client.cancel();
+                                aborted = true;
+                                return;
+                            }
+                        }
+                    }
+
+                    if let Ok(pcm) = self.synthesize_directed(&phrase) {
+                        // Locución obsoleta por barge-in: descarta y aborta.
+                        if self.is_stale(generation) {
+                            client.cancel();
+                            aborted = true;
+                            let _ = self
+                                .core
+                                .transition_from(JarvisState::Speaking, JarvisState::Listening);
+                            return;
+                        }
+                        on_phrase_audio(&phrase.text, &pcm);
+                    }
                 }
-            }
-        });
+            });
 
         // Remanente pendiente del segmentador al terminar el stream.
         if !aborted {
@@ -1129,6 +1188,63 @@ mod tests {
         assert_eq!(emitted[0].1.sample_rate, 24_000);
         assert_eq!(completion.text, "Hola mundo.");
 
+        cleanup(&dir);
+    }
+
+    /// Cliente que anota cada prompt recibido (implementación por defecto de
+    /// `stream_tokens_with_context`).
+    #[derive(Default)]
+    struct RecordingClient {
+        prompts: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl TokenStream for RecordingClient {
+        fn stream_tokens(
+            &self,
+            user_text: &str,
+            on_token: &mut dyn FnMut(&str),
+        ) -> Result<Completion, BrainError> {
+            self.prompts.borrow_mut().push(user_text.to_string());
+            on_token("Va bien.");
+            Ok(Completion {
+                text: "Va bien.".to_string(),
+                ..Completion::default()
+            })
+        }
+
+        fn cancel(&self) {}
+    }
+
+    #[test]
+    fn turn_streaming_with_context_prefixes_the_prompt_only_when_given_hu65() {
+        let dir = temp_dir("streaming-context");
+        cleanup(&dir);
+        let mut coord = ConversationCoordinator::new(empty_engine(&dir));
+        coord.synth_override = Some(Box::new(|_text| {
+            Ok(PcmAudio::new(vec![0.0, 0.5], 24_000, 1))
+        }));
+        let client = RecordingClient::default();
+        let roster = "[Sub-sesiones activas]\n#1 los logs de Melón — trabajando (2 min)";
+        for context in [Some(roster), None] {
+            coord.start_listening().unwrap();
+            coord.handle_user_utterance("¿cómo va?").unwrap();
+            coord
+                .run_turn_streaming_with_context(&client, context, "¿cómo va?", &mut |_, _| {})
+                .expect("turno con contexto");
+        }
+        coord.start_listening().unwrap();
+        coord.handle_user_utterance("¿y ahora?").unwrap();
+        coord
+            .run_turn_streaming_with(&client, "¿y ahora?", &mut |_, _| {})
+            .expect("turno sin contexto");
+        assert_eq!(
+            *client.prompts.borrow(),
+            vec![
+                format!("{roster}\n\nUsuario: ¿cómo va?"),
+                "¿cómo va?".to_string(),
+                "¿y ahora?".to_string(),
+            ]
+        );
         cleanup(&dir);
     }
 

@@ -30,13 +30,14 @@ mod settings;
 
 use std::cell::{Cell, RefCell};
 use std::io::BufRead;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use jarvis_audio::io::{AudioBackend, CpalBackend, InputPort, OutputPort, PortShared};
+use jarvis_audio::sessions::{sessions_dir, SessionStore};
 use jarvis_audio::{
     ActivationDetector, AudioEngine, AudioPlayback, ConversationCoordinator, DspThreadConfig,
     EdgeTtsEngine, EndpointConfig, EngineConfig, EngineControl, ModelManager, ModelStatus,
@@ -49,7 +50,8 @@ use jarvis_automation::{
 };
 use jarvis_core::single_instance::{self, InstanceError};
 use jarvis_core::{
-    sphere_size_for_pct, FullscreenBehavior, JarvisConfig, JarvisCore, Opacity, SharedCore,
+    sphere_size_for_pct, tasks_dir, FullscreenBehavior, JarvisConfig, JarvisCore, Opacity,
+    SharedCore,
 };
 use jarvis_ipc::{
     speech_priority, IpcClient, IpcError, IpcServer, ServerState, SpeechSink, TaskPort, Utterance,
@@ -89,6 +91,18 @@ enum CliAction {
     /// `--diag-turns [segundos]`: escucha y vuelca las métricas de cierre de
     /// turno y pausas intra-turno (HU-41).
     DiagTurns(Duration),
+    /// `session show <id>` | `task show <id>`: imprime el detalle en markdown
+    /// de una sub-sesión o de una tarea de fondo (HU-65).
+    Show(DetailTarget),
+}
+
+/// Qué detalle imprime `… show <id>` (HU-65).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailTarget {
+    /// `state_dir()/sessions/<id>/detail.md`.
+    Session(u32),
+    /// `state_dir()/tasks/<id>.md` o el `<ms>-<id>.md` más reciente.
+    Task(u64),
 }
 
 /// Perfil de una tarea despachada por `task run` (HU-61).
@@ -276,6 +290,7 @@ fn main() -> ExitCode {
         Ok(CliAction::DevRun(task)) => run_dev_task(&task),
         Ok(CliAction::TaskRun(profile, task)) => run_background_task(profile, &task),
         Ok(CliAction::DiagTurns(window)) => diag::run(window),
+        Ok(CliAction::Show(target)) => run_show(target),
         Err(message) => {
             eprintln!("{message}");
             print_usage();
@@ -295,9 +310,18 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         Some("--diag-turns") => diag::parse_secs(&args[1..]).map(CliAction::DiagTurns),
         Some("input") => parse_input(&args[1..]).map(CliAction::Input),
         Some("dev") => parse_dev(&args[1..]).map(CliAction::DevRun),
+        Some("task") if args.get(1).is_some_and(|verb| verb == "show") => {
+            parse_show_id("task", &args[2..]).map(|id| CliAction::Show(DetailTarget::Task(id)))
+        }
         Some("task") => {
             parse_task(&args[1..]).map(|(profile, task)| CliAction::TaskRun(profile, task))
         }
+        Some("session") => match args.get(1).map(String::as_str) {
+            Some("show") => parse_show_id("session", &args[2..])
+                .and_then(|id| u32::try_from(id).map_err(|_| format!("id inválido: {id}")))
+                .map(|id| CliAction::Show(DetailTarget::Session(id))),
+            _ => Err("uso: session show <id>".into()),
+        },
         Some("capture") => match &args[1..] {
             [] => Ok(CliAction::Capture(PathBuf::from(DEFAULT_CAPTURE_PATH))),
             [path] => Ok(CliAction::Capture(PathBuf::from(path))),
@@ -393,6 +417,72 @@ fn parse_task(args: &[String]) -> Result<(TaskProfile, String), String> {
     }
 }
 
+/// `<kind> show <id>`: el id numérico de la sub-sesión o de la tarea (HU-65).
+fn parse_show_id(kind: &str, args: &[String]) -> Result<u64, String> {
+    match args {
+        [id] => id
+            .trim_start_matches('#')
+            .parse::<u64>()
+            .map_err(|_| format!("id inválido: {id}")),
+        _ => Err(format!("uso: {kind} show <id>")),
+    }
+}
+
+/// Ruta del detalle de una sub-sesión o tarea, si existe (HU-65).
+///
+/// Las tareas escriben `<ms>-<id>.md` (los ids reinician con el proceso), así
+/// que se acepta también `<id>.md` y, entre varios, gana el más reciente.
+fn detail_path(target: DetailTarget, sessions: &Path, tasks: &Path) -> Option<PathBuf> {
+    match target {
+        DetailTarget::Session(id) => {
+            Some(SessionStore::new(sessions).detail_path(id)).filter(|path| path.is_file())
+        }
+        DetailTarget::Task(id) => {
+            let exact = tasks.join(format!("{id}.md"));
+            if exact.is_file() {
+                return Some(exact);
+            }
+            let suffix = format!("-{id}.md");
+            std::fs::read_dir(tasks)
+                .ok()?
+                .flatten()
+                .filter_map(|entry| {
+                    let name = entry.file_name().into_string().ok()?;
+                    let stamp = name.strip_suffix(&suffix)?.parse::<u64>().ok()?;
+                    Some((stamp, entry.path()))
+                })
+                .filter(|(_, path)| path.is_file())
+                .max_by_key(|(stamp, _)| *stamp)
+                .map(|(_, path)| path)
+        }
+    }
+}
+
+/// Imprime el detalle en markdown de una sub-sesión o tarea (HU-65).
+fn run_show(target: DetailTarget) -> ExitCode {
+    let (kind, id) = match target {
+        DetailTarget::Session(id) => ("sub-sesión", u64::from(id)),
+        DetailTarget::Task(id) => ("tarea", id),
+    };
+    let Some(path) = detail_path(target, &sessions_dir(), &tasks_dir()) else {
+        eprintln!("No hay detalle guardado de la {kind} #{id}.");
+        return ExitCode::FAILURE;
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(detail) => {
+            print!("{detail}");
+            if !detail.ends_with('\n') {
+                println!();
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("No pude leer {}: {e}", path.display());
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// Texto de ayuda del binario.
 fn print_usage() {
     println!("Uso: jarvis [OPCIONES]");
@@ -422,6 +512,8 @@ fn print_usage() {
     println!("  task run [--profile <read_only|dev>] <tarea>");
     println!("                              Despacha una revisión, análisis o investigación");
     println!("                              (por defecto read_only, sin prompt de ingeniería).");
+    println!("  task show <id>              Imprime el detalle (markdown) de una tarea.");
+    println!("  session show <id>           Imprime el detalle (markdown) de una sub-sesión.");
     println!();
     println!("Sin opciones, arranca Fokkus-Jarvis, levanta el servidor IPC y deja");
     println!("el socket listo para conexiones de Fokkus IDE.");
@@ -1913,5 +2005,69 @@ mod tests {
             run_background_task(TaskProfile::ReadOnly, "revisa las PR de Felipe"),
             ExitCode::FAILURE
         );
+    }
+
+    #[test]
+    fn show_subcommands_parse_session_and_task_ids_hu65() {
+        assert_eq!(
+            parse_args(&args(&["session", "show", "3"])),
+            Ok(CliAction::Show(DetailTarget::Session(3)))
+        );
+        assert_eq!(
+            parse_args(&args(&["task", "show", "#12"])),
+            Ok(CliAction::Show(DetailTarget::Task(12)))
+        );
+        // `task run` sigue intacto.
+        assert!(matches!(
+            parse_args(&args(&["task", "run", "show", "algo"])),
+            Ok(CliAction::TaskRun(_, task)) if task == "show algo"
+        ));
+        for bad in [
+            &["session"][..],
+            &["session", "show"],
+            &["session", "show", "x"],
+            &["session", "show", "1", "2"],
+            &["session", "show", "99999999999"],
+            &["session", "list"],
+            &["task", "show"],
+            &["task", "show", "-1"],
+        ] {
+            assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn detail_path_finds_session_and_latest_task_detail_hu65() {
+        let root = std::env::temp_dir().join(format!("jarvis-app-hu65-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sessions = root.join("sessions");
+        let tasks = root.join("tasks");
+        std::fs::create_dir_all(sessions.join("4")).unwrap();
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(sessions.join("4").join("detail.md"), "# PR 214\n").unwrap();
+        std::fs::write(tasks.join("100-7.md"), "viejo").unwrap();
+        std::fs::write(tasks.join("200-7.md"), "nuevo").unwrap();
+        std::fs::write(tasks.join("300-17.md"), "otra tarea").unwrap();
+
+        assert_eq!(
+            detail_path(DetailTarget::Session(4), &sessions, &tasks),
+            Some(sessions.join("4").join("detail.md"))
+        );
+        assert_eq!(
+            detail_path(DetailTarget::Session(5), &sessions, &tasks),
+            None
+        );
+        assert_eq!(
+            detail_path(DetailTarget::Task(7), &sessions, &tasks),
+            Some(tasks.join("200-7.md"))
+        );
+        // `<id>.md` exacto tiene prioridad.
+        std::fs::write(tasks.join("7.md"), "exacto").unwrap();
+        assert_eq!(
+            detail_path(DetailTarget::Task(7), &sessions, &tasks),
+            Some(tasks.join("7.md"))
+        );
+        assert_eq!(detail_path(DetailTarget::Task(1), &sessions, &tasks), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

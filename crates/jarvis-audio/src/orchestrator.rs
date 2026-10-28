@@ -103,6 +103,20 @@ pub const UNFOCUS_PHRASE: &str = "Volvimos al hilo principal.";
 /// Frase cuando el usuario nombra una sub-sesión que no existe (HU-64).
 pub const NO_SUCH_SESSION_PHRASE: &str = "No encontré ese hilo.";
 
+/// Presupuesto del bloque de roster que se antepone al turno del hilo central
+/// (HU-65, §3.5): unos 400 tokens. El bloque viaja en la petición al cerebro,
+/// nunca al historial de la conversación.
+pub const ROSTER_CONTEXT_MAX_CHARS: usize = 1600;
+
+/// Cabecera del bloque de contexto efímero que el cerebro no lee en voz alta.
+pub const ROSTER_CONTEXT_HEADER: &str = "[Sub-sesiones activas]";
+
+/// Tope de caracteres del título de una sub-sesión dentro del roster.
+const ROSTER_TITLE_MAX_CHARS: usize = 80;
+
+/// Tope de caracteres de un avance o de un resultado dentro del roster.
+const ROSTER_TEXT_MAX_CHARS: usize = 160;
+
 /// Sub-sesión abierta por voz, tal como la nombra el usuario (HU-64).
 #[derive(Debug, Clone)]
 struct VoiceThread {
@@ -1586,6 +1600,126 @@ fn status_word(status: TaskStatus) -> &'static str {
         TaskStatus::Cancelled => "cancelada",
         TaskStatus::TimedOut => "agotó el tiempo",
     }
+}
+
+/// Bloque de roster para el contexto del hilo central (HU-65, §3.5).
+///
+/// Una línea por sub-sesión: `#id título — estado (duración)`, con el avance o
+/// el último resultado cuando existen. Las activas van primero y, dentro de
+/// cada grupo, la más reciente: es el orden en que el modelo las necesita para
+/// responder "¿cómo va…?" o "¿encontró algo grave?".
+///
+/// Devuelve `None` si no hay sub-sesiones (no se gasta contexto en un bloque
+/// vacío) y **nunca** supera `max_chars`, aunque haya cientos de sesiones.
+pub fn format_roster_context(tasks: &[TaskRecord], max_chars: usize) -> Option<String> {
+    format_roster_context_with_progress(tasks, &HashMap::new(), max_chars)
+}
+
+/// Como [`format_roster_context`], con el avance en curso de cada sub-sesión
+/// (`PROGRESO:` del subagente). El avance no se habla: alimenta el roster.
+pub fn format_roster_context_with_progress(
+    tasks: &[TaskRecord],
+    progress: &HashMap<TaskId, String>,
+    max_chars: usize,
+) -> Option<String> {
+    if tasks.is_empty() || max_chars == 0 {
+        return None;
+    }
+    let mut ordered: Vec<&TaskRecord> = tasks.iter().collect();
+    ordered.sort_by_key(|record| {
+        (
+            !matches!(record.status, TaskStatus::Queued | TaskStatus::Running),
+            std::cmp::Reverse((record.created_at_ms, record.id)),
+        )
+    });
+
+    let now = now_ms();
+    // La cabecera cuenta dentro del presupuesto, igual que cada separador.
+    let mut block = String::from(ROSTER_CONTEXT_HEADER);
+    let mut used = block.chars().count();
+    let mut lines = 0usize;
+    for record in ordered {
+        let line = roster_line(record, progress.get(&record.id), now);
+        let available = max_chars.saturating_sub(used + 1);
+        let line = if line.chars().count() <= available {
+            line
+        } else if lines == 0 && available > 0 {
+            // La primera línea siempre entra recortada: mejor contexto parcial
+            // que un bloque sin sesiones.
+            clip(&line, available)
+        } else {
+            break;
+        };
+        used += line.chars().count() + 1;
+        block.push('\n');
+        block.push_str(&line);
+        lines += 1;
+    }
+    (lines > 0).then_some(block)
+}
+
+/// Una línea del roster (§3.5).
+fn roster_line(record: &TaskRecord, progress: Option<&String>, now: u64) -> String {
+    let mut line = format!(
+        "#{} {} — {} ({})",
+        record.id,
+        clip(&record.title, ROSTER_TITLE_MAX_CHARS),
+        status_word(record.status.clone()),
+        duration_phrase(record, now)
+    );
+    if let Some(progress) = progress
+        .map(String::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        line.push_str(&format!(
+            " — progreso: \"{}\"",
+            clip(progress, ROSTER_TEXT_MAX_CHARS)
+        ));
+    }
+    if let Some(summary) = record
+        .spoken_summary
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        line.push_str(&format!(
+            " — resultado: \"{}\"",
+            clip(summary, ROSTER_TEXT_MAX_CHARS)
+        ));
+    }
+    line
+}
+
+/// Duración legible de una sub-sesión ("4 min"): hasta su fin si terminó, o
+/// hasta ahora si sigue viva.
+fn duration_phrase(record: &TaskRecord, now: u64) -> String {
+    let end = record.finished_at_ms.unwrap_or(now);
+    let secs = end.saturating_sub(record.created_at_ms) / 1_000;
+    if secs >= 60 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{secs} s")
+    }
+}
+
+/// Milisegundos desde la época (marca de tiempo de los registros de tarea).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Recorta a `max_chars` caracteres (en una sola línea) con puntos suspensivos.
+///
+/// Un título o un resumen gigante no puede comerse el presupuesto del bloque.
+fn clip(text: &str, max_chars: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max_chars {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// "¿La revisión de PR de Felipe o la de Oscar?"
@@ -3239,6 +3373,24 @@ impl BrainLoop {
             .unwrap_or_else(|| record.title.clone())
     }
 
+    /// Bloque de contexto `[Sub-sesiones activas]` para el turno del hilo
+    /// central (HU-65, §3.5): qué hilos existen, cómo van y qué encontraron.
+    ///
+    /// Es efímero: [`Self::converse`] lo pasa como contexto de la petición, no
+    /// como turno del usuario, así que no entra al historial ni al HUD.
+    fn roster_context(&self) -> Option<String> {
+        let tasks = self.tasks.as_ref()?;
+        let records: Vec<TaskRecord> = tasks
+            .list()
+            .into_iter()
+            .map(|record| TaskRecord {
+                title: self.spoken_title(&record),
+                ..record
+            })
+            .collect();
+        format_roster_context(&records, ROSTER_CONTEXT_MAX_CHARS)
+    }
+
     /// Resuelve la referencia o devuelve la frase con la que preguntar.
     fn resolve(&self, tasks: &TaskManager, reference: &SessionRef) -> Result<TaskRecord, String> {
         let roster = self.roster();
@@ -3737,11 +3889,15 @@ impl BrainLoop {
         }
         self.stats.turns.fetch_add(1, Ordering::Relaxed);
         let generation = self.coordinator.utterance_generation();
+        // HU-65: el roster viaja como contexto efímero de la petición. El
+        // historial de la conversación guarda solo el turno del usuario.
+        let context = self.roster_context();
 
         let tts = self.tts.clone();
         let hud_turn = self.hud_open;
-        let result = self.coordinator.run_turn_streaming_with(
+        let result = self.coordinator.run_turn_streaming_with_context(
             client,
+            context.as_deref(),
             query,
             &mut |phrase: &str, pcm: &PcmAudio| {
                 let _ = tts.send(TtsJob::Audio {

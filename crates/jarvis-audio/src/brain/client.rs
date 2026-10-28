@@ -74,6 +74,10 @@ pub const SYSTEM_PROMPT: &str = concat!(
     "síncrona en la voz: despáchalos ejecutando fokkus-jarvis task run --profile ",
     "read_only \"<la tarea completa, con repos, PRs y criterios>\" y di en una frase ",
     "que quedó corriendo en segundo plano. ",
+    "Si el turno trae un bloque [Sub-sesiones activas], es contexto interno: no lo leas ",
+    "en voz alta. Cuando el usuario pregunte por una sub-sesión o tarea de fondo, responde ",
+    "basándote SOLO en ese bloque (su estado, su progreso o su último resultado); si no ",
+    "aparece ahí o no trae el dato, dilo, y NUNCA inventes estados ni resultados. ",
     "Constitución de privacidad, sin excepciones: tienes PROHIBIDO de forma ABSOLUTA leer, ",
     "listar, buscar, copiar, mover, modificar o borrar cualquier cosa dentro de ~/Imágenes/, ",
     "~/Images/, ~/Pictures/, ~/Documentos/, ~/Documents/, ~/Videos/, ~/Música/, ~/Music/, ",
@@ -372,7 +376,23 @@ impl ClaudeClient {
         user_text: &str,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion, BrainError> {
-        let messages = self.build_messages(user_text);
+        self.stream_with_context(None, user_text, on_token)
+    }
+
+    /// Como [`stream`](Self::stream) con un bloque de contexto efímero
+    /// antepuesto al turno actual (HU-65). El historial guarda solo
+    /// `user_text`: el contexto no se arrastra a los turnos siguientes.
+    pub fn stream_with_context(
+        &self,
+        context: Option<&str>,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError> {
+        let turn = match context {
+            Some(ctx) => crate::conversation::with_context(ctx, user_text),
+            None => user_text.to_string(),
+        };
+        let messages = self.build_messages(&turn);
         let body = self.build_body(messages);
         self.cancel.reset();
 
@@ -811,6 +831,34 @@ mod tests {
         c.cancel();
         let result = c.consume_stream(Cursor::new(bytes), &mut |_| {});
         assert!(matches!(result, Err(BrainError::Cancelled)));
+    }
+
+    #[test]
+    fn ephemeral_context_rides_only_on_the_current_turn_hu65() {
+        // El agente es https-only: se verifica el armado del turno sin red.
+        let c = client();
+        c.record_turn("hola", "¿qué necesitas?");
+        let roster = "[Sub-sesiones activas]\n#1 la revisión de PR de Felipe — trabajando (3 min)";
+        let turn = crate::conversation::with_context(roster, "¿cómo va lo de Felipe?");
+        let messages = c.build_messages(&turn);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"].as_str(), Some("hola"));
+        let current = messages[2]["content"].as_str().unwrap();
+        assert!(current.starts_with(roster), "{current}");
+        assert!(current.ends_with("\n\nUsuario: ¿cómo va lo de Felipe?"));
+        // `stream_with_context` registra `user_text`, no `turn`.
+        c.record_turn("¿cómo va lo de Felipe?", "Va bien.");
+        assert!(c
+            .history()
+            .iter()
+            .all(|m| !m.content.contains("[Sub-sesiones")));
+    }
+
+    #[test]
+    fn system_prompt_grounds_sub_session_answers_in_the_roster_hu65() {
+        assert!(SYSTEM_PROMPT.contains("[Sub-sesiones activas]"));
+        assert!(SYSTEM_PROMPT.contains("no lo leas en voz alta"));
+        assert!(SYSTEM_PROMPT.contains("NUNCA inventes estados"));
     }
 
     #[test]

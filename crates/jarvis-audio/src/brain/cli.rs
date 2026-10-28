@@ -205,8 +205,19 @@ impl CliBrain {
         user_text: &str,
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion, BrainError> {
+        self.stream_with_context(None, user_text, on_token)
+    }
+
+    /// Como [`stream`](Self::stream) con un bloque de contexto efímero en el
+    /// prompt de este turno (HU-65). El historial guarda solo `user_text`.
+    pub fn stream_with_context(
+        &self,
+        context: Option<&str>,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError> {
         self.cancel.reset();
-        let prompt = self.build_prompt(user_text);
+        let prompt = self.build_prompt(context, user_text);
         let mut child = self.spawn(&prompt)?;
         let mut stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -312,7 +323,7 @@ impl CliBrain {
     /// En [`CliBrainMode::Worker`] no se añade la coletilla de voz
     /// ("responde únicamente … en una frase breve"): el subagente recibe su
     /// propio prompt y el formato pactado con el gestor de tareas (HU-60).
-    fn build_prompt(&self, user_text: &str) -> String {
+    fn build_prompt(&self, context: Option<&str>, user_text: &str) -> String {
         let mut prompt = self.system_prompt.clone();
         let history = self.lock_history();
         if !history.is_empty() {
@@ -327,6 +338,9 @@ impl CliBrain {
             }
         }
         drop(history);
+        if let Some(ctx) = context.filter(|ctx| !ctx.trim().is_empty()) {
+            prompt.push_str(&format!("\n\n{ctx}\n"));
+        }
         match self.mode {
             CliBrainMode::Voice => prompt.push_str(&format!(
                 "\nUsa tus herramientas (run_command, herramientas MCP, etc.) para realizar las acciones solicitadas en el equipo cuando corresponda. Responde únicamente con lo que Jarvis debe decir en voz alta al usuario en una frase breve en español.\nUsuario: {user_text}"
@@ -526,6 +540,31 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_context_goes_in_the_prompt_but_not_the_history_hu65() {
+        let roster = "[Sub-sesiones activas]\n#1 la revisión de PR de Felipe — terminada (4 min)";
+        let brain = CliBrain::new("echo").unwrap();
+        let prompt = brain.build_prompt(Some(roster), "¿encontró algo grave?");
+        assert!(prompt.contains(roster), "{prompt}");
+        assert!(
+            prompt.ends_with("Usuario: ¿encontró algo grave?"),
+            "{prompt}"
+        );
+        assert!(!brain.build_prompt(None, "hola").contains("#1 la revisión"));
+
+        // El prompt va como `$0`: el script responde fijo.
+        let brain = CliBrain::new("sh -c 'echo Nada grave.' {prompt}").unwrap();
+        brain
+            .stream_with_context(Some(roster), "¿encontró algo grave?", &mut |_| {})
+            .expect("sh responde");
+        let history = brain.history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].content, "¿encontró algo grave?");
+        assert_eq!(history[1].content, "Nada grave.");
+        let next = brain.build_prompt(None, "gracias");
+        assert!(!next.contains("#1 la revisión"), "{next}");
+    }
+
+    #[test]
     fn prompt_is_appended_or_replaces_the_placeholder() {
         let brain = CliBrain::new("agy -p").unwrap();
         assert_eq!(brain.program(), "agy");
@@ -573,13 +612,13 @@ mod tests {
     fn worker_mode_drops_the_voice_persona_and_marks_the_sub_session_hu60() {
         let brain = CliBrain::new("agy -p").unwrap();
         assert_eq!(brain.mode(), CliBrainMode::Voice);
-        let voice = brain.build_prompt("revisa las PR de Felipe");
+        let voice = brain.build_prompt(None, "revisa las PR de Felipe");
         assert!(voice.contains("una frase breve"), "modo voz intacto");
         assert!(voice.contains("fokkus-jarvis dev run"));
 
         let worker = CliBrain::new("agy -p").unwrap().with_worker_mode(true);
         assert_eq!(worker.mode(), CliBrainMode::Worker);
-        let prompt = worker.build_prompt("revisa las PR de Felipe");
+        let prompt = worker.build_prompt(None, "revisa las PR de Felipe");
         assert!(!prompt.contains("frase breve"), "{prompt}");
         assert!(!prompt.contains("fokkus-jarvis dev run"), "{prompt}");
         assert!(prompt.contains("subagente de fondo"), "{prompt}");
