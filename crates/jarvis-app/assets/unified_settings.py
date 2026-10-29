@@ -3,9 +3,13 @@
 Uso: python3 -I -c <script> <config.toml> [--pid <pid>] [--tab <pestaña>]
 
 Ventana de 860x600 px con barra lateral de pestañas: Cerebro, Voz, Escucha
-y General. Lee y guarda el TOML de configuración conservando las claves que
-no edita; "volver a posición inicial" sale con el código 3 para que el
-daemon restablezca el anclaje de la esfera.
+y General. Lee y guarda el TOML de configuración conservando las claves y
+tablas que no edita; "volver a posición inicial" sale con el código 3 para
+que el daemon restablezca el anclaje de la esfera.
+
+Guardado: la barra inferior es común a todas las pestañas («Guardar cambios»
+y «Descartar»). Ctrl+S o Enter en un campo de texto guardan y cierran; la ✕
+guarda si hubo cambios; Esc descarta.
 
 Código de salida: 0 = guardado, 1 = cancelado, 2 = error, 3 = volver a
 posición inicial.
@@ -20,8 +24,10 @@ final al soltar el slider:
 El daemon la aplica al instante; si se cancela, vuelve al valor guardado.
 """
 
+import datetime
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -37,7 +43,7 @@ if os.environ.get("DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor, QCursor, QGuiApplication
+from PyQt6.QtGui import QColor, QCursor, QGuiApplication, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -149,21 +155,56 @@ def load_config(path):
         return {}
 
 
+BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def toml_key(key):
+    key = str(key)
+    return key if BARE_KEY.match(key) else json.dumps(key, ensure_ascii=False)
+
+
 def toml_value(value):
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return repr(value)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    if isinstance(value, dict):
+        inner = ", ".join(f"{toml_key(k)} = {toml_value(v)}" for k, v in value.items())
+        return "{ " + inner + " }" if inner else "{}"
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def save_config(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+def is_table_array(value):
+    return isinstance(value, list) and bool(value) and all(
+        isinstance(v, dict) for v in value
+    )
+
+
+def toml_lines(data, prefix=()):
+    """Serializa `data` a TOML: primero los valores simples y después las
+    tablas (`[a.b]`) y arreglos de tablas (`[[a]]`), como exige el formato."""
     lines = [
-        f"{key} = {toml_value(value)}"
+        f"{toml_key(key)} = {toml_value(value)}"
         for key, value in data.items()
-        if not isinstance(value, (dict, list))
+        if not isinstance(value, dict) and not is_table_array(value)
     ]
+    for key, value in data.items():
+        path = prefix + (toml_key(key),)
+        if isinstance(value, dict):
+            lines += ["", f"[{'.'.join(path)}]"] + toml_lines(value, path)
+        elif is_table_array(value):
+            for item in value:
+                lines += ["", f"[[{'.'.join(path)}]]"] + toml_lines(item, path)
+    return lines
+
+
+def save_config(path, data):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    lines = toml_lines(data)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -313,8 +354,20 @@ class UnifiedSettings(QWidget):
         root.setSpacing(0)
 
         root.addWidget(self._build_sidebar())
-        root.addWidget(self._build_content(), 1)
+        right = QVBoxLayout()
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(0)
+        right.addWidget(self._build_content(), 1)
+        right.addWidget(self._build_footer())
+        root.addLayout(right, 1)
 
+        save_shortcut = QShortcut(QKeySequence(QKeySequence.StandardKey.Save), self)
+        save_shortcut.activated.connect(self._save_and_close)
+        for edit in (self.cli_edit, self.api_url_edit, self.api_model_edit):
+            edit.returnPressed.connect(self._save_and_close)
+
+        self.initial = self._collect()
+        self._watch_changes()
         self.setStyleSheet(self._stylesheet())
         self._center_on_cursor_screen()
 
@@ -348,8 +401,8 @@ class UnifiedSettings(QWidget):
         close_btn.setObjectName("closeBtn")
         close_btn.setFixedSize(32, 32)
         close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        close_btn.setToolTip("Cerrar sin guardar")
-        close_btn.clicked.connect(lambda: QApplication.instance().exit(1))
+        close_btn.setToolTip("Cerrar (guarda los cambios pendientes)")
+        close_btn.clicked.connect(self._close)
         header.addWidget(close_btn)
         layout.addLayout(header)
         layout.addSpacing(12)
@@ -392,6 +445,34 @@ class UnifiedSettings(QWidget):
 
         self.nav_group.idClicked.connect(self._on_nav_clicked)
         return self.stack
+
+    def _build_footer(self):
+        """Barra de acciones común a todas las pestañas."""
+        footer = QFrame()
+        footer.setObjectName("footer")
+        layout = QHBoxLayout(footer)
+        layout.setContentsMargins(28, 12, 28, 14)
+        layout.setSpacing(10)
+
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("status")
+        layout.addWidget(self.status_label, 1)
+
+        discard = QPushButton("Descartar")
+        discard.setObjectName("secondary")
+        discard.setCursor(Qt.CursorShape.PointingHandCursor)
+        discard.setToolTip("Cerrar sin guardar (Esc)")
+        discard.clicked.connect(lambda: QApplication.instance().exit(1))
+        layout.addWidget(discard)
+
+        self.save_btn = QPushButton("Guardar cambios")
+        self.save_btn.setObjectName("primary")
+        self.save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.save_btn.setToolTip("Guardar y cerrar (Ctrl+S)")
+        self.save_btn.setDefault(True)
+        self.save_btn.clicked.connect(self._save_and_close)
+        layout.addWidget(self.save_btn)
+        return footer
 
     def _build_cerebro(self):
         page = QWidget()
@@ -464,6 +545,21 @@ class UnifiedSettings(QWidget):
         self.test_output.setWordWrap(True)
         layout.addWidget(self.test_output)
 
+        layout.addWidget(self._label("API (modo API)"))
+        api_row = QHBoxLayout()
+        api_row.setSpacing(10)
+        self.api_url_edit = QLineEdit()
+        self.api_url_edit.setObjectName("field")
+        self.api_url_edit.setText(str(self.current.get("api_base_url") or ""))
+        self.api_url_edit.setPlaceholderText("URL base (vacío = api.anthropic.com)")
+        api_row.addWidget(self.api_url_edit, 3)
+        self.api_model_edit = QLineEdit()
+        self.api_model_edit.setObjectName("field")
+        self.api_model_edit.setText(str(self.current.get("api_model") or ""))
+        self.api_model_edit.setPlaceholderText("Modelo (vacío = por defecto)")
+        api_row.addWidget(self.api_model_edit, 2)
+        layout.addLayout(api_row)
+
         layout.addStretch(1)
         return page
 
@@ -520,7 +616,7 @@ class UnifiedSettings(QWidget):
         footer.addWidget(self.voice_selection)
         footer.addStretch(1)
         use_btn = QPushButton("Usar esta voz")
-        use_btn.setObjectName("primary")
+        use_btn.setObjectName("secondary")
         use_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         use_btn.clicked.connect(self._use_selected_voice)
         footer.addWidget(use_btn)
@@ -560,8 +656,9 @@ class UnifiedSettings(QWidget):
     def _build_general(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(28, 24, 28, 20)
-        layout.setSpacing(14)
+        # Más compacta que las demás: comparte el alto con la barra inferior.
+        layout.setContentsMargins(28, 20, 28, 12)
+        layout.setSpacing(10)
 
         layout.addWidget(self._page_title("General"))
 
@@ -600,13 +697,6 @@ class UnifiedSettings(QWidget):
         )
         layout.addWidget(self.hud_card)
 
-        save = QPushButton("Guardar")
-        save.setObjectName("primary")
-        save.setCursor(Qt.CursorShape.PointingHandCursor)
-        save.clicked.connect(self._save_and_close)
-        layout.addWidget(save)
-        layout.addSpacing(8)
-
         reset = QPushButton("Volver a posición inicial")
         reset.setObjectName("secondary")
         reset.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -614,8 +704,8 @@ class UnifiedSettings(QWidget):
         layout.addWidget(reset)
         layout.addWidget(
             self._hint(
-                "Devuelve la esfera a su esquina original. Los cambios de las"
-                " otras pestañas se guardan con «Guardar»."
+                "Devuelve la esfera a su esquina original y guarda los cambios"
+                " de todas las pestañas."
             )
         )
 
@@ -772,10 +862,10 @@ class UnifiedSettings(QWidget):
         self.selected_voice = voice_id
         self.voice_selection.setText(f"Seleccionada: {voice_id}")
         self._refresh_voices()
+        self._update_status()
 
     def _use_selected_voice(self):
-        self._save()
-        QApplication.instance().exit(0)
+        self._save_and_close()
 
     def _refresh_voices(self):
         # Limpia el grid conservando el host.
@@ -841,7 +931,8 @@ class UnifiedSettings(QWidget):
         except OSError as exc:
             self.test_output.setText(f"No se pudo ejecutar: {exc}")
 
-    def _save(self):
+    def _collect(self):
+        """Valores actuales del formulario, con las mismas claves del TOML."""
         mode = "cli"
         for button in self.mode_group.buttons():
             if button.isChecked():
@@ -849,34 +940,66 @@ class UnifiedSettings(QWidget):
         voice = next(
             (v for v in VOICES if v[0] == self.selected_voice), VOICES[0]
         )
-        self.data.update(
-            {
-                "brain_mode": mode,
-                "cli_command": self.cli_edit.text().strip()
-                or DEFAULTS["cli_command"],
-                "continuous_listening": bool(self.continuous_check.isChecked()),
-                "barge_in_enabled": bool(self.barge_check.isChecked()),
-                "voice_id": voice[0],
-                "voice_lang": voice[3],
-                "sphere_scale_pct": int(self.scale_slider.value()),
-                "sphere_opacity_pct": int(self.opacity_slider.value()),
-                "fullscreen_behavior": self.fullscreen_combo.currentData()
-                or DEFAULTS["fullscreen_behavior"],
-                "hud_enabled": bool(self.hud_check.isChecked()),
-            }
-        )
+        return {
+            "brain_mode": mode,
+            "cli_command": self.cli_edit.text().strip() or DEFAULTS["cli_command"],
+            "api_base_url": self.api_url_edit.text().strip(),
+            "api_model": self.api_model_edit.text().strip(),
+            "continuous_listening": bool(self.continuous_check.isChecked()),
+            "barge_in_enabled": bool(self.barge_check.isChecked()),
+            "voice_id": voice[0],
+            "voice_lang": voice[3],
+            "sphere_scale_pct": int(self.scale_slider.value()),
+            "sphere_opacity_pct": int(self.opacity_slider.value()),
+            "fullscreen_behavior": self.fullscreen_combo.currentData()
+            or DEFAULTS["fullscreen_behavior"],
+            "hud_enabled": bool(self.hud_check.isChecked()),
+        }
+
+    def _is_dirty(self):
+        return self._collect() != self.initial
+
+    def _watch_changes(self):
+        for edit in (self.cli_edit, self.api_url_edit, self.api_model_edit):
+            edit.textChanged.connect(self._update_status)
+        for check in (self.continuous_check, self.barge_check, self.hud_check):
+            check.toggled.connect(self._update_status)
+        for slider in (self.scale_slider, self.opacity_slider):
+            slider.valueChanged.connect(self._update_status)
+        self.mode_group.buttonToggled.connect(self._update_status)
+        self.fullscreen_combo.currentIndexChanged.connect(self._update_status)
+
+    def _update_status(self, *_args):
+        self.status_label.setProperty("error", False)
+        self.status_label.setText("● Cambios sin guardar" if self._is_dirty() else "")
+        self.status_label.style().polish(self.status_label)
+
+    def _save(self):
+        """Escribe el TOML. Devuelve False (y lo avisa) si no se pudo."""
+        self.data.update(self._collect())
         try:
             save_config(self.config_path, self.data)
-        except OSError:
-            pass
+            return True
+        except OSError as exc:
+            self.status_label.setProperty("error", True)
+            self.status_label.setText(f"No se pudo guardar: {exc}")
+            self.status_label.style().polish(self.status_label)
+            return False
 
     def _save_and_close(self):
-        self._save()
-        QApplication.instance().exit(0)
+        if self._save():
+            QApplication.instance().exit(0)
+
+    def _close(self):
+        # La ✕ no descarta trabajo: guarda si hubo cambios.
+        if self._is_dirty():
+            self._save_and_close()
+        else:
+            QApplication.instance().exit(1)
 
     def _reset_position(self):
-        self._save()
-        QApplication.instance().exit(EXIT_RESET_POSITION)
+        if self._save():
+            QApplication.instance().exit(EXIT_RESET_POSITION)
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
@@ -890,6 +1013,10 @@ class UnifiedSettings(QWidget):
         QFrame#sidebar {{ background: {SIDEBAR}; border: none;
                           border-top-left-radius: 18px; border-bottom-left-radius: 18px; }}
         QWidget#content {{ background: {BG}; }}
+        QFrame#footer {{ background: {BG}; border: none; border-top: 1px solid {BORDER};
+                         border-bottom-right-radius: 18px; }}
+        QLabel#status {{ color: {MUTED}; font-size: 12px; }}
+        QLabel#status[error="true"] {{ color: {DANGER}; }}
         QLabel {{ color: {TEXT}; font-size: 13px; }}
         QLabel#sideTitle {{ color: {ACCENT}; font-size: 12px; font-weight: 700; letter-spacing: 3px; }}
         QLabel#pageTitle {{ color: {TEXT}; font-size: 20px; font-weight: 700; }}

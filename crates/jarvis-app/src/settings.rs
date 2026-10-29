@@ -786,6 +786,29 @@ mod tests {
     }
 
     #[test]
+    fn unified_settings_script_saves_from_every_tab() {
+        // Barra inferior global (fuera del QStackedWidget) y atajos.
+        assert!(UNIFIED_SETTINGS_SCRIPT.contains("def _build_footer(self):"));
+        assert!(UNIFIED_SETTINGS_SCRIPT.contains("QPushButton(\"Guardar cambios\")"));
+        assert!(!UNIFIED_SETTINGS_SCRIPT.contains("QPushButton(\"Guardar\")"));
+        assert!(UNIFIED_SETTINGS_SCRIPT.contains("QKeySequence.StandardKey.Save"));
+        assert!(
+            UNIFIED_SETTINGS_SCRIPT.contains("edit.returnPressed.connect(self._save_and_close)")
+        );
+        // La ✕ guarda si hay cambios en vez de descartarlos.
+        assert!(UNIFIED_SETTINGS_SCRIPT.contains("close_btn.clicked.connect(self._close)"));
+        // Todos los campos del cerebro llegan al TOML.
+        for key in ["\"cli_command\"", "\"api_base_url\"", "\"api_model\""] {
+            assert!(
+                UNIFIED_SETTINGS_SCRIPT.contains(&format!("{key}: self.")),
+                "falta {key}"
+            );
+        }
+        // Las tablas ([automation], [stt_lexicon]...) se conservan al guardar.
+        assert!(UNIFIED_SETTINGS_SCRIPT.contains("def toml_lines(data, prefix=()):"));
+    }
+
+    #[test]
     fn unified_settings_script_emits_sphere_previews() {
         assert!(UNIFIED_SETTINGS_SCRIPT.contains("\"sphere_scale_pct\": 100"));
         assert!(UNIFIED_SETTINGS_SCRIPT.contains("\"sphere_opacity_pct\": 100"));
