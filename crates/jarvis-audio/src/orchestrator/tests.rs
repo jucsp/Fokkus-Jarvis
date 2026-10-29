@@ -1842,6 +1842,42 @@ fn a_slow_planner_times_out_instead_of_blocking_the_turn_hu63() {
     );
 }
 
+/// Fábrica cuyos cerebros arrancan en frío (CLI): nunca caben en el
+/// presupuesto del planificador.
+struct ColdCliFactory(Arc<FakeFactory>);
+
+impl BrainFactory for ColdCliFactory {
+    fn spawn(&self, timeout: Duration) -> Result<Arc<dyn TokenStream + Send + Sync>, BrainError> {
+        self.0.spawn(timeout)
+    }
+
+    fn answers_within(&self, _budget: Duration) -> bool {
+        false
+    }
+}
+
+#[test]
+fn a_cold_cli_factory_skips_the_planner_without_spawning_a_brain() {
+    // Auditoría de latencia: con un CLI en frío (≥ 5 s) el planificador de
+    // 2,5 s siempre vencía; ahora se salta en el acto y no lanza el proceso.
+    let inner = FakeFactory::new(PLANNER_REPLY, Duration::ZERO);
+    let factory = Arc::new(ColdCliFactory(Arc::clone(&inner)));
+    let planner = BrainTurnPlanner::new(factory as Arc<dyn BrainFactory>);
+    let request = crate::router::PlanRequest {
+        text: SCRIPT[27],
+        roster: &[],
+        constraints: crate::router::TurnConstraints::none(),
+    };
+    let started = std::time::Instant::now();
+    assert_eq!(
+        planner.plan(&request),
+        Err(crate::router::PlanError::Disabled)
+    );
+    assert!(started.elapsed() < Duration::from_millis(50));
+    assert_eq!(planner.calls(), 0);
+    assert!(inner.spawned.lock().unwrap().is_empty());
+}
+
 #[test]
 fn simple_heavy_turn_does_not_spawn_a_planner_brain_hu63() {
     // CA-3: un turno pesado simple no paga la llamada al planificador.

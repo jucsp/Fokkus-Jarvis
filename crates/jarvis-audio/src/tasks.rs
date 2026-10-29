@@ -284,6 +284,16 @@ pub trait BrainFactory: Send + Sync {
     ) -> Result<Arc<dyn TokenStream + Send + Sync>, BrainError> {
         self.spawn(timeout)
     }
+
+    /// `true` si un cerebro de esta fábrica puede contestar dentro de
+    /// `budget` (p. ej. el [`PLANNER_TIMEOUT`] de 2,5 s). Un CLI que arranca
+    /// en frío en cada llamada (~5 s medidos con `agy`) nunca llega: el
+    /// planificador se salta y el turno no paga esa espera perdida.
+    ///
+    /// [`PLANNER_TIMEOUT`]: crate::router::PLANNER_TIMEOUT
+    fn answers_within(&self, _budget: Duration) -> bool {
+        true
+    }
 }
 
 /// Cola hablada compartida entre el hilo del cerebro (que la drena con su

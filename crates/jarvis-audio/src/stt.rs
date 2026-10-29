@@ -419,4 +419,34 @@ mod tests {
         // El contexto se reutiliza entre llamadas.
         let _ = engine.transcribe(&[0.0; SAMPLE_RATE]).unwrap();
     }
+
+    /// Perfil de latencia del STT (auditoría E2E): transcribe un PCM real
+    /// mono 16 kHz `f32le` (`JARVIS_STT_BENCH_PCM`) con el modelo
+    /// `base-q5_1` instalado e imprime el tiempo de inferencia por pasada.
+    #[test]
+    #[ignore = "requiere base-q5_1 instalado y JARVIS_STT_BENCH_PCM"]
+    fn bench_base_q5_1_inference_latency() {
+        let path = std::env::var("JARVIS_STT_BENCH_PCM").expect("JARVIS_STT_BENCH_PCM");
+        let bytes = std::fs::read(path).expect("PCM de prueba");
+        let pcm: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect();
+        let manager = crate::models::ModelManager::new().unwrap();
+        let model = manager
+            .load_verified(&crate::models::WHISPER_BASE_Q5_1)
+            .expect("modelo base-q5_1 verificado");
+        let engine = WhisperEngine::from_verified(model).expect("contexto whisper");
+        let audio_ms = pcm.len() * 1_000 / SAMPLE_RATE;
+        for pass in 0..3 {
+            let started = std::time::Instant::now();
+            let text = engine.transcribe(&pcm).unwrap();
+            eprintln!(
+                "[bench-stt] pasada {pass}: {} ms para {audio_ms} ms de audio → {text:?}",
+                started.elapsed().as_millis()
+            );
+        }
+    }
 }

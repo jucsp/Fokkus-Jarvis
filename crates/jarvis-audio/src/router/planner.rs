@@ -108,6 +108,9 @@ impl BrainTurnPlanner {
 
 impl TurnPlanner for BrainTurnPlanner {
     fn plan(&self, request: &PlanRequest<'_>) -> Result<TurnPlan, PlanError> {
+        if !self.factory.answers_within(self.timeout) {
+            return Err(PlanError::Disabled);
+        }
         self.calls.fetch_add(1, Ordering::Relaxed);
         // El timeout viaja al cerebro: con CLI mata el proceso hijo colgado.
         let brain = self

@@ -7,6 +7,7 @@
 
 pub mod cli;
 pub mod client;
+pub mod session;
 pub mod sse;
 
 pub use cli::{split_command, CliBrain, DEFAULT_CLI_COMMAND, DEFAULT_CLI_TIMEOUT};

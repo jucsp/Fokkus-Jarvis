@@ -44,7 +44,15 @@ pub fn build_brain(config: &JarvisConfig) -> Result<Brain, &'static str> {
                 brain.with_timeout(Duration::from_secs(u64::from(config.cli_timeout_secs())))
             }) {
                 Ok(brain) if brain.is_available() => {
-                    println!("[cerebro] modo CLI: `{command}`.");
+                    // Sesión persistente: el arranque en frío ocurre ahora y
+                    // no en el primer turno hablado.
+                    brain.warm_up();
+                    let mode = if brain.is_persistent() {
+                        "sesión persistente"
+                    } else {
+                        "un proceso por turno"
+                    };
+                    println!("[cerebro] modo CLI ({mode}): `{command}`.");
                     Ok(Arc::new(brain))
                 }
                 Ok(brain) => {
@@ -114,7 +122,18 @@ impl BrainFactory for TaskBrainFactory {
             .clone();
         build_task_brain(&config, timeout)
     }
+
+    /// Las tareas en CLI lanzan un proceso por llamada (arranque en frío de
+    /// varios segundos): no caben en presupuestos cortos como el del
+    /// planificador de turnos.
+    fn answers_within(&self, budget: Duration) -> bool {
+        let config = self.config.read().unwrap_or_else(PoisonError::into_inner);
+        config.brain_mode == BrainMode::Api || budget >= CLI_COLD_START
+    }
 }
+
+/// Arranque en frío medido de `agy -p` hasta el primer token (5,3–9 s).
+const CLI_COLD_START: Duration = Duration::from_secs(6);
 
 /// Cerebro aislado para una tarea de fondo, sin avisos por consola.
 pub fn build_task_brain(config: &JarvisConfig, timeout: Duration) -> Result<Brain, BrainError> {

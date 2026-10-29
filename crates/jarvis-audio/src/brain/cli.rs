@@ -8,6 +8,12 @@
 //! El proceso se ejecuta sin shell (no hay interpolación de la voz del
 //! usuario en un intérprete) y el barge-in lo mata en el acto.
 //!
+//! Con Antigravity (`agy … -p`) en modo voz, el cerebro mantiene además una
+//! [`AgySession`] persistente: el proceso se lanza por adelantado
+//! ([`CliBrain::warm_up`]) y atiende cada turno por NDJSON, de modo que el
+//! arranque en frío (~3,5 s) sale del camino crítico y los `text_delta` llegan
+//! al TTS por frases en cuanto el modelo los emite.
+//!
 //! [`ClaudeClient`]: crate::brain::ClaudeClient
 
 use std::collections::VecDeque;
@@ -19,6 +25,7 @@ use std::time::{Duration, Instant};
 use crate::brain::client::{
     BrainError, CancellationToken, Completion, Message, SUBAGENT_SYSTEM_PROMPT, SYSTEM_PROMPT,
 };
+use crate::brain::session::{parse_event, session_args, AgySession, SessionEvent};
 use crate::brain::DEFAULT_HISTORY_TURNS;
 
 /// Comando por defecto: Antigravity en modo no interactivo y con esfuerzo
@@ -35,6 +42,8 @@ pub const SUBSESSION_ENV: &str = "JARVIS_SUBSESSION_ID";
 pub const DEFAULT_SUBSESSION_ID: &str = "1";
 /// Bytes de stderr que se conservan para el mensaje de error.
 const STDERR_TAIL: usize = 2_048;
+/// Cada cuánto revisa la sesión persistente el barge-in y el *timeout*.
+const SESSION_POLL: Duration = Duration::from_millis(25);
 
 /// Papel del cerebro CLI dentro de Jarvis (HU-60).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -104,6 +113,10 @@ pub struct CliBrain {
     cancel: CancellationToken,
     /// Proceso en curso (para matarlo desde `cancel`).
     child: Arc<Mutex<Option<Child>>>,
+    /// Argumentos de la sesión persistente si el comando es `agy … -p`.
+    session_args: Option<Vec<String>>,
+    /// Proceso `agy` caliente entre turnos (solo en modo voz).
+    session: Mutex<Option<AgySession>>,
 }
 
 impl CliBrain {
@@ -112,6 +125,7 @@ impl CliBrain {
         let mut parts = split_command(command)
             .ok_or_else(|| BrainError::Cli(format!("comando CLI inválido: {command:?}")))?;
         let program = parts.remove(0);
+        let session_args = session_args(&program, &parts, PROMPT_PLACEHOLDER);
         Ok(Self {
             program,
             args: parts,
@@ -123,6 +137,8 @@ impl CliBrain {
             subsession_id: None,
             cancel: CancellationToken::new(),
             child: Arc::new(Mutex::new(None)),
+            session_args,
+            session: Mutex::new(None),
         })
     }
 
@@ -186,12 +202,36 @@ impl CliBrain {
         resolve_program(&self.program).is_some()
     }
 
+    /// `true` si los turnos de voz van por una [`AgySession`] persistente.
+    pub fn is_persistent(&self) -> bool {
+        self.mode == CliBrainMode::Voice && self.session_args.is_some()
+    }
+
+    /// Lanza por adelantado el proceso de la sesión persistente para que el
+    /// primer turno no pague el arranque en frío. Sin sesión, no hace nada.
+    pub fn warm_up(&self) {
+        if !self.is_persistent() {
+            return;
+        }
+        let mut slot = self.lock_session();
+        if slot.as_mut().is_some_and(AgySession::is_alive) {
+            return;
+        }
+        if let Some(dead) = slot.take() {
+            dead.kill();
+        }
+        *slot = self.spawn_session().ok();
+    }
+
     /// Devuelve una copia del historial (para inspección/pruebas).
     pub fn history(&self) -> Vec<Message> {
         self.lock_history().iter().cloned().collect()
     }
 
     /// Cancela el turno en curso matando el proceso. Idempotente.
+    ///
+    /// Con sesión persistente, el bucle del turno ve el token en menos de
+    /// [`SESSION_POLL`], mata el proceso y deja otro calentando.
     pub fn cancel(&self) {
         self.cancel.cancel();
         if let Some(child) = self.lock_child().as_mut() {
@@ -217,6 +257,9 @@ impl CliBrain {
         on_token: &mut dyn FnMut(&str),
     ) -> Result<Completion, BrainError> {
         self.cancel.reset();
+        if self.is_persistent() {
+            return self.stream_session(context, user_text, on_token);
+        }
         let prompt = self.build_prompt(context, user_text);
         let mut child = self.spawn(&prompt)?;
         let mut stdout = child.stdout.take();
@@ -302,6 +345,11 @@ impl CliBrain {
             None => return Err(BrainError::Cancelled),
         }
 
+        Ok(self.complete(user_text, &text))
+    }
+
+    /// Cierra un turno exitoso: recorta y lo guarda en el historial.
+    fn complete(&self, user_text: &str, text: &str) -> Completion {
         let text = text.trim().to_string();
         // Respuestas vacías o errores del CLI (p. ej. permisos de jetski)
         // envenenarían el historial de los turnos siguientes.
@@ -311,11 +359,117 @@ impl CliBrain {
         if !text.is_empty() && !cli_error {
             self.record_turn(user_text, &text);
         }
-        Ok(Completion {
+        Completion {
             text,
             stop_reason: Some("end_turn".to_string()),
             ..Completion::default()
-        })
+        }
+    }
+
+    /// Turno por la sesión persistente: el primer mensaje de cada proceso
+    /// lleva persona e historial; los siguientes solo el turno, porque `agy`
+    /// ya conserva la conversación.
+    fn stream_session(
+        &self,
+        context: Option<&str>,
+        user_text: &str,
+        on_token: &mut dyn FnMut(&str),
+    ) -> Result<Completion, BrainError> {
+        let warm = self.lock_session().take();
+        let mut session = match warm {
+            Some(mut session) => {
+                if session.is_alive() {
+                    session
+                } else {
+                    session.kill();
+                    self.spawn_session()?
+                }
+            }
+            None => self.spawn_session()?,
+        };
+        let message = if session.turns() == 0 {
+            self.build_prompt(context, user_text)
+        } else {
+            self.build_turn(context, user_text).trim_start().to_string()
+        };
+        if let Err(e) = session.send(&message) {
+            let detail = session.stderr_tail();
+            session.kill();
+            self.warm_up();
+            return Err(BrainError::Cli(format!(
+                "`{}` cerró la sesión: {}",
+                self.program,
+                if detail.is_empty() {
+                    e.to_string()
+                } else {
+                    detail
+                }
+            )));
+        }
+
+        let deadline = Instant::now() + self.timeout;
+        let mut text = String::new();
+        let outcome = loop {
+            if self.cancel.is_cancelled() {
+                break Err(BrainError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                break Err(BrainError::Cli(format!(
+                    "`{}` no respondió en {} s",
+                    self.program,
+                    self.timeout.as_secs()
+                )));
+            }
+            let line = match session.lines().recv_timeout(SESSION_POLL) {
+                Ok(line) => line,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    let detail = session.stderr_tail();
+                    break Err(BrainError::Cli(format!(
+                        "`{}` terminó a mitad del turno{}",
+                        self.program,
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {detail}")
+                        }
+                    )));
+                }
+            };
+            match parse_event(&line) {
+                SessionEvent::Delta(piece) => {
+                    on_token(&piece);
+                    text.push_str(&piece);
+                }
+                SessionEvent::Done(Ok(response)) => {
+                    // Sin deltas (respuesta de un solo bloque), se entrega entera.
+                    if text.trim().is_empty() && !response.trim().is_empty() {
+                        on_token(&response);
+                        text = response;
+                    }
+                    break Ok(());
+                }
+                SessionEvent::Done(Err(error)) => {
+                    break Err(BrainError::Cli(format!(
+                        "`{}` falló: {error}",
+                        self.program
+                    )))
+                }
+                SessionEvent::Other => {}
+            }
+        };
+
+        // Cancelado, vencido o caído: el proceso queda en un estado
+        // desconocido. Se descarta y otro empieza a calentar ya.
+        // Tras `history_turns` turnos se recicla para acotar su contexto.
+        let recycle = session.turns() >= self.history_turns.max(1);
+        if outcome.is_err() || recycle {
+            session.kill();
+            self.warm_up();
+        } else {
+            *self.lock_session() = Some(session);
+        }
+        outcome.map(|()| self.complete(user_text, &text))
     }
 
     /// Persona + transcripción reciente + turno actual, en texto plano.
@@ -338,6 +492,13 @@ impl CliBrain {
             }
         }
         drop(history);
+        prompt.push_str(&self.build_turn(context, user_text));
+        prompt
+    }
+
+    /// Contexto efímero + coletilla de modo + turno actual.
+    fn build_turn(&self, context: Option<&str>, user_text: &str) -> String {
+        let mut prompt = String::new();
         if let Some(ctx) = context.filter(|ctx| !ctx.trim().is_empty()) {
             prompt.push_str(&format!("\n\n{ctx}\n"));
         }
@@ -374,6 +535,25 @@ impl CliBrain {
     }
 
     fn spawn(&self, prompt: &str) -> Result<Child, BrainError> {
+        let mut command = self.command(self.build_args(prompt))?;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+            .spawn()
+            .map_err(|e| BrainError::Cli(format!("no se pudo ejecutar `{}`: {e}", self.program)))
+    }
+
+    /// Lanza el proceso de la sesión persistente.
+    fn spawn_session(&self) -> Result<AgySession, BrainError> {
+        let args = self.session_args.clone().unwrap_or_default();
+        AgySession::spawn(self.command(args)?)
+            .map_err(|e| BrainError::Cli(format!("no se pudo ejecutar `{}`: {e}", self.program)))
+    }
+
+    /// Comando sin shell, con su grupo de procesos y el entorno *headless*.
+    fn command(&self, args: Vec<String>) -> Result<Command, BrainError> {
         let program = resolve_program(&self.program).ok_or_else(|| {
             BrainError::Cli(format!("no se encontró `{}` en el PATH", self.program))
         })?;
@@ -383,10 +563,7 @@ impl CliBrain {
         #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         command
-            .args(self.build_args(prompt))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .args(args)
             .env("NO_COLOR", "1")
             // HU-58: el subagente corre sin interfaz. Ningún MCP (p. ej. el de
             // Google Workspace) ni script hijo debe abrir un navegador
@@ -403,9 +580,7 @@ impl CliBrain {
                     .unwrap_or(DEFAULT_SUBSESSION_ID),
             );
         }
-        command
-            .spawn()
-            .map_err(|e| BrainError::Cli(format!("no se pudo ejecutar `{}`: {e}", self.program)))
+        Ok(command)
     }
 
     /// Mata el proceso si supera `timeout`; [`Watchdog::finish`] lo detiene.
@@ -466,6 +641,22 @@ impl CliBrain {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn lock_session(&self) -> std::sync::MutexGuard<'_, Option<AgySession>> {
+        self.session
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Drop for CliBrain {
+    /// Un cerebro reemplazado (cambio de ajustes, salida) no deja un `agy`
+    /// huérfano esperando turnos.
+    fn drop(&mut self) {
+        if let Some(session) = self.lock_session().take() {
+            session.kill();
+        }
+    }
 }
 
 /// Vigilante de *timeout* de un turno.
@@ -483,7 +674,7 @@ impl Watchdog {
 }
 
 /// Mata el proceso y su grupo (los hijos que lanzó el CLI).
-fn kill_tree(child: &mut Child) {
+pub(crate) fn kill_tree(child: &mut Child) {
     #[cfg(unix)]
     if let Ok(pid) = libc::pid_t::try_from(child.id()) {
         // SAFETY: `kill` solo envía una señal; el grupo es el del hijo
@@ -677,6 +868,172 @@ mod tests {
         let err = brain.stream("", &mut |_| {}).unwrap_err();
         assert!(matches!(err, BrainError::Cli(_)), "{err:?}");
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    /// `agy` de mentira: atiende turnos NDJSON por stdin y responde con el
+    /// número de turno, su PID y si el mensaje traía la persona Jarvis.
+    fn fake_agy(name: &str, reply: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("jarvis-agy-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agy");
+        let script = format!(
+            "#!/bin/sh\nn=0\nwhile IFS= read -r line; do\n  n=$((n+1))\n  \
+             case \"$line\" in *'Eres Jarvis'*) who=persona;; *) who=corto;; esac\n  {reply}\ndone\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Otro test que hace `fork` en paralelo puede heredar el descriptor de
+        // escritura hasta su `exec` (ETXTBSY): se espera a que se libere.
+        for _ in 0..100 {
+            match Command::new(&path).stdin(Stdio::null()).status() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
+        path
+    }
+
+    const ECHO_TURN: &str = r#"printf '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"turno %s "}}\n' "$n"
+  printf '{"event":"step_update","step_update":{"step_type":"agent_response","text_delta":"%s %s."}}\n' "$who" "$$"
+  printf '{"event":"result","result":{"status":"SUCCESS","response":"x"}}\n'"#;
+
+    #[test]
+    fn voice_turns_reuse_one_warm_agy_process() {
+        let agy = fake_agy("persist", ECHO_TURN);
+        let brain = CliBrain::new(&format!("{} --model m -p", agy.display())).unwrap();
+        assert!(brain.is_persistent());
+        brain.warm_up();
+        let mut pieces = Vec::new();
+        let first = brain
+            .stream("hola", &mut |t| pieces.push(t.to_string()))
+            .expect("primer turno");
+        // Streaming real: dos deltas, no un bloque al final.
+        assert_eq!(pieces.len(), 2, "{pieces:?}");
+        let second = brain
+            .stream("y mañana", &mut |_| {})
+            .expect("segundo turno");
+        let pid = |text: &str| text.rsplit(' ').next().unwrap().to_string();
+        assert!(first.text.starts_with("turno 1 persona"), "{}", first.text);
+        assert!(second.text.starts_with("turno 2 corto"), "{}", second.text);
+        assert_eq!(pid(&first.text), pid(&second.text), "mismo proceso");
+        assert_eq!(brain.history().len(), 4);
+
+        let alive = pid(&second.text)
+            .trim_end_matches('.')
+            .parse::<i32>()
+            .unwrap();
+        drop(brain);
+        std::thread::sleep(Duration::from_millis(50));
+        // SAFETY: señal 0 solo consulta si el PID existe.
+        let exists = unsafe { libc::kill(alive, 0) } == 0;
+        assert!(!exists, "el agy caliente no debe quedar huérfano");
+    }
+
+    #[test]
+    fn session_is_recycled_and_primed_again_after_history_turns() {
+        let agy = fake_agy("recycle", ECHO_TURN);
+        let brain = CliBrain::new(&format!("{} -p", agy.display()))
+            .unwrap()
+            .with_history_turns(2);
+        let texts: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|t| brain.stream(t, &mut |_| {}).unwrap().text)
+            .collect();
+        assert!(texts[1].starts_with("turno 2 corto"), "{texts:?}");
+        // Proceso nuevo: vuelve a recibir persona + historial.
+        assert!(texts[2].starts_with("turno 1 persona"), "{texts:?}");
+    }
+
+    #[test]
+    fn session_error_result_is_a_cli_error_and_keeps_history_clean() {
+        let agy = fake_agy(
+            "error",
+            r#"printf '{"event":"result","result":{"status":"ERROR","error":"cuota agotada"}}\n'"#,
+        );
+        let brain = CliBrain::new(&format!("{} -p", agy.display())).unwrap();
+        let err = brain.stream("hola", &mut |_| {}).unwrap_err();
+        assert!(
+            matches!(&err, BrainError::Cli(m) if m.contains("cuota agotada")),
+            "{err:?}"
+        );
+        assert!(brain.history().is_empty());
+    }
+
+    #[test]
+    fn barge_in_kills_the_session_turn_and_leaves_another_warming() {
+        let agy = fake_agy("cancel", "sleep 5");
+        let brain = Arc::new(CliBrain::new(&format!("{} -p", agy.display())).unwrap());
+        brain.warm_up();
+        let worker = {
+            let brain = Arc::clone(&brain);
+            std::thread::spawn(move || brain.stream("hola", &mut |_| {}))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        brain.cancel();
+        let result = worker.join().unwrap();
+        assert!(matches!(result, Err(BrainError::Cancelled)), "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(brain
+            .lock_session()
+            .as_mut()
+            .is_some_and(AgySession::is_alive));
+    }
+
+    #[test]
+    fn worker_mode_and_other_clis_stay_one_shot() {
+        let agy = fake_agy("worker", ECHO_TURN);
+        let worker = CliBrain::new(&format!("{} -p", agy.display()))
+            .unwrap()
+            .with_worker_mode(true);
+        assert!(!worker.is_persistent());
+        worker.warm_up();
+        assert!(worker.lock_session().is_none());
+        assert!(!CliBrain::new("echo -p").unwrap().is_persistent());
+    }
+
+    /// Perfil de latencia con el CLI real (`JARVIS_BENCH_CLI`, p. ej.
+    /// `agy --model gemini-3.8-flash-medium --dangerously-skip-permissions -p`):
+    /// compara un proceso por turno con la sesión persistente caliente.
+    #[test]
+    #[ignore = "requiere el CLI real y red (JARVIS_BENCH_CLI)"]
+    fn bench_cli_time_to_first_token() {
+        let command = std::env::var("JARVIS_BENCH_CLI").expect("JARVIS_BENCH_CLI");
+        let turns = [
+            "Jarvis, ¿qué día es hoy?",
+            "Dime en dos frases qué es un agujero negro.",
+            "¿Y quién lo predijo?",
+        ];
+        let measure = |brain: &CliBrain, label: &str| {
+            for turn in turns {
+                let started = Instant::now();
+                let mut first = None;
+                let done = brain
+                    .stream(turn, &mut |_| {
+                        first.get_or_insert_with(|| started.elapsed());
+                    })
+                    .expect("turno");
+                eprintln!(
+                    "[bench-cli] {label}: primer token {} ms, total {} ms → {:?}",
+                    first.unwrap_or_default().as_millis(),
+                    started.elapsed().as_millis(),
+                    done.text
+                );
+            }
+        };
+        let one_shot = CliBrain::new(&command.replace(" -p", " --output-format text -p")).unwrap();
+        assert!(!one_shot.is_persistent());
+        measure(&one_shot, "proceso por turno");
+
+        let persistent = CliBrain::new(&command).unwrap();
+        assert!(persistent.is_persistent());
+        persistent.warm_up();
+        // El arranque en frío ocurre mientras el usuario aún habla.
+        std::thread::sleep(Duration::from_secs(5));
+        measure(&persistent, "sesión persistente");
     }
 
     #[test]
