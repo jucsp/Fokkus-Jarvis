@@ -10,6 +10,14 @@ description = "Binario de Fokkus-Jarvis: orquesta núcleo, render, shell, audio 
 name = "fokkus-jarvis"
 path = "src/main.rs"
 
+[features]
+# HU-75 fase 2: el daemon intenta sherpa-onnx (NeMo FastConformer CTC int8)
+# antes que whisper. `--no-default-features` produce el binario sin
+# sherpa-onnx, que es lo que necesita el empaquetado mientras la biblioteca
+# nativa no esté vendorizada (SEC-01).
+default = ["sherpa"]
+sherpa = ["jarvis-audio/sherpa"]
+
 [dependencies]
 cpal.workspace = true
 crossbeam-channel.workspace = true

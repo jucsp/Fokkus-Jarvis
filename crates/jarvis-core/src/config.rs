@@ -338,6 +338,10 @@ pub struct JarvisConfig {
     /// o `"base-q5_1"`. Un valor inválido cae al por defecto con aviso; ver
     /// [`JarvisConfig::stt_model`]. La palabra de activación no depende de esto.
     pub stt_model: String,
+    /// Motor de transcripción (HU-75, tabla `[stt]`). Se declara aquí, antes de
+    /// las demás tablas, porque TOML exige que las tablas se emitan después de
+    /// todos los valores simples.
+    pub stt: SttConfig,
     /// Automatización de escritorio (HU-38, tabla `[automation]`). Va al final:
     /// en TOML las tablas se emiten después de los valores simples.
     pub automation: AutomationConfig,
@@ -380,6 +384,81 @@ impl SttModel {
             "small-q5_1" => Some(SttModel::SmallQ5_1),
             "base-q5_1" => Some(SttModel::BaseQ5_1),
             _ => None,
+        }
+    }
+}
+
+/// Backend de transcripción seleccionable en `config.toml` (HU-75).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SttBackend {
+    /// whisper.cpp enlazado (HU-5). Es el valor por defecto y el único que
+    /// compila sin features extra.
+    Whisper,
+    /// sherpa-onnx (HU-75). Requiere compilar `jarvis-audio` con
+    /// `--features sherpa`; con el binario estándar la configuración se
+    /// acepta pero el arranque avisa y se queda en Whisper.
+    Sherpa,
+}
+
+impl SttBackend {
+    /// Backend por defecto: whisper, porque es el único enlazado en el binario
+    /// que se distribuye.
+    pub const DEFAULT: SttBackend = SttBackend::Whisper;
+
+    /// Valor canónico en `config.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SttBackend::Whisper => "whisper",
+            SttBackend::Sherpa => "sherpa",
+        }
+    }
+
+    /// Interpreta el valor de `config.toml` (sin distinguir mayúsculas ni
+    /// espacios en los extremos). Se acepta `"sherpa-onnx"` como alias.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "whisper" => Some(SttBackend::Whisper),
+            "sherpa" | "sherpa-onnx" => Some(SttBackend::Sherpa),
+            _ => None,
+        }
+    }
+}
+
+/// Tabla `[stt]` (HU-75).
+///
+/// Va como tabla y no como clave suelta para dejar sitio a los parámetros del
+/// motor nuevo (rutas del `.onnx`, hilos, idioma) sin seguir poblando la raíz
+/// del archivo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SttConfig {
+    /// Backend de transcripción: `"whisper"` (por defecto) o `"sherpa"`.
+    pub backend: String,
+}
+
+impl Default for SttConfig {
+    fn default() -> Self {
+        Self {
+            backend: SttBackend::DEFAULT.as_str().to_string(),
+        }
+    }
+}
+
+impl SttConfig {
+    /// Backend elegido (HU-75). Un valor desconocido cae a
+    /// [`SttBackend::DEFAULT`] y devuelve el aviso a registrar; nunca aborta el
+    /// arranque, igual que `stt_model`.
+    pub fn backend(&self) -> (SttBackend, Option<String>) {
+        match SttBackend::parse(&self.backend) {
+            Some(backend) => (backend, None),
+            None => (
+                SttBackend::DEFAULT,
+                Some(format!(
+                    "stt.backend = {:?} no es válido (se admite \"whisper\" o \"sherpa\"); se usa {}",
+                    self.backend,
+                    SttBackend::DEFAULT.as_str()
+                )),
+            ),
         }
     }
 }
@@ -519,6 +598,7 @@ impl Default for JarvisConfig {
             hud_enabled: true,
             hud_max_bubbles: 3,
             stt_model: SttModel::DEFAULT.as_str().to_string(),
+            stt: SttConfig::default(),
             automation: AutomationConfig::default(),
             voice_endpoint: VoiceEndpointConfig::default(),
             stt_lexicon: BTreeMap::new(),
@@ -743,6 +823,13 @@ impl JarvisConfig {
                 )),
             ),
         }
+    }
+
+    /// Backend de transcripción elegido (HU-75). Igual que
+    /// [`JarvisConfig::stt_model`], un valor desconocido cae al por defecto y
+    /// devuelve el aviso a registrar; nunca aborta el arranque.
+    pub fn stt_backend(&self) -> (SttBackend, Option<String>) {
+        self.stt.backend()
     }
 
     /// Configuración de *endpointing* con todos los valores ya saturados
@@ -1100,6 +1187,46 @@ mod tests {
         // Un archivo sin la clave conserva el valor por defecto.
         let config: JarvisConfig = toml::from_str("gaming_mode = true\n").unwrap();
         assert_eq!(config.stt_model().0, SttModel::DEFAULT);
+    }
+
+    /// HU-75: `[stt] backend` con Whisper por defecto y caída segura ante
+    /// valores desconocidos (el binario distribuido solo enlaza whisper).
+    #[test]
+    fn stt_backend_defaults_to_whisper_and_invalid_values_fall_back() {
+        let config = JarvisConfig::default();
+        assert_eq!(config.stt.backend, "whisper");
+        assert_eq!(config.stt_backend(), (SttBackend::Whisper, None));
+        assert_eq!(SttBackend::DEFAULT, SttBackend::Whisper);
+
+        // Se emite como tabla `[stt]`, no como clave suelta.
+        let toml = toml::to_string(&config).expect("serializa");
+        assert!(toml.contains("[stt]"), "{toml}");
+        assert!(toml.contains("backend = \"whisper\""), "{toml}");
+
+        // Lectura de la tabla, con alias y con espacios.
+        let config: JarvisConfig = toml::from_str("[stt]\nbackend = \"sherpa\"\n").unwrap();
+        assert_eq!(config.stt_backend(), (SttBackend::Sherpa, None));
+        let config: JarvisConfig = toml::from_str("[stt]\nbackend = \" Sherpa-ONNX \"\n").unwrap();
+        assert_eq!(config.stt_backend(), (SttBackend::Sherpa, None));
+
+        for bad in ["sensevoice", "", "onnx", "../sherpa"] {
+            let config = JarvisConfig {
+                stt: SttConfig {
+                    backend: bad.to_string(),
+                },
+                ..JarvisConfig::default()
+            };
+            let (backend, warning) = config.stt_backend();
+            assert_eq!(backend, SttBackend::Whisper, "{bad:?}");
+            assert!(warning.is_some_and(|w| w.contains("sherpa")), "{bad:?}");
+        }
+
+        // Un archivo sin la tabla conserva el valor por defecto.
+        let config: JarvisConfig = toml::from_str("gaming_mode = true\n").unwrap();
+        assert_eq!(config.stt_backend().0, SttBackend::DEFAULT);
+        // Y una tabla vacía también.
+        let config: JarvisConfig = toml::from_str("[stt]\n").unwrap();
+        assert_eq!(config.stt_backend().0, SttBackend::Whisper);
     }
 
     #[test]

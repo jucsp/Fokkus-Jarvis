@@ -16,11 +16,11 @@ mod state;
 pub use bus::{AudioLevel, AudioLevelStore, EventBus};
 pub use config::{
     sphere_size_for_pct, AutomationConfig, BrainMode, ConfigError, JarvisConfig,
-    NotificationsConfig, Opacity, SttModel, VoiceEndpointConfig, CONNECTOR_GRACE_MS_RANGE,
-    DEFAULT_CLI_COMMAND, DEFAULT_SPHERE_SIZE_PX, EXTENDED_SILENCE_MS_RANGE, FULLSCREEN_PCT_RANGE,
-    HUD_MAX_BUBBLES_RANGE, MAX_SEGMENT_MS_RANGE, MAX_TURN_MS_RANGE,
-    NOTIFICATIONS_TTL_MINUTES_RANGE, SILENCE_MS_RANGE, SPHERE_OPACITY_RANGE, SPHERE_SCALE_RANGE,
-    VOICE_HOLD_RANGE, VOICE_OPEN_RANGE,
+    NotificationsConfig, Opacity, SttBackend, SttConfig, SttModel, VoiceEndpointConfig,
+    CONNECTOR_GRACE_MS_RANGE, DEFAULT_CLI_COMMAND, DEFAULT_SPHERE_SIZE_PX,
+    EXTENDED_SILENCE_MS_RANGE, FULLSCREEN_PCT_RANGE, HUD_MAX_BUBBLES_RANGE, MAX_SEGMENT_MS_RANGE,
+    MAX_TURN_MS_RANGE, NOTIFICATIONS_TTL_MINUTES_RANGE, SILENCE_MS_RANGE, SPHERE_OPACITY_RANGE,
+    SPHERE_SCALE_RANGE, VOICE_HOLD_RANGE, VOICE_OPEN_RANGE,
 };
 pub use fullscreen::{
     is_effectively_fullscreen, FullscreenBehavior, OutputGeometry, Rect, WindowSnapshot,

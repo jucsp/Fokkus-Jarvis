@@ -53,7 +53,7 @@ use jarvis_automation::{
 use jarvis_core::single_instance::{self, InstanceError};
 use jarvis_core::{
     sphere_size_for_pct, tasks_dir, FullscreenBehavior, JarvisConfig, JarvisCore, Opacity,
-    SharedCore,
+    SharedCore, SttBackend,
 };
 use jarvis_ipc::{
     speech_priority, IpcClient, IpcError, IpcServer, RoutingMetrics, ServerState, SpeechSink,
@@ -990,6 +990,7 @@ fn run() -> ExitCode {
         }
     };
     let stt_model = stt_model_from(&config);
+    let stt_backend = stt_backend_from(&config);
 
     // Un único núcleo: la esfera, el IPC y el orquestador ven el mismo estado.
     let core = SharedCore::new(JarvisCore::new(config.clone()));
@@ -1169,11 +1170,25 @@ fn run() -> ExitCode {
         Some((mgr, plan)) => SttAvailability::probe(mgr, plan),
         None => SttAvailability::NoDataDir,
     };
-    if let Some(warning) = stt.warning() {
-        eprintln!("{warning}");
+    // Con `stt.backend = "sherpa"` el modelo que se sondea no es el de whisper:
+    // el loader informa por su cuenta si el motor pedido no arranca (HU-75), así
+    // que el aviso de «STT deshabilitado» describiría un motor que no se usará.
+    if stt_backend == SttBackend::Whisper {
+        if let Some(warning) = stt.warning() {
+            eprintln!("{warning}");
+        }
     }
+    // La línea de arranque nombra el motor pedido, no el que whisper podría
+    // haber cargado en su lugar.
+    let stt_label = match stt_backend {
+        SttBackend::Whisper => stt.label(),
+        SttBackend::Sherpa if runtime::sherpa_model_present() => "sherpa",
+        SttBackend::Sherpa => "sin-modelo-sherpa",
+    };
     let mut stt_pending = match model_manager {
-        Some((manager, plan)) if orchestrator.is_some() => runtime::spawn_stt_loader(manager, plan),
+        Some((manager, plan)) if orchestrator.is_some() => {
+            runtime::spawn_stt_loader(manager, plan, stt_backend)
+        }
         _ => None,
     };
 
@@ -1191,7 +1206,7 @@ fn run() -> ExitCode {
             config.voice_id,
             config.voice_lang,
             tts_backend,
-            stt.label(),
+            stt_label,
             core.state(),
         );
         println!(
@@ -1226,8 +1241,8 @@ fn run() -> ExitCode {
     let tray_revision = Cell::new(None::<u64>);
     let mut source = || {
         if let Some(orchestrator) = orchestrator.borrow().as_ref() {
-            runtime::poll_stt_loader(&mut stt_pending, |engine: WhisperEngine| {
-                orchestrator.set_transcriber(Box::new(engine))
+            runtime::poll_stt_loader(&mut stt_pending, |engine: runtime::Transcriber| {
+                orchestrator.set_transcriber(engine)
             });
         }
         // Sub-sesiones en la bandeja (HU-67): la revisión del gestor es una
@@ -1542,12 +1557,6 @@ fn tray_menu_sessions(records: &[TaskRecord]) -> Vec<jarvis_shell::tray::TraySes
     live.into_iter().map(tray_session).collect()
 }
 
-/// Comprueba la salud de los subsistemas y sale.
-///
-/// Reporta el estado de la configuración, el lock de instancia única, los
-/// backends TTS/STT y el socket IPC. Devuelve un código de error solo si algún
-/// subsistema queda en [`Health::Fail`]; las degradaciones ([`Health::Warn`])
-/// se informan pero no bloquean la salida.
 /// Modelo STT de `config.toml` (HU-69, CA-69.5); un valor inválido cae al
 /// por defecto con aviso.
 fn stt_model_from(config: &JarvisConfig) -> ModelSpec {
@@ -1558,6 +1567,132 @@ fn stt_model_from(config: &JarvisConfig) -> ModelSpec {
     jarvis_audio::stt_spec(model)
 }
 
+/// Backend STT de `config.toml` (HU-75); un valor inválido cae al de por
+/// defecto con aviso, igual que el modelo.
+///
+/// El valor decide qué motor se intenta: `whisper` (por defecto) no prueba
+/// sherpa aunque el modelo NeMo CTC esté en disco, y `sherpa` lo intenta antes
+/// de descargar whisper.
+fn stt_backend_from(config: &JarvisConfig) -> SttBackend {
+    let (backend, warning) = config.stt_backend();
+    if let Some(warning) = warning {
+        eprintln!("[config] {warning}");
+    }
+    backend
+}
+
+/// Chequeo del backend STT tal como lo verá el daemon (HU-75).
+///
+/// El motor que se comprueba es el que pide `stt.backend`: con `"sherpa"` se
+/// intenta primero el motor preferente —sherpa-onnx con el modelo NeMo CTC— y,
+/// si carga de verdad, se informa y **no se toca whisper**: es exactamente lo
+/// que hará el arranque. Si no, se deja el motivo (sin rutas del usuario,
+/// SEC-02) y se sigue con el chequeo de whisper de siempre (HU-69), que es el
+/// respaldo real. Con `"whisper"` no se menciona sherpa en absoluto: sería un
+/// falso aviso sobre un motor que la configuración no pidió.
+fn stt_checks(config: &JarvisConfig) -> Vec<(&'static str, Health, String)> {
+    let mut checks = Vec::new();
+    // Un `stt.backend` desconocido se acepta y se avisa; el arranque hace lo
+    // mismo, así que el diagnóstico no puede callarlo.
+    let (backend, warning) = config.stt_backend();
+    if let Some(warning) = warning {
+        checks.push(("STT", Health::Warn, warning));
+    }
+    if backend == SttBackend::Sherpa {
+        let started = std::time::Instant::now();
+        match runtime::try_load_sherpa_engine() {
+            Ok(_) => {
+                let elapsed = started.elapsed().as_millis();
+                checks.push((
+                    "STT",
+                    Health::Ok,
+                    format!("sherpa-onnx NeMo CTC cargado en {elapsed} ms"),
+                ));
+                return checks;
+            }
+            Err(status) => {
+                // Aquí el motor se pidió por nombre, así que cualquier motivo
+                // —incluido «compilado sin la feature»— es una petición que no
+                // se cumple y merece su fila.
+                checks.push((
+                    "STT sherpa",
+                    Health::Warn,
+                    format!("{}; se comprueba whisper", status.reason()),
+                ));
+            }
+        }
+    }
+    checks.extend(whisper_stt_checks(config));
+    checks
+}
+
+/// Chequeo del modelo whisper del plan (o de su respaldo, HU-69): se verifica
+/// la integridad y se carga el contexto de verdad.
+fn whisper_stt_checks(config: &JarvisConfig) -> Vec<(&'static str, Health, String)> {
+    let mut checks = Vec::new();
+    let stt_model = stt_model_from(config);
+    match ModelManager::new() {
+        Ok(manager) => {
+            let plan = manager.plan_stt(&stt_model);
+            if let Some(reason) = &plan.fallback_reason {
+                checks.push((
+                    "STT respaldo",
+                    Health::Warn,
+                    format!("{} en lugar de {}: {reason}", plan.spec.id, stt_model.id),
+                ));
+            }
+            let spec = plan.spec;
+            match manager.status(&spec) {
+                ModelStatus::Verified { .. } => {
+                    let started = std::time::Instant::now();
+                    match manager
+                        .load_verified(&spec)
+                        .map_err(|e| e.to_string())
+                        .and_then(|model| {
+                            WhisperEngine::from_verified(model).map_err(|e| e.to_string())
+                        }) {
+                        Ok(engine) => checks.push((
+                            "STT",
+                            Health::Ok,
+                            format!(
+                                "{} cargado en whisper en {} ms (sha256 {})",
+                                engine.model_id(),
+                                started.elapsed().as_millis(),
+                                engine.model_sha256()
+                            ),
+                        )),
+                        Err(e) => checks.push(("STT", Health::Fail, format!("no carga: {e}"))),
+                    }
+                }
+                ModelStatus::Missing => checks.push((
+                    "STT",
+                    Health::Warn,
+                    format!(
+                        "{} no descargado aún en {} (se descarga al arrancar desde {MODELS_RELEASE_TAG})",
+                        spec.id,
+                        manager.path_of(&spec).display()
+                    ),
+                )),
+                ModelStatus::Invalid { reason } => {
+                    checks.push(("STT", Health::Fail, format!("modelo corrupto: {reason}")));
+                }
+            }
+        }
+        Err(_) => checks.push((
+            "STT",
+            Health::Warn,
+            "no se pudo resolver ~/.local/share".to_string(),
+        )),
+    }
+    checks
+}
+
+/// Comprueba la salud de los subsistemas y sale.
+///
+/// Reporta el estado de la configuración, el lock de instancia única, los
+/// backends TTS/STT y el socket IPC. Devuelve un código de error solo si algún
+/// subsistema queda en [`Health::Fail`]; las degradaciones ([`Health::Warn`])
+/// se informan pero no bloquean la salida.
 fn run_health_check() -> ExitCode {
     println!(
         "Fokkus-Jarvis {} — diagnóstico de subsistemas",
@@ -1619,62 +1754,9 @@ fn run_health_check() -> ExitCode {
         )),
     }
 
-    // 4. Backend STT: el modelo elegido (o su respaldo, HU-69) se verifica y
-    //    se carga en whisper de verdad.
-    let stt_model = stt_model_from(&config);
-    match ModelManager::new() {
-        Ok(manager) => {
-            let plan = manager.plan_stt(&stt_model);
-            if let Some(reason) = &plan.fallback_reason {
-                checks.push((
-                    "STT respaldo",
-                    Health::Warn,
-                    format!("{} en lugar de {}: {reason}", plan.spec.id, stt_model.id),
-                ));
-            }
-            let spec = plan.spec;
-            match manager.status(&spec) {
-                ModelStatus::Verified { .. } => {
-                    let started = std::time::Instant::now();
-                    match manager
-                        .load_verified(&spec)
-                        .map_err(|e| e.to_string())
-                        .and_then(|model| {
-                            WhisperEngine::from_verified(model).map_err(|e| e.to_string())
-                        }) {
-                        Ok(engine) => checks.push((
-                            "STT",
-                            Health::Ok,
-                            format!(
-                                "{} cargado en whisper en {} ms (sha256 {})",
-                                engine.model_id(),
-                                started.elapsed().as_millis(),
-                                engine.model_sha256()
-                            ),
-                        )),
-                        Err(e) => checks.push(("STT", Health::Fail, format!("no carga: {e}"))),
-                    }
-                }
-                ModelStatus::Missing => checks.push((
-                    "STT",
-                    Health::Warn,
-                    format!(
-                        "{} no descargado aún en {} (se descarga al arrancar desde {MODELS_RELEASE_TAG})",
-                        spec.id,
-                        manager.path_of(&spec).display()
-                    ),
-                )),
-                ModelStatus::Invalid { reason } => {
-                    checks.push(("STT", Health::Fail, format!("modelo corrupto: {reason}")))
-                }
-            }
-        }
-        Err(_) => checks.push((
-            "STT",
-            Health::Warn,
-            "no se pudo resolver ~/.local/share".to_string(),
-        )),
-    }
+    // 4. Backend STT: se informa el motor que el daemon usa de verdad (HU-75),
+    //    no el que se supone.
+    checks.extend(stt_checks(&config));
 
     // 5. Dispositivos de audio: se abren de verdad y se sueltan al terminar.
     checks.extend(probe_audio_streams());

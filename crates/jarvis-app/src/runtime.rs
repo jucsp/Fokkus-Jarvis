@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, TryRecvError};
 use jarvis_audio::models::{ModelManager, ModelStatus, SttPlan};
 use jarvis_audio::WhisperEngine;
-use jarvis_core::{AudioLevel, JarvisConfig, JarvisState, Opacity, SphereVisualState};
+use jarvis_core::{AudioLevel, JarvisConfig, JarvisState, Opacity, SphereVisualState, SttBackend};
 use jarvis_render::{OpacityFade, Pixmap, RenderError, SphereRenderer};
 use jarvis_shell::{FrameBuffer, OverlaySurface, ShellCommand, SurfaceSize, SurfaceStatus};
 
@@ -526,19 +526,185 @@ impl ProgressLog {
     }
 }
 
-/// Resultado de la carga de whisper en segundo plano.
+/// Resultado de la carga del motor STT en segundo plano.
 pub type SttLoad<T> = Receiver<Result<T, String>>;
+
+/// Transcriptor listo para el orquestador: whisper o, si está en disco,
+/// sherpa-onnx (HU-75).
+pub type Transcriber = Box<dyn jarvis_audio::Transcriber + Send>;
+
+/// Por qué sherpa-onnx no quedó como motor STT activo (HU-75).
+///
+/// Compartido entre el daemon y `--check` para que el diagnóstico informe el
+/// motor real y no uno supuesto. **Nunca lleva rutas del usuario**: el motivo
+/// de un fallo de carga se sanea con `without_user_paths` (SEC-02).
+// Cada binario construye solo una parte de las variantes (`FeatureOff` sin la
+// feature, el resto con ella), pero `--check` las recorre todas: el `allow`
+// evita que el diagnóstico se llene de avisos de código muerto según cómo se
+// haya compilado.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SherpaStatus {
+    /// Binario compilado sin la feature `sherpa`.
+    FeatureOff,
+    /// No se pudo resolver el directorio de datos de los modelos.
+    NoModelsDir,
+    /// El modelo NeMo CTC no está en el directorio de modelos.
+    ModelMissing,
+    /// El modelo está en disco pero el reconocedor no se pudo crear.
+    EngineFailed(String),
+}
+
+impl SherpaStatus {
+    /// Motivo legible y sin rutas del usuario (SEC-02).
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            Self::FeatureOff => "compilado sin la feature sherpa",
+            Self::NoModelsDir => "sin directorio de datos para los modelos",
+            Self::ModelMissing => "modelo NeMo CTC no descargado",
+            Self::EngineFailed(reason) => reason,
+        }
+    }
+}
+
+/// Intenta activar sherpa-onnx con el modelo NeMo CTC del directorio de modelos.
+///
+/// Devuelve el transcriptor ya envuelto o el motivo por el que no se usó. La
+/// ruta sale siempre del directorio de modelos, nunca de la configuración
+/// (SEC-02).
+#[cfg(feature = "sherpa")]
+pub(crate) fn try_load_sherpa_engine() -> Result<Transcriber, SherpaStatus> {
+    let models_dir = jarvis_audio::models::default_models_dir().ok_or(SherpaStatus::NoModelsDir)?;
+    try_load_sherpa_engine_in(&models_dir)
+}
+
+/// Igual que [`try_load_sherpa_engine`], con el directorio de modelos explícito.
+///
+/// Existe para poder probar la decisión sin depender de lo que haya en el
+/// `$HOME` de quien corre las pruebas.
+#[cfg(feature = "sherpa")]
+pub(crate) fn try_load_sherpa_engine_in(
+    models_dir: &std::path::Path,
+) -> Result<Transcriber, SherpaStatus> {
+    use jarvis_audio::{locate_nemo_ctc, SherpaEngine};
+
+    let (model, tokens) = locate_nemo_ctc(models_dir).ok_or(SherpaStatus::ModelMissing)?;
+    SherpaEngine::nemo_ctc(&model, &tokens)
+        .map(|engine| Box::new(engine) as Transcriber)
+        .map_err(|e| SherpaStatus::EngineFailed(without_user_paths(&e.to_string(), &model)))
+}
+
+/// Sin la feature `sherpa` el motor alternativo no existe.
+#[cfg(not(feature = "sherpa"))]
+pub(crate) fn try_load_sherpa_engine() -> Result<Transcriber, SherpaStatus> {
+    Err(SherpaStatus::FeatureOff)
+}
+
+/// Sustituye el directorio del modelo por `…` en un mensaje de error.
+///
+/// El enlace nativo devuelve rutas completas cuando no puede abrir el `.onnx`;
+/// `--check` y el log solo necesitan el nombre del archivo (SEC-02).
+#[cfg(feature = "sherpa")]
+fn without_user_paths(message: &str, model: &std::path::Path) -> String {
+    let mut out = message.to_string();
+    if let Some(dir) = model.parent() {
+        let dir = dir.display().to_string();
+        if !dir.is_empty() {
+            out = out.replace(&dir, "…");
+        }
+    }
+    out
+}
+
+/// `true` si `stt.backend` pide sherpa-onnx (HU-75).
+///
+/// El motor alternativo se intenta **solo** cuando la configuración lo nombra:
+/// quien dejó el valor por defecto no ve cómo le sustituyen el modelo whisper
+/// verificado por otro que no eligió.
+fn wants_sherpa(backend: SttBackend) -> bool {
+    matches!(backend, SttBackend::Sherpa)
+}
+
+/// `true` si el modelo NeMo CTC está en disco (HU-75).
+///
+/// Comprobación barata: solo mira que existan los dos archivos, sin construir el
+/// reconocedor ni tocar el enlace nativo. Sirve para que la línea de arranque
+/// nombre el motor que se pidió en `stt.backend`.
+#[cfg(feature = "sherpa")]
+pub(crate) fn sherpa_model_present() -> bool {
+    jarvis_audio::models::default_models_dir()
+        .is_some_and(|models_dir| sherpa_model_present_in(&models_dir))
+}
+
+/// Igual que [`sherpa_model_present`], con el directorio de modelos explícito.
+#[cfg(feature = "sherpa")]
+fn sherpa_model_present_in(models_dir: &std::path::Path) -> bool {
+    jarvis_audio::locate_nemo_ctc(models_dir).is_some()
+}
+
+/// Sin la feature `sherpa` no hay modelo que buscar.
+#[cfg(not(feature = "sherpa"))]
+pub(crate) fn sherpa_model_present() -> bool {
+    false
+}
+
+/// Motor STT del daemon cuando `stt.backend = "sherpa"`; `None` para que
+/// [`spawn_stt_loader`] siga con whisper.
+///
+/// Con cualquier otro backend devuelve `None` sin tocar el enlace nativo: el
+/// modelo NeMo CTC puede estar en disco y aun así no usarse.
+fn load_sherpa_engine(backend: SttBackend) -> Option<Transcriber> {
+    if !wants_sherpa(backend) {
+        return None;
+    }
+    match try_load_sherpa_engine() {
+        Ok(engine) => Some(engine),
+        Err(status) => {
+            // Se avisa siempre que se haya pedido sherpa: con la elección
+            // explícita, caer a whisper deja de ser «lo normal» y el motivo
+            // (sin rutas del usuario, SEC-02) es lo único que explica por qué
+            // habla el motor de siempre.
+            eprintln!(
+                "[stt] sherpa-onnx no disponible ({}); se usa whisper",
+                status.reason()
+            );
+            None
+        }
+    }
+}
 
 /// Verifica (y si falta, descarga) el modelo whisper del plan y lo carga
 /// **una sola vez** en un hilo de fondo (HU-7). Si el preferido no está
 /// disponible cae al respaldo verificado y lo informa (HU-69, CA-69.6). Nunca
 /// bloquea el arranque ni el render: el resultado llega por el canal y lo
 /// recoge [`poll_stt_loader`].
-pub fn spawn_stt_loader(manager: ModelManager, plan: SttPlan) -> Option<SttLoad<WhisperEngine>> {
+///
+/// Con `stt.backend = "sherpa"` intenta antes sherpa-onnx con el modelo NeMo
+/// CTC: si está en disco se entrega ese motor y no se toca la red ni whisper.
+/// Con `"whisper"`, que es el valor por defecto, no se prueba sherpa siquiera.
+/// La caída a whisper es silenciosa para no romper el arranque.
+pub fn spawn_stt_loader(
+    manager: ModelManager,
+    plan: SttPlan,
+    backend: SttBackend,
+) -> Option<SttLoad<Transcriber>> {
     let (tx, rx) = crossbeam_channel::bounded(1);
     let spawned = std::thread::Builder::new()
         .name("jarvis-models".to_string())
         .spawn(move || {
+            // HU-75 fase 2: solo si `stt.backend` lo pide, y siempre que el
+            // modelo NeMo CTC esté en disco y la feature esté compilada, se
+            // arranca sin descargar ni cargar whisper.
+            let sherpa_started = Instant::now();
+            if let Some(engine) = load_sherpa_engine(backend) {
+                println!(
+                    "[stt] sherpa-onnx (NeMo FastConformer CTC int8) cargado en {} ms.",
+                    sherpa_started.elapsed().as_millis()
+                );
+                let _ = tx.send(Ok(engine));
+                return;
+            }
+
             let spec = plan.spec;
             // Dañado también se descarga: `ensure` lo borra antes.
             if !matches!(manager.status(&spec), ModelStatus::Verified { .. }) {
@@ -576,6 +742,7 @@ pub fn spawn_stt_loader(manager: ModelManager, plan: SttPlan) -> Option<SttLoad<
                                 started.elapsed().as_millis()
                             )
                         })
+                        .map(|engine| Box::new(engine) as Transcriber)
                 });
             let _ = tx.send(result);
             // El preferido se descarga después, ya con el STT funcionando:
@@ -1302,5 +1469,93 @@ mod tests {
     fn local_time_is_a_valid_clock_reading() {
         let (h, m) = local_time();
         assert!(h < 24 && m < 60);
+    }
+
+    /// HU-75 · `--check` debe informar el motor que el daemon usaría de verdad:
+    /// con el modelo NeMo CTC de media pareja el veredicto es «no hay motor
+    /// sherpa» y el motivo se puede imprimir tal cual.
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn sherpa_status_reports_a_missing_model_hu75() {
+        let root = std::env::temp_dir().join(format!("jarvis-sherpa-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("directorio temporal");
+
+        // Directorio vacío: ni se intenta el enlace nativo (SEC-02).
+        match try_load_sherpa_engine_in(&root) {
+            Ok(_) => panic!("sin modelo no debe haber motor"),
+            Err(status) => {
+                assert_eq!(status, SherpaStatus::ModelMissing);
+                let reason = status.reason();
+                assert_eq!(reason, "modelo NeMo CTC no descargado");
+                assert!(!reason.contains('/'), "{reason}");
+            }
+        }
+
+        // Media pareja (solo el `.onnx`) sigue siendo «no descargado».
+        let dir = root.join(jarvis_audio::NEMO_CTC_DIR);
+        std::fs::create_dir_all(&dir).expect("directorio del modelo");
+        std::fs::write(dir.join(jarvis_audio::NEMO_CTC_MODEL), b"x").expect("modelo de prueba");
+        match try_load_sherpa_engine_in(&root) {
+            Ok(_) => panic!("sin tokens.txt no debe haber motor"),
+            Err(status) => assert_eq!(status, SherpaStatus::ModelMissing),
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// El motivo de un fallo de carga se imprime en `--check` y en el log, así
+    /// que no puede llevar rutas del usuario (SEC-02).
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn sherpa_failure_reason_never_carries_user_paths_hu75() {
+        let path = "/home/alguien/.local/share/fokkus-jarvis/models/nemo/model.int8.onnx";
+        let model = std::path::Path::new(path);
+        let raw = format!("backend STT alternativo: no existe el modelo ONNX en {path}");
+        let reason = without_user_paths(&raw, model);
+        assert!(!reason.contains("/home/alguien"), "{reason}");
+        assert!(reason.contains(jarvis_audio::NEMO_CTC_MODEL), "{reason}");
+    }
+
+    /// Sin la feature el diagnóstico no finge un backend que no está compilado.
+    #[cfg(not(feature = "sherpa"))]
+    #[test]
+    fn sherpa_reports_the_feature_is_not_compiled_hu75() {
+        assert_eq!(
+            try_load_sherpa_engine().err(),
+            Some(SherpaStatus::FeatureOff)
+        );
+        assert_eq!(
+            SherpaStatus::FeatureOff.reason(),
+            "compilado sin la feature sherpa"
+        );
+    }
+
+    /// El backend por defecto conserva whisper: el modelo NeMo CTC puede estar
+    /// en disco y aun así no se toca (HU-75).
+    #[test]
+    fn whisper_backend_never_tries_sherpa_hu75() {
+        assert!(!wants_sherpa(SttBackend::Whisper));
+        assert!(wants_sherpa(SttBackend::Sherpa));
+        // El guardia corta antes del enlace nativo: sin modelo, sin carga y sin
+        // aviso por stderr.
+        assert!(load_sherpa_engine(SttBackend::Whisper).is_none());
+    }
+
+    /// La línea de arranque solo nombra sherpa cuando los dos archivos del
+    /// modelo están en disco (HU-75).
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn sherpa_model_presence_needs_both_files_hu75() {
+        let root = std::env::temp_dir().join(format!("jarvis-nemo-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("directorio temporal");
+        assert!(!sherpa_model_present_in(&root));
+
+        let dir = root.join(jarvis_audio::NEMO_CTC_DIR);
+        std::fs::create_dir_all(&dir).expect("directorio del modelo");
+        std::fs::write(dir.join(jarvis_audio::NEMO_CTC_MODEL), b"x").expect("modelo de prueba");
+        assert!(!sherpa_model_present_in(&root));
+
+        std::fs::write(dir.join(jarvis_audio::NEMO_CTC_TOKENS), b"a\n").expect("tokens de prueba");
+        assert!(sherpa_model_present_in(&root));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

@@ -24,6 +24,22 @@ ureq.workspace = true
 sha2.workspace = true
 serde_json.workspace = true
 keyring.workspace = true
+# Motor STT alternativo de HU-75 (SenseVoice / Whisper-ONNX).
+#
+# Opt-in y **no** activo por defecto, por dos motivos:
+#  1. El build script de `sherpa-onnx-sys` descarga un archivo nativo
+#     precompilado desde GitHub Releases si no se define `SHERPA_ONNX_LIB_DIR`,
+#     lo que choca con SEC-01 (nada de binarios sin vendorizar).
+#  2. Es una biblioteca C++ grande: activarla sin comprobar el enlace rompería
+#     el build de todo el workspace.
+# Para compilarla: `cargo check -p jarvis-audio --features sherpa`.
+sherpa-onnx = { version = "2.0.1", default-features = false, features = ["static"], optional = true }
+
+[features]
+# Sin features por defecto: `cargo build` sigue usando solo whisper.cpp.
+default = []
+# HU-75: enlaza sherpa-onnx y compila `stt::sherpa` (ver comentario arriba).
+sherpa = ["dep:sherpa-onnx"]
 
 [target.'cfg(unix)'.dependencies]
 # Matar el grupo de procesos del cerebro CLI en el barge-in.

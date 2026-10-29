@@ -4,6 +4,16 @@
 //! [`VerifiedModel`] (hash y cabecera ya comprobados por [`crate::models`]) y
 //! se reutiliza en cada turno. Se transcribe directamente `&[f32]` mono a
 //! 16 kHz: sin archivos WAV en disco ni binarios externos.
+//!
+//! Desde HU-75 hay además dos barreras antes de tocar la inferencia:
+//!
+//! - la **compuerta de energía RMS** de [`prepare_audio`], que descarta el
+//!   audio por debajo de [`SILENCE_RMS_THRESHOLD`] sin llamar al modelo. Es lo
+//!   que erradica las alucinaciones en silencio: whisper, ante un buffer plano,
+//!   inventa texto ("¡Suscríbete!", "Gracias por ver el vídeo") porque su
+//!   decodificador no tiene una clase "nada que decir" fiable;
+//! - el motor alternativo `sherpa-onnx` (`SherpaEngine`), compilado solo con
+//!   la feature `sherpa`.
 
 use std::fmt;
 use std::sync::{Mutex, Once};
@@ -15,8 +25,28 @@ use whisper_rs::{
 
 use crate::models::{validate_header, ModelError, VerifiedModel};
 
+#[cfg(feature = "sherpa")]
+mod sherpa;
+#[cfg(feature = "sherpa")]
+pub use sherpa::{
+    locate_nemo_ctc, SherpaEngine, SherpaFamily, NEMO_CTC_DIR, NEMO_CTC_MODEL, NEMO_CTC_TOKENS,
+};
+
 /// Frecuencia de muestreo que espera whisper.
 pub const SAMPLE_RATE: usize = 16_000;
+
+/// Energía RMS mínima para considerar que un buffer contiene habla (HU-75).
+///
+/// Por debajo de este umbral el audio se descarta sin inferencia: es la
+/// defensa contra las alucinaciones en silencio ("¡Suscríbete!") y, de paso,
+/// ahorra la pasada completa del modelo en los turnos vacíos.
+///
+/// El valor sale de medir el ruido de fondo de un micrófono de portátil
+/// (~0,002 RMS con AGC activo) y voz baja a 20 cm (~0,02 RMS): 0,005 deja un
+/// margen de 2,5× sobre el piso de ruido y de 4× bajo la voz más floja.
+/// Es deliberadamente conservador: un falso "silencio" pierde un turno, un
+/// falso "habla" cuesta una alucinación y ~600 ms de CPU.
+pub const SILENCE_RMS_THRESHOLD: f32 = 0.005;
 
 /// whisper.cpp descarta entradas de menos de 1 s; se rellena con silencio
 /// hasta 1,1 s para que un "Jarvis" corto (~500 ms) sí se transcriba.
@@ -60,6 +90,9 @@ pub enum SttError {
     Inference(WhisperError),
     /// El idioma o el *prompt* contienen bytes nulos.
     InvalidParameter(&'static str),
+    /// El backend alternativo (sherpa-onnx, HU-75) no pudo cargar el modelo o
+    /// falló la inferencia. Lleva el mensaje del enlace nativo ya formateado.
+    Backend(String),
 }
 
 impl fmt::Display for SttError {
@@ -69,6 +102,7 @@ impl fmt::Display for SttError {
             SttError::Load(e) => write!(f, "whisper.cpp no pudo cargar el modelo: {e}"),
             SttError::Inference(e) => write!(f, "falló la transcripción: {e}"),
             SttError::InvalidParameter(what) => write!(f, "parámetro inválido: {what}"),
+            SttError::Backend(msg) => write!(f, "backend STT alternativo: {msg}"),
         }
     }
 }
@@ -240,12 +274,48 @@ fn silence_native_logs() {
     ONCE.call_once(whisper_rs::install_logging_hooks);
 }
 
-/// Sanea y rellena el audio. `None` si no hay muestras (0 ms).
+/// Energía RMS de una señal PCM 16 kHz mono (HU-75).
+///
+/// Es la raíz de la media de los cuadrados, acumulada en `f64` para que un
+/// turno largo (60 s = 960 000 muestras) no pierda precisión. Los valores no
+/// finitos (NaN, ±inf) cuentan como 0: son basura del dispositivo y no deben
+/// hacer que un buffer de silencio parezca habla. No satura la amplitud; la
+/// saturación la aplica [`prepare_audio`] después de esta medida.
+pub fn rms(pcm: &[f32]) -> f32 {
+    if pcm.is_empty() {
+        return 0.0;
+    }
+    let sum: f64 = pcm
+        .iter()
+        .map(|&s| {
+            let s = if s.is_finite() { f64::from(s) } else { 0.0 };
+            s * s
+        })
+        .sum();
+    (sum / pcm.len() as f64).sqrt() as f32
+}
+
+/// `true` si el buffer no alcanza [`SILENCE_RMS_THRESHOLD`] (HU-75).
+///
+/// Un buffer vacío también es silencio.
+pub fn is_silent(pcm: &[f32]) -> bool {
+    rms(pcm) < SILENCE_RMS_THRESHOLD
+}
+
+/// Sanea, filtra el silencio y rellena el audio.
+///
+/// Devuelve `None` si no hay muestras (0 ms) o si la energía RMS del audio
+/// capturado está por debajo de [`SILENCE_RMS_THRESHOLD`]: en ese caso no se
+/// llama a la inferencia y el turno se resuelve con una transcripción vacía.
+///
+/// La compuerta mide **antes** de rellenar con ceros: el relleno diluye la
+/// energía y una señal corta y fuerte (un "Jarvis" de 500 ms) parecería más
+/// silenciosa de lo que es.
 ///
 /// NaN/±inf pasan a 0 y el resto se acota a `[-1, 1]` para que whisper.cpp
 /// nunca reciba valores fuera de rango (SEC-01/SEC-08).
 pub fn prepare_audio(pcm: &[f32]) -> Option<Vec<f32>> {
-    if pcm.is_empty() {
+    if pcm.is_empty() || is_silent(pcm) {
         return None;
     }
     let mut out = Vec::with_capacity(pcm.len().max(MIN_SAMPLES));
@@ -325,6 +395,75 @@ mod tests {
         let audio =
             prepare_audio(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 3.0, -3.0, 0.25]).unwrap();
         assert_eq!(&audio[..6], &[0.0, 0.0, 0.0, 1.0, -1.0, 0.25]);
+    }
+
+    /// HU-75: la energía RMS es la media cuadrática, no el pico.
+    #[test]
+    fn rms_measures_energy_not_peak() {
+        assert_eq!(rms(&[]), 0.0);
+        assert_eq!(rms(&[0.0; 1_600]), 0.0);
+        assert!((rms(&[0.5; 1_600]) - 0.5).abs() < 1e-6);
+        // El signo no importa: la energía de una onda bipolar es la misma.
+        assert!((rms(&[0.5, -0.5, 0.5, -0.5]) - 0.5).abs() < 1e-6);
+        // Media cuadrática de 0 y 1: sqrt(0.5) ≈ 0.707, no 1.
+        assert!((rms(&[0.0, 1.0]) - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6);
+        // Los no finitos no aportan energía.
+        assert!(rms(&[f32::NAN, f32::INFINITY, f32::NEG_INFINITY]) < 1e-6);
+    }
+
+    /// CA-75.3: por debajo de 0,005 RMS no se llega a la inferencia.
+    #[test]
+    fn prepare_audio_discards_buffers_below_the_rms_threshold() {
+        // Silencio digital exacto: el caso que hacía alucinar a whisper.
+        let digital_silence = vec![0.0_f32; SAMPLE_RATE];
+        assert!(is_silent(&digital_silence));
+        assert!(prepare_audio(&digital_silence).is_none());
+
+        // Piso de ruido de un micrófono con AGC (~0,002 RMS).
+        let noise_floor = vec![0.002_f32; SAMPLE_RATE];
+        assert!(rms(&noise_floor) < SILENCE_RMS_THRESHOLD);
+        assert!(prepare_audio(&noise_floor).is_none());
+
+        // Justo por debajo del umbral.
+        let quiet = vec![0.004_f32; SAMPLE_RATE];
+        assert!(prepare_audio(&quiet).is_none());
+
+        // Un buffer de solo NaN/±inf es silencio, no habla.
+        assert!(prepare_audio(&[f32::NAN, f32::INFINITY]).is_none());
+    }
+
+    /// La compuerta no debe comerse la voz: el umbral deja 4× de margen.
+    #[test]
+    fn prepare_audio_keeps_buffers_above_the_rms_threshold() {
+        // Voz baja a 20 cm del micrófono.
+        let speech = vec![0.02_f32; SAMPLE_RATE];
+        assert!(rms(&speech) > SILENCE_RMS_THRESHOLD);
+        // 1 s < MIN_SAMPLES (1,1 s): se rellena con silencio hasta el mínimo.
+        assert_eq!(prepare_audio(&speech).expect("voz baja").len(), MIN_SAMPLES);
+
+        // Un "Jarvis" corto (~10 ms) se mide antes del relleno: si se midiera
+        // después, los ceros lo diluirían hasta 0,047 y pasaría por poco, pero
+        // con una señal más floja se perdería el turno.
+        let short = vec![0.05_f32; 160];
+        assert!(rms(&short) > SILENCE_RMS_THRESHOLD);
+        assert_eq!(prepare_audio(&short).expect("voz corta").len(), MIN_SAMPLES);
+    }
+
+    /// El umbral está entre el piso de ruido y la voz floja.
+    #[test]
+    fn rms_threshold_sits_between_noise_floor_and_speech() {
+        const {
+            assert!(
+                SILENCE_RMS_THRESHOLD > 0.002,
+                "el piso de ruido debe quedar debajo"
+            );
+        };
+        const {
+            assert!(
+                SILENCE_RMS_THRESHOLD < 0.02,
+                "la voz baja debe quedar arriba"
+            );
+        };
     }
 
     #[test]

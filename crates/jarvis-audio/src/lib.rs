@@ -4,7 +4,9 @@
 //! - [`voices`]: catálogo de 19 voces neuronales.
 //! - [`tts`]: síntesis Edge-TTS con fallback a espeak-ng y caché de fillers.
 //! - [`playback`]: control de reproducción con parada instantánea (barge-in).
-//! - [`stt`]: transcripción local con Whisper (binario del sistema).
+//! - [`stt`]: transcripción local con Whisper, compuerta de energía RMS contra
+//!   las alucinaciones en silencio y motor alternativo `sherpa-onnx` (HU-75,
+//!   este último solo con la feature `sherpa`).
 //! - [`conversation`]: gestor de diálogo con fillers contextuales e interrupción
 //!   humana (Issues #3 y #4).
 //! - [`io`]: captura y reproducción con `cpal` (callbacks sin locks ni
@@ -92,7 +94,13 @@ pub use router::{
 pub use speech_queue::{
     Delivery, DeliveryGate, SpeechPriority, SpeechQueue, SPEECH_QUEUE_CAPACITY,
 };
-pub use stt::{SttError, Transcriber, WhisperEngine};
+pub use stt::{
+    is_silent, prepare_audio, rms, SttError, Transcriber, WhisperEngine, SILENCE_RMS_THRESHOLD,
+};
+#[cfg(feature = "sherpa")]
+pub use stt::{
+    locate_nemo_ctc, SherpaEngine, SherpaFamily, NEMO_CTC_DIR, NEMO_CTC_MODEL, NEMO_CTC_TOKENS,
+};
 pub use tasks::{
     classify_workload, dev_task_prompt, split_task_output, summarize, task_title, BrainFactory,
     TaskConfig, TaskId, TaskManager, TaskOrigin, TaskRecord, TaskStatus, Workload, DEV_TASK_TITLE,
