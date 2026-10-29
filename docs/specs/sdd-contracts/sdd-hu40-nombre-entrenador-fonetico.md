@@ -21,7 +21,7 @@ El usuario quiere llamar al asistente con otro nombre ("Viernes", "Nova", "Kai")
 | Pieza | Hoy | Brecha |
 |---|---|---|
 | `activation::DEFAULT_WAKE_WORD` | `"jarvis"` | — |
-| `JARVIS_PHONETIC_VARIANTS` | 11 variantes **cableadas**; `contains_wake_word` y `strip_wake_word` solo las aplican si la palabra es la de por defecto. | Un nombre nuevo no tiene variantes. |
+| `JARVIS_PHONETIC_VARIANTS` | 16 variantes **cableadas**; `contains_wake_word` y `strip_wake_word` solo las aplican si la palabra es la de por defecto. | Un nombre nuevo no tiene variantes. |
 | `ActivationDetector::with_wake_word` | Existe, pero `jarvis-app/src/main.rs:362` construye con `ActivationDetector::new()`: **el nombre no es configurable** en la práctica. `wake_word: String` es inmutable tras construir. | Falta campo en config, cambio en caliente y variantes por usuario. |
 | `WhisperEngine::with_initial_prompt` | Existe y no se usa para sesgar hacia el nombre. | Oportunidad barata de mejorar el acierto. |
 | `brain::SYSTEM_PROMPT` | "Eres Jarvis, el asistente de desarrollo de Fokkus…" (constante). | La persona no cambia con el nombre. |

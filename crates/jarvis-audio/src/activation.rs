@@ -36,11 +36,16 @@ use crate::stt::{SttError, Transcriber};
 /// Palabra de activación por defecto.
 pub const DEFAULT_WAKE_WORD: &str = "jarvis";
 
-/// Variantes fonéticas que whisper en español suele devolver para `"jarvis"`
-/// (HU-32). Se aplican solo cuando la palabra configurada es la de por defecto.
+/// Variantes fonéticas que whisper/sherpa-onnx en español suelen devolver para
+/// `"jarvis"` (HU-32). Se aplican solo cuando la palabra configurada es la de
+/// por defecto.
+///
+/// El bloque `arvis`/`arbis`/`harvis`/`harbis`/`árvis` cubre la aspiración
+/// suave de la `J` inicial que devuelve el motor CTC de sherpa-onnx
+/// (HU-32): `"Jarvis"` se transcribe como `"Arvis"`.
 const JARVIS_PHONETIC_VARIANTS: &[&str] = &[
     "jarvis", "yarvis", "jarbis", "yarbis", "llarvis", "llarbis", "charvis", "chárvis", "yárvis",
-    "jervis", "sharvis",
+    "jervis", "sharvis", "arvis", "arbis", "harvis", "harbis", "árvis",
 ];
 
 /// Ventana de seguimiento por defecto (8 s, HU-29; antes 5 s, HU-17).
@@ -494,6 +499,63 @@ mod tests {
         );
         assert_eq!(strip_wake_word("chárvis?", "Jarvis"), "");
         assert_eq!(strip_wake_word("llarvis, abre", "Jarvis"), "abre");
+    }
+
+    #[test]
+    fn wake_word_matches_soft_aspirated_arvis_variants() {
+        // sherpa-onnx (CTC) se come la "J" inicial aspirada del español:
+        // "Jarvis" se transcribe como "Arvis". Todas sus variantes deben
+        // activar igual que la palabra canónica (HU-32).
+        for text in [
+            "arvis",
+            "Arvis",
+            "ARVIS",
+            "arvis, qué hora es",
+            "Arvis, qué hora es",
+            "¡Arvis! abre el repo",
+            "arbis",
+            "harvis",
+            "harbis",
+            "árvis",
+            "Árvis, dime la hora",
+            "yárvis",
+            "chárvis",
+        ] {
+            assert!(contains_wake_word(text, "Jarvis"), "debió activar: {text}");
+        }
+
+        // El vocativo aspirado también se limpia: la consulta llega sin él.
+        assert_eq!(
+            strip_wake_word("Arvis, qué hora es", "Jarvis"),
+            "qué hora es"
+        );
+        assert_eq!(strip_wake_word("arvis?", "Jarvis"), "");
+        assert_eq!(strip_wake_word("¡Arvis!", "Jarvis"), "");
+        assert_eq!(
+            strip_wake_word("harbis, sube el volumen", "Jarvis"),
+            "sube el volumen"
+        );
+        assert_eq!(
+            strip_wake_word("árvis, dime la hora", "Jarvis"),
+            "dime la hora"
+        );
+
+        // La coincidencia sigue siendo por token completo: nada de parciales.
+        for text in ["arvisito", "el arviss", "harvismensaje", "arbisito"] {
+            assert!(
+                !contains_wake_word(text, "Jarvis"),
+                "no debió activar: {text}"
+            );
+        }
+
+        // Y el detector completo acepta la frase limpiando el vocativo.
+        let detector = ActivationDetector::new();
+        assert_eq!(
+            detector.process_text("Arvis, qué hora es"),
+            Activation::Accepted {
+                query: "qué hora es".into()
+            }
+        );
     }
 
     #[test]
