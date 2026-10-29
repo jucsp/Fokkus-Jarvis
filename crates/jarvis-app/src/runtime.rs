@@ -648,22 +648,47 @@ pub(crate) fn sherpa_model_present() -> bool {
     false
 }
 
-/// Motor STT del daemon cuando `stt.backend = "sherpa"`; `None` para que
-/// [`spawn_stt_loader`] siga con whisper.
+/// Motor STT del daemon cuando `stt.backend` pide sherpa-onnx —que es el valor
+/// por defecto (HU-75)—; `None` para que [`spawn_stt_loader`] siga con whisper.
 ///
-/// Con cualquier otro backend devuelve `None` sin tocar el enlace nativo: el
+/// Con `stt.backend = "whisper"` devuelve `None` sin tocar el enlace nativo: el
 /// modelo NeMo CTC puede estar en disco y aun así no usarse.
 fn load_sherpa_engine(backend: SttBackend) -> Option<Transcriber> {
     if !wants_sherpa(backend) {
         return None;
     }
-    match try_load_sherpa_engine() {
+    resolve_sherpa_engine(try_load_sherpa_engine())
+}
+
+/// Igual que [`load_sherpa_engine`], con el directorio de modelos explícito.
+///
+/// Existe para poder probar el respaldo sin depender de lo que haya en el
+/// `$HOME` de quien corre las pruebas: un directorio vacío es el caso «modelo
+/// no descargado», que debe devolver `None` (whisper) **sin abortar**.
+#[cfg(test)]
+#[cfg(feature = "sherpa")]
+fn load_sherpa_engine_from(
+    backend: SttBackend,
+    models_dir: &std::path::Path,
+) -> Option<Transcriber> {
+    if !wants_sherpa(backend) {
+        return None;
+    }
+    resolve_sherpa_engine(try_load_sherpa_engine_in(models_dir))
+}
+
+/// Traduce el intento de carga al motor que seguirá vivo: el transcriptor de
+/// sherpa o `None` para que [`spawn_stt_loader`] continue con whisper.
+///
+/// Ningún fallo del motor alternativo puede tumbar el arranque (SEC-02): el
+/// motivo —sin rutas del usuario— se registra y se devuelve `None`, nunca un
+/// `panic` ni un `?` que propague el error.
+fn resolve_sherpa_engine(result: Result<Transcriber, SherpaStatus>) -> Option<Transcriber> {
+    match result {
         Ok(engine) => Some(engine),
         Err(status) => {
-            // Se avisa siempre que se haya pedido sherpa: con la elección
-            // explícita, caer a whisper deja de ser «lo normal» y el motivo
-            // (sin rutas del usuario, SEC-02) es lo único que explica por qué
-            // habla el motor de siempre.
+            // Con sherpa como valor por defecto, el respaldo ya no es una
+            // rareza: el motivo es lo único que explica por qué habla whisper.
             eprintln!(
                 "[stt] sherpa-onnx no disponible ({}); se usa whisper",
                 status.reason()
@@ -679,10 +704,12 @@ fn load_sherpa_engine(backend: SttBackend) -> Option<Transcriber> {
 /// bloquea el arranque ni el render: el resultado llega por el canal y lo
 /// recoge [`poll_stt_loader`].
 ///
-/// Con `stt.backend = "sherpa"` intenta antes sherpa-onnx con el modelo NeMo
-/// CTC: si está en disco se entrega ese motor y no se toca la red ni whisper.
-/// Con `"whisper"`, que es el valor por defecto, no se prueba sherpa siquiera.
-/// La caída a whisper es silenciosa para no romper el arranque.
+/// Con `stt.backend = "sherpa"` —el valor por defecto (HU-75)— intenta antes
+/// sherpa-onnx con el modelo NeMo CTC: si está en disco se entrega ese motor y
+/// no se toca la red ni whisper. Si el modelo no está, la feature no está
+/// compilada o el enlace nativo falla, **no aborta**: se registra el motivo y
+/// se sigue con el camino whisper de siempre.
+/// Con `"whisper"` no se prueba sherpa siquiera.
 pub fn spawn_stt_loader(
     manager: ModelManager,
     plan: SttPlan,
@@ -1529,15 +1556,51 @@ mod tests {
         );
     }
 
-    /// El backend por defecto conserva whisper: el modelo NeMo CTC puede estar
-    /// en disco y aun así no se toca (HU-75).
+    /// El backend por defecto es sherpa-onnx: el daemon intenta NeMo CTC antes
+    /// que whisper sin que nadie configure nada (HU-75).
     #[test]
-    fn whisper_backend_never_tries_sherpa_hu75() {
-        assert!(!wants_sherpa(SttBackend::Whisper));
+    fn sherpa_is_the_default_backend_hu75() {
+        assert_eq!(SttBackend::DEFAULT, SttBackend::Sherpa);
+        assert!(wants_sherpa(SttBackend::DEFAULT));
         assert!(wants_sherpa(SttBackend::Sherpa));
-        // El guardia corta antes del enlace nativo: sin modelo, sin carga y sin
-        // aviso por stderr.
+        // `whisper` explícito sigue siendo el escape: no se toca el enlace
+        // nativo aunque el modelo NeMo CTC esté en disco (el guardia corta antes
+        // de `try_load_sherpa_engine`, así que no hay aviso por stderr).
+        assert!(!wants_sherpa(SttBackend::Whisper));
         assert!(load_sherpa_engine(SttBackend::Whisper).is_none());
+    }
+
+    /// Con el modelo NeMo CTC ausente, el camino sherpa devuelve `None` para
+    /// que el loader siga con whisper: ni `panic`, ni `abort`, ni error
+    /// propagado (HU-75, SEC-02).
+    #[cfg(feature = "sherpa")]
+    #[test]
+    fn missing_sherpa_model_falls_back_to_whisper_without_aborting_hu75() {
+        let root = std::env::temp_dir().join(format!("jarvis-fallback-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("directorio temporal");
+
+        // Directorio vacío: modelo no descargado.
+        assert!(load_sherpa_engine_from(SttBackend::Sherpa, &root).is_none());
+        // Media pareja (solo el `.onnx`): tampoco hay motor.
+        let dir = root.join(jarvis_audio::NEMO_CTC_DIR);
+        std::fs::create_dir_all(&dir).expect("directorio del modelo");
+        std::fs::write(dir.join(jarvis_audio::NEMO_CTC_MODEL), b"x").expect("modelo de prueba");
+        assert!(load_sherpa_engine_from(SttBackend::Sherpa, &root).is_none());
+
+        // Cualquier `Err` del motor se traduce en respaldo, nunca en aborto.
+        assert!(resolve_sherpa_engine(Err(SherpaStatus::ModelMissing)).is_none());
+        assert!(resolve_sherpa_engine(Err(SherpaStatus::FeatureOff)).is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// El diagnóstico y el daemon comparten criterio: con el backend por
+    /// defecto (`sherpa`) `--check` sí intenta el motor alternativo (HU-75).
+    #[test]
+    fn default_backend_matches_what_check_probes_hu75() {
+        let (backend, warning) = jarvis_core::JarvisConfig::default().stt_backend();
+        assert_eq!(warning, None);
+        assert_eq!(backend, SttBackend::DEFAULT);
+        assert!(wants_sherpa(backend));
     }
 
     /// La línea de arranque solo nombra sherpa cuando los dos archivos del

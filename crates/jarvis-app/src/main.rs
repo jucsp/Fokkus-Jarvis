@@ -1170,18 +1170,20 @@ fn run() -> ExitCode {
         Some((mgr, plan)) => SttAvailability::probe(mgr, plan),
         None => SttAvailability::NoDataDir,
     };
-    // Con `stt.backend = "sherpa"` el modelo que se sondea no es el de whisper:
-    // el loader informa por su cuenta si el motor pedido no arranca (HU-75), así
-    // que el aviso de «STT deshabilitado» describiría un motor que no se usará.
+    // Con el backend por defecto (`sherpa`) el modelo que se sondea no es el de
+    // whisper: el loader informa por su cuenta si el motor pedido no arranca
+    // (HU-75) y, si cae a whisper, es él quien descarga el modelo. El aviso de
+    // «STT deshabilitado» describiría un motor que quizá no se usará.
     if stt_backend == SttBackend::Whisper {
         if let Some(warning) = stt.warning() {
             eprintln!("{warning}");
         }
     }
     // La línea de arranque nombra el motor pedido, no el que whisper podría
-    // haber cargado en su lugar.
+    // haber cargado en su lugar, y distingue por qué sherpa no puede usarse.
     let stt_label = match stt_backend {
         SttBackend::Whisper => stt.label(),
+        SttBackend::Sherpa if !cfg!(feature = "sherpa") => "sherpa-no-compilado",
         SttBackend::Sherpa if runtime::sherpa_model_present() => "sherpa",
         SttBackend::Sherpa => "sin-modelo-sherpa",
     };
@@ -1568,11 +1570,11 @@ fn stt_model_from(config: &JarvisConfig) -> ModelSpec {
 }
 
 /// Backend STT de `config.toml` (HU-75); un valor inválido cae al de por
-/// defecto con aviso, igual que el modelo.
+/// defecto (sherpa-onnx) con aviso, igual que el modelo.
 ///
-/// El valor decide qué motor se intenta: `whisper` (por defecto) no prueba
-/// sherpa aunque el modelo NeMo CTC esté en disco, y `sherpa` lo intenta antes
-/// de descargar whisper.
+/// El valor decide qué motor se intenta: `sherpa` (por defecto) prueba el motor
+/// NeMo CTC antes de descargar whisper y, si no está o no carga, cae a whisper;
+/// `whisper` no prueba sherpa siquiera.
 fn stt_backend_from(config: &JarvisConfig) -> SttBackend {
     let (backend, warning) = config.stt_backend();
     if let Some(warning) = warning {
