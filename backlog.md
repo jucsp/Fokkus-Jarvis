@@ -240,20 +240,22 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
-## 🎭 Épica 16 (E-16): Voz Expresiva y STT Coloquial — ✅ v0.3.2
+## 🎭 Épica 16 (E-16): Voz Expresiva y STT Coloquial — ✅ v0.3.3
 - _Contexto de negocio:_ las emociones de Jarvis apenas se notaban al oído (offsets de prosodia demasiado sutiles), faltaba un registro de alarma y el cerebro olvidaba el protocolo de directivas en sesiones de voz largas. Además Whisper seguía deformando modismos chilenos y tecnicismos que el diccionario base no cubría.
-- [x] **HU-73** Rango emocional y prosodia perceptible en Edge-TTS: ánimo Asustado, offsets ampliados perceptibles y recordatorio en la sesión persistente de voz [Responsable: DeepSeek / Claude]
-- [x] **HU-74** Expansión masiva del diccionario STT: jerga chilena, tecnicismos y deformaciones de Whisper [Responsable: DeepSeek / Claude]
+- [x] **HU-73** Rango emocional y prosodia perceptible en Edge-TTS: ánimo Asustado, offsets ampliados perceptibles y recordatorio en la sesión persistente de voz (v0.3.2); `Mood::Normal` y calibración natural sobre es-US-AlonsoNeural sin efecto ardilla/Thanos (v0.3.3) [Responsable: DeepSeek / Claude]
+- [x] **HU-74** Expansión masiva del diccionario STT: jerga chilena, tecnicismos y deformaciones de Whisper (v0.3.2); lote adicional de transcripciones fonéticas reales (v0.3.3) [Responsable: DeepSeek / Claude]
 
 ### HU-73: Rango emocional y prosodia perceptible en Edge-TTS
 - 📁 _Repositorio:_ `Fokkus-Jarvis`
 - 🎯 _Capa:_ `crates/jarvis-audio/src/tts/directive.rs`, `tts/phrase.rs`, `brain/cli.rs`, `brain/client.rs`.
 - 📌 _Objetivo técnico:_ Que cada ánimo se distinga de oído en Edge-TTS, añadir el registro Asustado y mantener vigente el protocolo de directivas aunque la sesión de voz persista entre turnos.
+- 🔧 _Corrección v0.3.3:_ los offsets de v0.3.2 deformaban la voz (ardilla en agudos, Thanos en graves) y el modelo se quedaba en `serio` por no existir un ánimo neutro. Se añade `Mood::Normal` como estado por defecto de cada turno y se recalibra la tabla a oído sobre es-US-AlonsoNeural (±14 Hz, ±10 %).
 
 ### HU-74: Expansión masiva del diccionario STT
 - 📁 _Repositorio:_ `Fokkus-Jarvis`
 - 🎯 _Capa:_ `crates/jarvis-audio/src/text/lexicon.rs`.
 - 📌 _Objetivo técnico:_ Cubrir jerga chilena, tecnicismos y deformaciones frecuentes de Whisper sin introducir falsos positivos sobre frases correctas.
+- 🔧 _Ampliación v0.3.3:_ segundo lote con deformaciones de transcripciones reales (frases propias, Plane, archivos .md, Game Boy Advance).
 
 ## 🧾 Deuda técnica
 

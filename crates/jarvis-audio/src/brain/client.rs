@@ -88,16 +88,20 @@ pub const SYSTEM_PROMPT: &str = concat!(
     "tu respuesta se lee en voz alta. Sé conciso: una o dos frases salvo que te ",
     "pidan más detalle. ",
     "Habla con calidez y naturalidad, apoyándote en la puntuación expresiva ",
-    "(¡!, ¿?, …). Tu voz NUNCA debe sonar plana: es OBLIGATORIO guiar la prosodia ",
-    "con directivas entre corchetes que nunca se leen en voz alta. ",
-    "Directivas disponibles: [ánimo:alegre|serio|empático|entusiasta|calmo|curioso|",
-    "asustado] ",
+    "(¡!, ¿?, …). Por defecto tu tono debe ser normal y neutro: no interpretes ",
+    "emociones que nadie pidió. ",
+    "Usa directivas de prosodia SOLO cuando la conversación o el usuario lo pidan ",
+    "expresamente, y vuelve a [ánimo:normal] tras expresarlo. ",
+    "Las directivas van entre corchetes y nunca se leen en voz alta; ningún otro ",
+    "texto va entre corchetes. ",
+    "Directivas disponibles: [ánimo:normal|alegre|serio|empático|entusiasta|calmo|",
+    "curioso|asustado] ",
     "antes de la frase que abre la idea, [ritmo:lento|normal|rápido] para acelerar ",
     "o pausar la entrega, [pausa:300] (milisegundos) para separar ideas, ",
     "[respira] antes de una frase emotiva o larga, [énfasis]palabra[/énfasis] para ",
     "destacar una palabra y [susurro]texto[/susurro] para complicidad. ",
-    "Toda respuesta lleva al menos una directiva: usa una o dos por respuesta, ",
-    "nunca ninguna, y ningún otro texto entre corchetes. ",
+    "Cuando sí uses directivas, como mucho una o dos por respuesta: si una frase ",
+    "no necesita emoción, no le pongas ninguna. ",
     "Elige según la intención: sorpresa → [ánimo:curioso] con [pausa:200]; ",
     "pregunta → [ánimo:curioso] antes de la frase; entusiasmo o buena noticia → ",
     "[ánimo:entusiasta]; calma o explicación → [ánimo:calmo] y [ritmo:lento]; ",
@@ -105,7 +109,8 @@ pub const SYSTEM_PROMPT: &str = concat!(
     "[énfasis]palabra[/énfasis]. ",
     "Si el usuario te pide hablar con una emoción concreta (asustado, sorprendido, ",
     "emocionado, enfadado), o el contenido es una alerta o un riesgo, usa el ánimo ",
-    "correspondiente: miedo, alarma o peligro → [ánimo:asustado] y [ritmo:rápido]. ",
+    "correspondiente en esa frase: miedo, alarma o peligro → [ánimo:asustado] y ",
+    "[ritmo:rápido]. ",
     "Ejemplo: [ánimo:entusiasta]¡Listo, ya quedó! [pausa:300]Te aviso cuando termine. ",
     "Ejemplo: [ánimo:calmo][ritmo:lento]Tranquilo, lo reviso ahora mismo."
 );
@@ -755,26 +760,50 @@ mod tests {
         );
     }
 
-    /// El modelo tendía a responder en texto plano ignorando la prosodia: el
-    /// prompt ahora la exige en cada respuesta y la asocia a la intención.
+    /// HU-73 (calibración): el prompt anterior exigía una directiva en *toda*
+    /// respuesta ("nunca ninguna" la prohibía a cero). El modelo obedecía con
+    /// [ánimo:serio] en cada turno y, como no había ánimo neutro, la voz se
+    /// quedaba grave turno tras turno. Ahora el tono por defecto es normal y la
+    /// emoción se usa solo si se pide, volviendo a [ánimo:normal] después.
     #[test]
-    fn system_prompt_makes_prosody_mandatory() {
-        assert!(SYSTEM_PROMPT.contains("OBLIGATORIO"));
-        assert!(SYSTEM_PROMPT.contains("Toda respuesta lleva al menos una directiva"));
-        assert!(SYSTEM_PROMPT.contains("nunca ninguna"));
-        // La guía por intención cubre sorpresa, pregunta, entusiasmo, calma y
-        // empatía, que son los casos que el usuario echaba en falta.
+    fn system_prompt_defaults_to_a_normal_tone_hu73() {
+        assert!(SYSTEM_PROMPT.contains("Por defecto tu tono debe ser normal y neutro"));
+        assert!(SYSTEM_PROMPT.contains(
+            "Usa directivas de prosodia SOLO cuando la conversación o el usuario lo pidan"
+        ));
+        assert!(SYSTEM_PROMPT.contains("vuelve a [ánimo:normal]"));
+        // El ánimo neutro está entre los que el modelo puede elegir.
+        assert!(SYSTEM_PROMPT.contains("[ánimo:normal|"), "{SYSTEM_PROMPT}");
+        // La regla vieja de "prosodia obligatoria en cada respuesta" ya no está.
+        assert!(
+            !SYSTEM_PROMPT.contains("Toda respuesta lleva al menos una directiva"),
+            "la prosodia obligatoria es la causa del ánimo persistente"
+        );
+        assert!(!SYSTEM_PROMPT.contains("OBLIGATORIO"));
+        // El tope se mantiene: el prompt sigue siendo hablable.
+        assert!(SYSTEM_PROMPT.contains("una o dos por respuesta"));
+        // Las guías por intención siguen ahí para cuando sí se piden.
         for intent in ["sorpresa", "pregunta", "entusiasmo", "calma", "empatía"] {
             assert!(SYSTEM_PROMPT.contains(intent), "{intent}");
         }
-        // El tope de directivas se mantiene: el prompt sigue siendo hablable.
-        assert!(SYSTEM_PROMPT.contains("una o dos por respuesta"));
-        // El segundo ejemplo también se limpia por completo.
-        let example = "[ánimo:calmo][ritmo:lento]Tranquilo, lo reviso ahora mismo.";
-        assert!(SYSTEM_PROMPT.contains(example));
+        // Los dos ejemplos se limpian por completo antes de hablarse.
+        let enthusiastic =
+            "[ánimo:entusiasta]¡Listo, ya quedó! [pausa:300]Te aviso cuando termine.";
+        assert!(SYSTEM_PROMPT.contains(enthusiastic));
         assert_eq!(
-            crate::tts::strip_directives(example),
+            crate::tts::strip_directives(enthusiastic),
+            "¡Listo, ya quedó! Te aviso cuando termine."
+        );
+        let calm = "[ánimo:calmo][ritmo:lento]Tranquilo, lo reviso ahora mismo.";
+        assert!(SYSTEM_PROMPT.contains(calm));
+        assert_eq!(
+            crate::tts::strip_directives(calm),
             "Tranquilo, lo reviso ahora mismo."
+        );
+        // Y el ánimo neutro tampoco se pronuncia nunca.
+        assert_eq!(
+            crate::tts::strip_directives("[ánimo:normal]Hola, ya estoy."),
+            "Hola, ya estoy."
         );
     }
 

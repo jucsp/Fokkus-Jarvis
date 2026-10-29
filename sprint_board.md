@@ -1,6 +1,6 @@
 # Sprint Board — Fokkus-Jarvis
 
-**Épica Actual:** Épica 16 (E-16) Voz Expresiva y STT Coloquial · v0.3.2
+**Épica Actual:** Épica 16 (E-16) Voz Expresiva y STT Coloquial · v0.3.3
 **Sprint:** E-16 (HU-73 y HU-74) — IMPLEMENTADO. Arrastre de E-15: release `models-v1` (69.2), IPC `jarvis.modelStatus` (69.5) y pruebas manuales 🧪
 **Actualizado:** 2026-10-29 · **PM/QA:** Claude · **PO:** Antigravity · **Dev:** DeepSeek
 
@@ -8,18 +8,25 @@ Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere 
 
 ---
 
-## 🏁 COMPLETADO: ÉPICA 16 (E-16) — Voz Expresiva y STT Coloquial · v0.3.2
-> Verificado 2026-10-29: `cargo test -p jarvis-audio` 512 pasados, 0 fallidos, 4 ignorados; `cargo build --release -p jarvis-app` OK; binario instalado reporta `Fokkus-Jarvis 0.3.2`.
+## 🏁 COMPLETADO: ÉPICA 16 (E-16) — Voz Expresiva y STT Coloquial · v0.3.3
+> Verificado 2026-10-29 (v0.3.3): `cargo test -p jarvis-audio` 515 pasados (509 + 6), 0 fallidos, 4 ignorados; `cargo test --workspace` 957 pasados, 0 fallidos, 7 ignorados; `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --check` limpios; `cargo build --release -p jarvis-app` OK; binario instalado reporta `Fokkus-Jarvis 0.3.3`.
+> v0.3.2: 512 pasados en `jarvis-audio`; primera entrega de HU-73 y HU-74.
 
 ### HU-73 — Rango emocional y prosodia perceptible en Edge-TTS ✅
 - [x] 73.1 `tts/directive.rs`: nuevo ánimo **Asustado** en el protocolo de directivas [Responsable: DeepSeek / Claude]
 - [x] 73.2 `tts/directive.rs` + `tts/phrase.rs`: offsets de rate/pitch/volumen ampliados hasta ser perceptibles por ánimo [Responsable: DeepSeek / Claude]
 - [x] 73.3 `brain/cli.rs` + `brain/client.rs`: recordatorio del protocolo de prosodia en la sesión persistente de voz (agy entre turnos) [Responsable: DeepSeek / Claude]
 - [x] 73.4 QA: aserciones de offsets actualizadas, suite `jarvis-audio` en verde [Responsable: Claude]
+- [x] 73.5 (v0.3.3) `tts/directive.rs`: nuevo **`Mood::Normal`** (identidad, offsets 0/0/0; alias `neutro`, `neutral`, `plano`) como estado de partida de cada turno: ninguna emoción se arrastra al turno siguiente [Responsable: DeepSeek / Claude]
+- [x] 73.6 (v0.3.3) Calibración natural sobre `es-US-AlonsoNeural`: tono máx. ±14 Hz y ritmo ±10 % (antes +40 Hz/+22 % → efecto ardilla, −18 Hz → efecto Thanos) [Responsable: DeepSeek / Claude]
+- [x] 73.7 (v0.3.3) `brain/cli.rs` + `brain/client.rs`: el prompt fija tono normal por defecto y emoción solo si se pide, volviendo a `[ánimo:normal]` (antes exigía una directiva en cada respuesta y el modelo se quedaba en `serio`) [Responsable: DeepSeek / Claude]
+- [x] 73.8 (v0.3.3) QA: corregido el test de orden de tono (Calmo −4 Hz queda sobre Serio −5 Hz) y un `mut` sobrante que rompía clippy [Responsable: Claude]
 
 ### HU-74 — Expansión masiva del diccionario STT ✅
 - [x] 74.1 `text/lexicon.rs`: `BASE_ENTRIES` ampliado con jerga chilena, tecnicismos y deformaciones típicas de Whisper [Responsable: DeepSeek / Claude]
 - [x] 74.2 QA: depuradas variantes que corregían frases correctas (falsos positivos) y `fmt --check` limpio [Responsable: Claude]
+- [x] 74.3 (v0.3.3) `text/lexicon.rs`: lote adicional de transcripciones fonéticas reales (`socuen` → Soy Juan, `alvarlo` → Háblalo, `avelosidad` → a velocidad, `comardilla` → como ardilla, `su minito` → un grito, `asperate` → espérate, `tiketin plane` → ticket en Plane, `punto de mede` → archivo .md, `mieselo` → envíaselo, `gamboy advance` → Game Boy Advance) [Responsable: DeepSeek / Claude]
+- [x] 74.4 (v0.3.3) QA: casos nuevos en `transcript_history_terms_are_present`; variantes `archivo punto de mede` para no escribir "archivo archivo .md" [Responsable: Claude]
 
 ---
 

@@ -4,7 +4,7 @@
 //! entonación:
 //!
 //! ```text
-//! [ánimo:alegre|serio|empático|entusiasta|calmo|curioso|asustado]
+//! [ánimo:normal|alegre|serio|empático|entusiasta|calmo|curioso|asustado]
 //! [ritmo:lento|normal|rápido]
 //! [pausa:300] [respira] [énfasis]palabra[/énfasis] [susurro]…[/susurro]
 //! ```
@@ -35,14 +35,16 @@ pub const ELLIPSIS_PAUSE_MS: u32 = 400;
 /// Techo de cada desplazamiento de prosodia, aplicado **después** de sumar
 /// ánimo, ritmo, susurro, énfasis y la subida de las preguntas.
 ///
-/// Antes eran ±30 % de ritmo y ±10 Hz de tono (HU-73). Con un techo de
-/// ±10 Hz, asustado (+40 Hz) y entusiasta (+25 Hz) se recortaban al mismo
-/// valor y **volvían a sonar iguales**: el recorte silencioso era la otra
-/// mitad del fallo de la "voz plana". Los topes actuales son los que admite
-/// Edge-TTS sin que la frase se oiga deformada.
+/// Recorrido: primero ±30 % de ritmo y ±10 Hz de tono, que recortaba el ánimo
+/// y sonaba plano; después ±50 Hz, que dejó de recortar y llevó la voz al
+/// efecto ardilla. La tabla de [`Mood::offsets`] ya está **calibrada a oído**
+/// (máximo +14 Hz) y queda muy por debajo de estos topes, que solo existen
+/// como red de seguridad ante combinaciones absurdas (ánimo + ritmo + susurro
+/// + pregunta + énfasis a la vez).
 const MAX_RATE_PCT: i8 = 50;
 const MAX_PITCH_HZ: i8 = 50;
-/// El susurro resta 25 % de volumen y ningún ánimo suma más de 6.
+/// El susurro resta 25 % de volumen, ningún ánimo suma más de 4 y el énfasis
+/// suma 5: el techo real (9 %) no llega a este límite.
 const MAX_VOLUME_MUTE: i8 = -40;
 const MAX_VOLUME_BOOST: i8 = 20;
 /// Pausa heurística tras un cierre de frase (`.`, `!`, `?`).
@@ -53,6 +55,12 @@ pub const CLAUSE_PAUSE_MS: u32 = 120;
 /// Ánimo de una frase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mood {
+    /// Tono base, sin desplazamiento: la voz tal como suena de fábrica.
+    ///
+    /// Existe porque no había forma de pedir "habla normal": el modelo, al no
+    /// tener un ánimo neutro, elegía `serio` para bajar el tono, y con una voz
+    /// masculina grave (−18 Hz) eso sonaba a ultratumba.
+    Normal,
     Alegre,
     Serio,
     Empatico,
@@ -67,6 +75,9 @@ pub enum Mood {
 impl Mood {
     fn parse(arg: &str) -> Option<Self> {
         Some(match arg {
+            // Cuatro formas de pedir lo mismo: el LLM escribe "neutro" o
+            // "plano" según el idioma con que venga la petición del usuario.
+            "normal" | "neutro" | "neutral" | "plano" => Mood::Normal,
             "alegre" => Mood::Alegre,
             "serio" => Mood::Serio,
             "empatico" => Mood::Empatico,
@@ -80,23 +91,26 @@ impl Mood {
 
     /// Desplazamiento `(ritmo %, tono Hz, volumen %)` sobre la voz base.
     ///
-    /// Valores **perceptibles** en Edge-TTS (HU-73). La tabla original
-    /// (+2 Hz, 8 %) era inaudible: por debajo de ~10 Hz de tono y ~10 % de
-    /// ritmo, el oído no distingue el ánimo de la voz neutra, así que el
-    /// usuario oía una voz plana aunque el LLM pidiera emoción.
+    /// Calibración natural para una voz masculina grave (es-US-AlonsoNeural /
+    /// es-CL-LorenzoNeural). La tabla anterior llevaba el ánimo agudo a
+    /// +40 Hz y +22 % —sonaba a ardilla— y el grave a −18 Hz —sonaba a
+    /// ultratumba—. El recorrido actual mueve el tono como mucho ±14 Hz y el
+    /// ritmo ±10 %, que se oyen con claridad sin cambiar el timbre de la voz.
     ///
     /// `pitch` va en Hz y `rate`/`volume` en %, que es lo que espera el
-    /// `<prosody>` de `msedge-tts`. El ánimo más extremo (asustado, +40 Hz)
-    /// sigue dentro de lo que la voz es-CL admite sin deformarse.
+    /// `<prosody>` de `msedge-tts`. `Normal` es la identidad: deja la voz
+    /// exactamente como viene de fábrica, y es el estado de partida de cada
+    /// turno.
     pub fn offsets(self) -> (i8, i8, i8) {
         match self {
-            Mood::Entusiasta => (15, 25, 5),
-            Mood::Alegre => (10, 18, 3),
-            Mood::Asustado => (22, 40, 6),
-            Mood::Curioso => (5, 12, 0),
-            Mood::Serio => (-10, -18, 0),
-            Mood::Calmo => (-12, -12, -3),
-            Mood::Empatico => (-15, -15, -3),
+            Mood::Normal => (0, 0, 0),
+            Mood::Asustado => (10, 14, 4),
+            Mood::Entusiasta => (8, 10, 3),
+            Mood::Alegre => (5, 7, 2),
+            Mood::Curioso => (3, 6, 0),
+            Mood::Serio => (-4, -5, 0),
+            Mood::Calmo => (-6, -4, -3),
+            Mood::Empatico => (-6, -4, -3),
         }
     }
 }
@@ -379,6 +393,12 @@ impl DirectedPhrase {
 /// Estado de prosodia de un turno: ánimo y ritmo persisten hasta que otra
 /// directiva los cambia; pausas y respiraciones se aplican a la frase
 /// siguiente.
+///
+/// Nace en [`Mood::Normal`], es decir, en la voz base. El segmentador se crea
+/// por turno ([`crate::tts::PhraseSplitter::new`] en cada respuesta) y se
+/// reinicia al cerrarlo, así que **ninguna emoción se arrastra al turno
+/// siguiente**: ese arrastre era el otro síntoma del usuario, que tras pedir
+/// "asustado" seguía oyendo la voz gravísima turnos después.
 #[derive(Debug, Default)]
 pub struct ProsodyState {
     mood: Option<Mood>,
@@ -425,7 +445,9 @@ impl ProsodyState {
 
     /// Construye la frase y consume las pausas y respiraciones pendientes.
     pub fn directed(&mut self, text: &str, emphasis: bool) -> DirectedPhrase {
-        let (mut rate, mut pitch, mut volume) = self.mood.map_or((0, 0, 0), Mood::offsets);
+        // Sin directiva, el turno habla con la voz base: `Normal` es la
+        // identidad, así que "no hay ánimo" y "[ánimo:normal]" dan lo mismo.
+        let (mut rate, mut pitch, mut volume) = self.mood.unwrap_or(Mood::Normal).offsets();
         rate += self.rhythm;
         if self.whisper {
             rate -= 5;
@@ -539,6 +561,10 @@ mod tests {
             ("[ánimo:curioso]", Tag::Mood(Mood::Curioso)),
             ("[ánimo:asustado]", Tag::Mood(Mood::Asustado)),
             ("[Ánimo:ASUSTADO]", Tag::Mood(Mood::Asustado)),
+            ("[ánimo:normal]", Tag::Mood(Mood::Normal)),
+            ("[ánimo:neutro]", Tag::Mood(Mood::Normal)),
+            ("[Ánimo:NEUTRAL]", Tag::Mood(Mood::Normal)),
+            ("[animo:plano]", Tag::Mood(Mood::Normal)),
             ("[ritmo:lento]", Tag::Rhythm(-12)),
             ("[ritmo:normal]", Tag::Rhythm(0)),
             ("[ritmo:rápido]", Tag::Rhythm(12)),
@@ -727,9 +753,9 @@ mod tests {
         let mut emphasis = false;
         state.apply(Tag::Mood(Mood::Entusiasta), &mut emphasis);
         let first = state.directed("¡Listo, ya quedó!", emphasis);
-        assert_eq!(first.directive.rate, 15);
-        assert_eq!(first.directive.pitch, 25);
-        assert_eq!(first.directive.volume, 5);
+        assert_eq!(first.directive.rate, 8);
+        assert_eq!(first.directive.pitch, 10);
+        assert_eq!(first.directive.volume, 3);
         assert_eq!(
             first.directive.pause_before_ms, 0,
             "primera frase sin pausa"
@@ -755,8 +781,8 @@ mod tests {
         let fourth = state.directed("¿Estás bien?", false);
         assert_eq!(fourth.directive.pause_before_ms, 600);
         assert!(fourth.directive.breath);
-        assert_eq!(fourth.directive.rate, -15 - 12 - 5);
-        assert_eq!(fourth.directive.pitch, -15 + 2, "la pregunta sube el tono");
+        assert_eq!(fourth.directive.rate, -6 - 12 - 5);
+        assert_eq!(fourth.directive.pitch, -4 + 2, "la pregunta sube el tono");
         assert_eq!(fourth.directive.volume, -3 - 25);
         let fifth = state.directed("Sigo.", false);
         assert!(!fifth.directive.breath, "la respiración se consume");
@@ -764,39 +790,80 @@ mod tests {
 
     // ------------------------------------------------------------- HU-73
 
-    /// Los desplazamientos tienen que **oírse**. La tabla original (±2 Hz,
-    /// ±8 %) no se distinguía de la voz neutra: ese era el fallo.
+    /// La tabla está **calibrada a oído** para una voz masculina grave: los
+    /// ánimos se distinguen entre sí y del neutro, pero sin el efecto ardilla
+    /// del ánimo agudo anterior (+40 Hz, +22 %) ni el efecto ultratumba del
+    /// grave (−18 Hz), que dejaba la voz "tipo Thanos".
     #[test]
-    fn mood_offsets_are_perceptible_in_edge_tts_hu71() {
+    fn mood_offsets_are_natural_and_ordered_hu73() {
         let expected = [
-            (Mood::Entusiasta, (15, 25, 5)),
-            (Mood::Alegre, (10, 18, 3)),
-            (Mood::Asustado, (22, 40, 6)),
-            (Mood::Curioso, (5, 12, 0)),
-            (Mood::Serio, (-10, -18, 0)),
-            (Mood::Calmo, (-12, -12, -3)),
-            (Mood::Empatico, (-15, -15, -3)),
+            (Mood::Normal, (0, 0, 0)),
+            (Mood::Asustado, (10, 14, 4)),
+            (Mood::Entusiasta, (8, 10, 3)),
+            (Mood::Alegre, (5, 7, 2)),
+            (Mood::Curioso, (3, 6, 0)),
+            (Mood::Serio, (-4, -5, 0)),
+            (Mood::Calmo, (-6, -4, -3)),
+            (Mood::Empatico, (-6, -4, -3)),
         ];
         for (mood, offsets) in expected {
             assert_eq!(mood.offsets(), offsets, "{mood:?}");
-            // Por debajo de ~10 Hz de tono y ~10 % de ritmo el oído no
-            // distingue el ánimo de la voz neutra.
-            assert!(
-                offsets.1.unsigned_abs() >= 12,
-                "{mood:?} mueve el tono solo {} Hz",
-                offsets.1
-            );
-            assert!(
-                offsets.0.unsigned_abs() >= 5,
-                "{mood:?} mueve el ritmo solo {} %",
-                offsets.0
-            );
         }
-        // Asustado es el ánimo más agudo y el más rápido.
-        assert!(Mood::Asustado.offsets().1 > Mood::Entusiasta.offsets().1);
-        assert!(Mood::Asustado.offsets().0 > Mood::Entusiasta.offsets().0);
-        // Y los ánimos negativos van en la dirección contraria.
-        assert!(Mood::Serio.offsets().1 < 0 && Mood::Empatico.offsets().1 < 0);
+
+        // El neutro es la identidad exacta: la voz de fábrica, sin tocar.
+        assert_eq!(
+            Mood::Normal.offsets(),
+            (0, 0, 0),
+            "el ánimo normal no puede mover nada"
+        );
+
+        // Del más agudo al más grave sin saltos: si el orden se rompe, dos
+        // ánimos distintos vuelven a sonar igual.
+        let by_pitch = [
+            Mood::Asustado,
+            Mood::Entusiasta,
+            Mood::Alegre,
+            Mood::Curioso,
+            Mood::Normal,
+            Mood::Calmo,
+            Mood::Serio,
+        ]
+        .map(|mood| mood.offsets().1);
+        assert!(
+            by_pitch.windows(2).all(|pair| pair[0] > pair[1]),
+            "el orden del tono se rompió: {by_pitch:?}"
+        );
+
+        // Banda humana: ±15 Hz de tono y ±10 % de ritmo es lo máximo que
+        // admite la voz sin que el timbre deje de reconocerse.
+        for mood in [
+            Mood::Normal,
+            Mood::Alegre,
+            Mood::Serio,
+            Mood::Empatico,
+            Mood::Entusiasta,
+            Mood::Calmo,
+            Mood::Curioso,
+            Mood::Asustado,
+        ] {
+            let (rate, pitch, volume) = mood.offsets();
+            assert!(pitch.abs() <= 15, "{mood:?} mueve el tono {pitch} Hz");
+            assert!(rate.abs() <= 10, "{mood:?} mueve el ritmo {rate} %");
+            assert!(volume.abs() <= 5, "{mood:?} mueve el volumen {volume} %");
+        }
+
+        // Y ningún ánimo salvo el neutro se queda sin efecto.
+        for mood in [
+            Mood::Alegre,
+            Mood::Serio,
+            Mood::Empatico,
+            Mood::Entusiasta,
+            Mood::Calmo,
+            Mood::Curioso,
+            Mood::Asustado,
+        ] {
+            assert_ne!(mood.offsets(), (0, 0, 0), "{mood:?} no se oye");
+        }
     }
 
     /// El techo de [`ProsodyState::directed`] no puede recortar la tabla: con
@@ -824,6 +891,94 @@ mod tests {
             assert_eq!(phrase.directive.volume, volume, "{mood:?}");
             assert_ne!(phrase.directive.pitch, 0, "{mood:?} se quedó neutro");
         }
+        // El neutro tampoco se recorta: solo lo mueve la entonación de la
+        // pregunta, que es puntuación, no ánimo.
+        let mut state = ProsodyState::default();
+        let mut emphasis = false;
+        state.apply(Tag::Mood(Mood::Normal), &mut emphasis);
+        let phrase = state.directed("¿En serio?", emphasis);
+        assert_eq!((phrase.directive.rate, phrase.directive.pitch), (0, 2));
+        let plain = state.directed("Vale.", emphasis);
+        assert_eq!(plain.directive.pitch, 0, "sin pregunta vuelve al tono base");
+    }
+
+    /// HU-73: existe el ánimo neutro, se pide con cuatro nombres y devuelve la
+    /// voz a su tono base después de una emoción.
+    #[test]
+    fn normal_mood_returns_to_the_base_voice_hu73() {
+        for alias in [
+            "[ánimo:normal]",
+            "[ánimo:neutro]",
+            "[ánimo:neutral]",
+            "[ánimo:plano]",
+            "[Ánimo:NORMAL]",
+        ] {
+            assert_eq!(
+                run(&[alias]),
+                vec![Piece::Tag(Tag::Mood(Mood::Normal))],
+                "{alias}"
+            );
+            // Y nunca se pronuncia.
+            assert_eq!(strip_directives(&format!("{alias}Hola.")), "Hola.");
+        }
+
+        // Un turno que empieza en normal suena con la voz de fábrica.
+        let mut fresh = ProsodyState::default();
+        let mut emphasis = false;
+        fresh.apply(Tag::Mood(Mood::Normal), &mut emphasis);
+        let first = fresh.directed("Hola.", emphasis);
+        assert_eq!(
+            (
+                first.directive.rate,
+                first.directive.pitch,
+                first.directive.volume
+            ),
+            (0, 0, 0)
+        );
+        assert!(first.directive.is_neutral(), "el neutro no debe sonar raro");
+
+        // Y deshace la emoción anterior dentro del mismo turno: era el fallo
+        // que dejaba la voz cavernosa cuando el usuario pedía "habla normal".
+        let mut state = ProsodyState::default();
+        let mut emphasis = false;
+        state.apply(Tag::Mood(Mood::Asustado), &mut emphasis);
+        let afraid = state.directed("¡Cuidado!", emphasis);
+        assert_eq!(afraid.directive.pitch, 14);
+        state.apply(Tag::Mood(Mood::Normal), &mut emphasis);
+        let back = state.directed("No era nada.", emphasis);
+        assert_eq!(back.directive.mood, Some(Mood::Normal));
+        assert_eq!(
+            (
+                back.directive.rate,
+                back.directive.pitch,
+                back.directive.volume
+            ),
+            (0, 0, 0),
+            "el ánimo normal tiene que devolver la voz base"
+        );
+    }
+
+    /// Cada turno nace en neutro: el segmentador se crea por turno, así que la
+    /// emoción de la respuesta anterior no se arrastra a la siguiente.
+    #[test]
+    fn every_turn_starts_from_a_neutral_state_hu73() {
+        let mut previous = ProsodyState::default();
+        let mut emphasis = false;
+        previous.apply(Tag::Mood(Mood::Serio), &mut emphasis);
+        let grim = previous.directed("Esto es grave.", emphasis);
+        assert_eq!(grim.directive.pitch, -5);
+
+        let mut next_turn = ProsodyState::default();
+        let plain = next_turn.directed("Listo, ya está.", false);
+        assert_eq!(plain.directive.mood, None, "el turno nuevo no hereda ánimo");
+        assert_eq!(
+            (
+                plain.directive.rate,
+                plain.directive.pitch,
+                plain.directive.volume
+            ),
+            (0, 0, 0)
+        );
     }
 
     /// Lo que el usuario pidió por voz se traduce en una directiva real, no en
@@ -838,8 +993,8 @@ mod tests {
         state.apply(Tag::Mood(Mood::Asustado), &mut emphasis);
         let phrase = state.directed("¡Cuidado!", emphasis);
         assert_eq!(phrase.directive.mood, Some(Mood::Asustado));
-        assert_eq!(phrase.directive.pitch, 40);
-        assert_eq!(phrase.directive.rate, 22);
+        assert_eq!(phrase.directive.pitch, 14, "agitado, no ardilla");
+        assert_eq!(phrase.directive.rate, 10);
     }
 
     #[test]

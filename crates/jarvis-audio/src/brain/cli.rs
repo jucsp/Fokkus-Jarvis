@@ -506,12 +506,13 @@ impl CliBrain {
             CliBrainMode::Voice => prompt.push_str(&format!(
                 "\nUsa tus herramientas (run_command, herramientas MCP, etc.) para realizar \
                  las acciones solicitadas en el equipo cuando corresponda. Usa puntuación \
-                 expresiva (¡!, ¿?, …) y, cuando aporte emoción, empieza la frase con \
-                 directivas de prosodia: [ánimo:alegre|serio|empático|entusiasta|calmo|\
-                 curioso|asustado] [ritmo:lento|normal|rápido] [pausa:ms]; nómbralas entre \
-                 corchetes y nunca las leas en voz alta. Responde únicamente con lo que \
-                 Jarvis debe decir en voz alta al usuario en una frase breve en español.\n\
-                 Usuario: {user_text}"
+                 expresiva (¡!, ¿?, …). Tu tono por defecto es normal y neutro: usa \
+                 directivas de prosodia ([ánimo:normal|alegre|serio|empático|entusiasta|\
+                 calmo|curioso|asustado] [ritmo:lento|normal|rápido] [pausa:ms]) solo \
+                 cuando el usuario pida una emoción concreta o el contenido lo justifique, \
+                 y vuelve a [ánimo:normal] después. Nómbralas entre corchetes y nunca las \
+                 leas en voz alta. Responde únicamente con lo que Jarvis debe decir en voz \
+                 alta al usuario en una frase breve en español.\nUsuario: {user_text}"
             )),
             CliBrainMode::Worker => prompt.push_str(&format!(
                 "\nTarea encomendada a esta sub-sesión:\n{user_text}"
@@ -809,13 +810,23 @@ mod tests {
     /// HU-73: en la sesión persistente el primer mensaje lleva la persona, pero
     /// los turnos siguientes solo llevan [`CliBrain::build_turn`]. Si el
     /// recordatorio no repite las directivas de prosodia, `agy` deja de
-    /// emitirlas a partir del segundo turno y la voz vuelve a sonar plana.
+    /// emitirlas a partir del segundo turno y la voz vuelve a sonar plana; y si
+    /// no fija el tono normal por defecto, el modelo se queda con la última
+    /// emoción del turno anterior.
     #[test]
     fn every_voice_turn_reminds_the_model_about_prosody_hu71() {
         let brain = CliBrain::new("agy -p").unwrap();
         for text in ["hola", "cuéntame algo asustado", "y ahora enojado"] {
             let turn = brain.build_turn(None, text);
             for needle in ["ánimo:", "asustado", "ritmo:", "pausa:", "expresiva"] {
+                assert!(turn.contains(needle), "falta {needle:?} en {turn}");
+            }
+            // HU-73: el recordatorio también fija el ánimo por defecto.
+            for needle in [
+                "normal y neutro",
+                "[ánimo:normal|",
+                "vuelve a [ánimo:normal]",
+            ] {
                 assert!(turn.contains(needle), "falta {needle:?} en {turn}");
             }
             // La coletilla de voz sigue cerrando el turno con el texto del

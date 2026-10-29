@@ -679,7 +679,7 @@ mod tests {
             );
             let first = phrases[0].directive;
             assert_eq!(first.mood, Some(Mood::Entusiasta));
-            assert_eq!((first.rate, first.pitch, first.volume), (15, 25, 5));
+            assert_eq!((first.rate, first.pitch, first.volume), (8, 10, 3));
             assert_eq!(first.pause_before_ms, 0);
 
             let second = phrases[1].directive;
@@ -687,6 +687,35 @@ mod tests {
             assert_eq!(second.pause_before_ms, 300, "la pausa explícita manda");
             assert!(second.rate < 0);
         }
+    }
+
+    /// HU-73: "[ánimo:normal]" devuelve la entonación al tono base a mitad de
+    /// respuesta. Sin él, el modelo no tenía cómo salir de un ánimo grave y la
+    /// voz se quedaba cavernosa hasta el final del turno.
+    #[test]
+    fn normal_mood_restores_the_base_voice_mid_turn_hu73() {
+        let phrases = directed_streamed(
+            "[ánimo:serio]Esto es grave. [ánimo:normal]Ya está resuelto. Gracias por avisar.",
+        );
+        let texts: Vec<&str> = phrases.iter().map(|p| p.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["Esto es grave.", "Ya está resuelto.", "Gracias por avisar."]
+        );
+        assert_eq!(phrases[0].directive.mood, Some(Mood::Serio));
+        assert_eq!(phrases[0].directive.pitch, -5);
+        assert_eq!(phrases[1].directive.mood, Some(Mood::Normal));
+        assert_eq!(
+            (
+                phrases[1].directive.rate,
+                phrases[1].directive.pitch,
+                phrases[1].directive.volume
+            ),
+            (0, 0, 0),
+            "el neutro devuelve la voz de fábrica"
+        );
+        // Y el neutro sigue vigente en la frase siguiente.
+        assert_eq!(phrases[2].directive.pitch, 0);
     }
 
     #[test]

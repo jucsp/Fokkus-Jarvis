@@ -283,6 +283,29 @@ pub const BASE_ENTRIES: &[(&str, &[&str])] = &[
     ("los modismos", &["los modismo"]),
     ("por voz", &["por voz", "por vos"]),
     ("asustado", &["asustado", "sustado", "azustado"]),
+    // HU-74 (lote 2): deformaciones del historial real de transcripciones.
+    ("Soy Juan", &["socuen", "soi juan"]),
+    ("Háblalo", &["alvarlo", "albarlo"]),
+    ("a velocidad", &["avelosidad", "a velosidad", "avelocidad"]),
+    ("como ardilla", &["comardilla"]),
+    ("un grito", &["su minito", "suminito"]),
+    ("espérate", &["asperate"]),
+    ("ticket en Plane", &["ticatain plane", "tiketin plane"]),
+    // Con "archivo" dentro para no escribir "archivo archivo .md".
+    (
+        "archivo .md",
+        &[
+            "punto de mede",
+            "punto de mete",
+            "punto mede",
+            "archivo punto de mede",
+            "archivo punto de mete",
+            "archivo punto mede",
+        ],
+    ),
+    // "míeselo" no hace falta: la comparación pliega la tilde.
+    ("envíaselo", &["mieselo"]),
+    ("Game Boy Advance", &["gamboy advance", "gameboy advance"]),
     // -------------------------------------------------- nombres propios
     ("Iron Man", &["iron man", "iroquman", "airom man"]),
     ("Temuco", &["temuco", "temunco"]),
@@ -851,6 +874,24 @@ mod tests {
             ("volutiva", "evolutiva"),
             ("germando", "armando"),
             ("resiguiendo", "recibiendo"),
+            ("socuen", "Soy Juan"),
+            ("alvarlo", "Háblalo"),
+            (
+                "habla a velosidad de ardilla",
+                "habla a velocidad de ardilla",
+            ),
+            ("comardilla", "como ardilla"),
+            ("dame su minito", "dame un grito"),
+            ("asperate", "espérate"),
+            ("crea un tiketin plane", "crea un ticket en Plane"),
+            ("guárdalo en un punto de mede", "guárdalo en un archivo .md"),
+            (
+                "guárdalo en un archivo punto mede",
+                "guárdalo en un archivo .md",
+            ),
+            ("míeselo", "envíaselo"),
+            ("míeselo a Felipe", "envíaselo a Felipe"),
+            ("gamboy advance", "Game Boy Advance"),
         ] {
             assert_eq!(lex.correct(input), expected, "{input}");
         }
