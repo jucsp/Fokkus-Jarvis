@@ -3,7 +3,7 @@
 %define _build_id_links none
 
 Name:           fokkus-jarvis
-Version:        0.3.0
+Version:        0.3.1
 Release:        1
 Summary:        Asistente de voz nativo de Fokkus con esfera líquida e integración IPC con Fokkus IDE.
 License:        Proprietary
@@ -23,6 +23,14 @@ install -Dm644 %{SOURCE1} %{buildroot}%{_datadir}/applications/fokkus-jarvis.des
 %{_datadir}/applications/fokkus-jarvis.desktop
 
 %changelog
+* Thu Oct 29 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.3.1-1
+- Épica 15: Excelencia Conversacional, STT Seguro e Introspección Nativa (HU-69 a HU-72).
+- HU-69: Catálogo soberano en GitHub Releases sin Hugging Face y fallback stt_model.
+- HU-70: Corrector léxico determinista para tecnicismos y jerga chilena.
+- HU-71: Erradicación de bare_search y soporte de restricciones negativas (no_web).
+- HU-72: Introspección D-Bus de notificaciones de escritorio con verificación por PID.
+- Perf: Sesión agy persistente entre turnos, streaming frase a frase hacia el TTS y omisión de planner en modo CLI.
+
 * Wed Oct 28 2026 Juan Carlos Saavedra <juanc.saavedra07@gmail.com> - 0.3.0-1
 - Épica 14: Hilo Central + Sub-sesiones Ramificadas (HU-59 a HU-68).
 - HU-59: Normalizador léxico unificado con preservación de acentos y puntuación.

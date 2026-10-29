@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 rust-version = "1.99"
 # Los crates del workspace no se publican en crates.io (cargo-deny los trata
