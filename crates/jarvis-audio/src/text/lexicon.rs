@@ -29,11 +29,16 @@
 //! módulo no la mueve. Por la misma razón un léxico de usuario no puede
 //! introducir "Jarvis", "silencio" ni las órdenes de anulación (CA-70.5).
 //!
-//! Compromisos conocidos, todos de solo capitalización:
+//! Compromisos conocidos:
 //!
 //! - "plasma" se escribe siempre "Plasma" porque en este dominio casi siempre
 //!   es KDE Plasma ("el plasma de la sangre" quedaría con mayúscula).
 //! - "jira" se escribe "Jira" (la tela homónima es rarísima hablando).
+//! - "germando" se corrige a "armando" y "volutiva" a "evolutiva" aunque las
+//!   acepciones corrientes existan ("germinar"): en el historial de
+//!   transcripciones nunca aparecieron y sí el nombre y el adjetivo.
+//! - "po" se sustituye por "po" (identidad): está en la tabla para dar destino
+//!   a "poh" y para fijar la forma canónica, no para cambiarla.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -191,6 +196,22 @@ pub const BASE_ENTRIES: &[(&str, &[&str])] = &[
             "loren ipsun",
         ],
     ),
+    // ------------------------------------------- asistentes y modelos IA
+    (
+        "Antigravity",
+        &[
+            "antigravity",
+            "antigradity",
+            "nanti-gravity",
+            "nanti gravity",
+            "anti gravity",
+        ],
+    ),
+    (
+        "Claude",
+        &["claude", "claud", "cloudd", "clod", "clode", "cloude"],
+    ),
+    ("DeepSeek", &["deepseek", "dip sik", "dipsek", "deep seek"]),
     // ------------------------------------------------------- escritorio
     ("KDE", &["kde", "ka de e", "k de e"]),
     (
@@ -224,16 +245,47 @@ pub const BASE_ENTRIES: &[(&str, &[&str])] = &[
     ("D-Bus", &["d bus", "de bus", "dbus"]),
     ("systemd", &["systemd", "sistem de", "sistemdi"]),
     ("journalctl", &["journalctl", "journal ctl", "yournal ctl"]),
+    ("Spotify", &["spotify", "espotifai", "espotify", "spotifai"]),
     // --------------------------------------------------- jerga chilena
-    ("po", &["poh"]),
+    // "po" es identidad (ya se escribe igual): entra para que "poh" tenga a
+    // dónde llegar y para fijar la forma canónica.
+    ("po", &["po", "poh"]),
     ("cachái", &["cachai", "cachay", "kashai"]),
     ("al tiro", &["altiro", "al tiro", "al-tiro"]),
+    ("al toque", &["al toque", "altoke", "al-toke"]),
+    (
+        "compadre",
+        &[
+            "compadre",
+            "conpadre",
+            "conpadres",
+            "compadrito",
+            "con padricos",
+            "con padrico",
+        ],
+    ),
     ("pantallazo", &["pantallaso"]),
     ("bacán", &["bacan", "vakan"]),
     ("cuático", &["cuatico", "kuatico"]),
     ("harto", &["arto"]),
     ("weón", &["hueon", "gueon", "weon", "huevon"]),
     ("cahuín", &["caguin", "cahuin"]),
+    // ------------------------------------ confusiones del habla chilena
+    ("acento", &["asento"]),
+    ("acentos", &["asentos"]),
+    ("armando", &["germando"]),
+    ("evolutiva", &["volutiva"]),
+    ("evolutivo", &["volutivo"]),
+    ("recibiendo", &["resiguiendo", "resigiendo"]),
+    // HU-74: palabras del propio producto que whisper oía mal.
+    ("modismos", &["modismos", "comodimos"]),
+    // Con el artículo dentro: corregir solo "modismo" se comería el "los".
+    ("los modismos", &["los modismo"]),
+    ("por voz", &["por voz", "por vos"]),
+    ("asustado", &["asustado", "sustado", "azustado"]),
+    // -------------------------------------------------- nombres propios
+    ("Iron Man", &["iron man", "iroquman", "airom man"]),
+    ("Temuco", &["temuco", "temunco"]),
 ];
 
 /// Tabla de **negativos**: palabras españolas legítimas que se parecen a una
@@ -275,6 +327,12 @@ pub const NEGATIVES: &[&str] = &[
     // "guagua" y "pichanga" son léxico chileno que **no** está en la tabla.
     "la guagua llora de noche",
     "la pichanga del domingo fue buena",
+    // HU-74: "como dimos" es una frase corriente, no "modismos" mal oído.
+    "como dimos la vuelta llegamos antes",
+    // "po hijo" es jerga legítima: la variante borraba la palabra "hijo".
+    "ya po hijo apúrate",
+    // "los modismo" se corregía a "modismos" y se comía el artículo.
+    "explícame los modismos chilenos",
     // "alto" ≠ "altiro".
     "el alto del cerro está nublado",
     // "cachar" (entender) no es "cachái".
@@ -756,6 +814,43 @@ mod tests {
             ("pantallaso", "pantallazo"),
             ("al tiro", "al tiro"),
             ("cachay", "cachái"),
+        ] {
+            assert_eq!(lex.correct(input), expected, "{input}");
+        }
+    }
+
+    /// Términos del historial real de transcripciones: nombres del ecosistema
+    /// (Antigravity, Claude, DeepSeek), apps, lugares y las confusiones del
+    /// habla chilena que whisper devuelve deformadas.
+    #[test]
+    fn transcript_history_terms_are_present() {
+        let lex = base();
+        for (input, expected) in [
+            ("nanti gravity", "Antigravity"),
+            ("nanti-gravity", "Antigravity"),
+            ("antigradity", "Antigravity"),
+            ("claud", "Claude"),
+            ("clod", "Claude"),
+            ("dip sik", "DeepSeek"),
+            ("dipsek", "DeepSeek"),
+            ("espotifai", "Spotify"),
+            ("spotifai", "Spotify"),
+            ("temunco", "Temuco"),
+            ("iroquman", "Iron Man"),
+            ("airom man", "Iron Man"),
+            ("asento", "acento"),
+            ("asentos", "acentos"),
+            ("po", "po"),
+            ("poh", "po"),
+            ("los modismo", "los modismos"),
+            ("comodimos", "modismos"),
+            ("al-tiro", "al tiro"),
+            ("altiro", "al tiro"),
+            ("conpadre", "compadre"),
+            ("compadrito", "compadre"),
+            ("volutiva", "evolutiva"),
+            ("germando", "armando"),
+            ("resiguiendo", "recibiendo"),
         ] {
             assert_eq!(lex.correct(input), expected, "{input}");
         }

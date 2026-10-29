@@ -1,10 +1,25 @@
 # Sprint Board — Fokkus-Jarvis
 
-**Épica Actual:** Épica 15 (E-15) Excelencia Conversacional, STT Seguro e Introspección Nativa del Sistema
-**Sprint:** E-15 (HU-69 a HU-72) — IMPLEMENTADO (Fases A y B). Pendiente: release `models-v1` (69.2), IPC `jarvis.modelStatus` (69.5) y pruebas manuales 🧪
-**Actualizado:** 2026-10-28 · **PM/QA:** Claude · **PO:** Antigravity · **Dev:** DeepSeek
+**Épica Actual:** Épica 16 (E-16) Voz Expresiva y STT Coloquial · v0.3.2
+**Sprint:** E-16 (HU-73 y HU-74) — IMPLEMENTADO. Arrastre de E-15: release `models-v1` (69.2), IPC `jarvis.modelStatus` (69.5) y pruebas manuales 🧪
+**Actualizado:** 2026-10-29 · **PM/QA:** Claude · **PO:** Antigravity · **Dev:** DeepSeek
 
 Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere prueba manual
+
+---
+
+## 🏁 COMPLETADO: ÉPICA 16 (E-16) — Voz Expresiva y STT Coloquial · v0.3.2
+> Verificado 2026-10-29: `cargo test -p jarvis-audio` 512 pasados, 0 fallidos, 4 ignorados; `cargo build --release -p jarvis-app` OK; binario instalado reporta `Fokkus-Jarvis 0.3.2`.
+
+### HU-73 — Rango emocional y prosodia perceptible en Edge-TTS ✅
+- [x] 73.1 `tts/directive.rs`: nuevo ánimo **Asustado** en el protocolo de directivas [Responsable: DeepSeek / Claude]
+- [x] 73.2 `tts/directive.rs` + `tts/phrase.rs`: offsets de rate/pitch/volumen ampliados hasta ser perceptibles por ánimo [Responsable: DeepSeek / Claude]
+- [x] 73.3 `brain/cli.rs` + `brain/client.rs`: recordatorio del protocolo de prosodia en la sesión persistente de voz (agy entre turnos) [Responsable: DeepSeek / Claude]
+- [x] 73.4 QA: aserciones de offsets actualizadas, suite `jarvis-audio` en verde [Responsable: Claude]
+
+### HU-74 — Expansión masiva del diccionario STT ✅
+- [x] 74.1 `text/lexicon.rs`: `BASE_ENTRIES` ampliado con jerga chilena, tecnicismos y deformaciones típicas de Whisper [Responsable: DeepSeek / Claude]
+- [x] 74.2 QA: depuradas variantes que corregían frases correctas (falsos positivos) y `fmt --check` limpio [Responsable: Claude]
 
 ---
 

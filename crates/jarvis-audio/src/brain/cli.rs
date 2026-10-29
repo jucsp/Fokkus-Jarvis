@@ -504,11 +504,18 @@ impl CliBrain {
         }
         match self.mode {
             CliBrainMode::Voice => prompt.push_str(&format!(
-                "\nUsa tus herramientas (run_command, herramientas MCP, etc.) para realizar las acciones solicitadas en el equipo cuando corresponda. Responde únicamente con lo que Jarvis debe decir en voz alta al usuario en una frase breve en español.\nUsuario: {user_text}"
+                "\nUsa tus herramientas (run_command, herramientas MCP, etc.) para realizar \
+                 las acciones solicitadas en el equipo cuando corresponda. Usa puntuación \
+                 expresiva (¡!, ¿?, …) y, cuando aporte emoción, empieza la frase con \
+                 directivas de prosodia: [ánimo:alegre|serio|empático|entusiasta|calmo|\
+                 curioso|asustado] [ritmo:lento|normal|rápido] [pausa:ms]; nómbralas entre \
+                 corchetes y nunca las leas en voz alta. Responde únicamente con lo que \
+                 Jarvis debe decir en voz alta al usuario en una frase breve en español.\n\
+                 Usuario: {user_text}"
             )),
-            CliBrainMode::Worker => {
-                prompt.push_str(&format!("\nTarea encomendada a esta sub-sesión:\n{user_text}"))
-            }
+            CliBrainMode::Worker => prompt.push_str(&format!(
+                "\nTarea encomendada a esta sub-sesión:\n{user_text}"
+            )),
         }
         prompt
     }
@@ -797,6 +804,29 @@ mod tests {
         let brain = CliBrain::new("sh -c 'echo \"$BROWSER|$NO_BROWSER\"' {prompt}").unwrap();
         let completion = brain.stream("hola", &mut |_| {}).expect("sh responde");
         assert_eq!(completion.text.trim(), "/bin/true|1");
+    }
+
+    /// HU-73: en la sesión persistente el primer mensaje lleva la persona, pero
+    /// los turnos siguientes solo llevan [`CliBrain::build_turn`]. Si el
+    /// recordatorio no repite las directivas de prosodia, `agy` deja de
+    /// emitirlas a partir del segundo turno y la voz vuelve a sonar plana.
+    #[test]
+    fn every_voice_turn_reminds_the_model_about_prosody_hu71() {
+        let brain = CliBrain::new("agy -p").unwrap();
+        for text in ["hola", "cuéntame algo asustado", "y ahora enojado"] {
+            let turn = brain.build_turn(None, text);
+            for needle in ["ánimo:", "asustado", "ritmo:", "pausa:", "expresiva"] {
+                assert!(turn.contains(needle), "falta {needle:?} en {turn}");
+            }
+            // La coletilla de voz sigue cerrando el turno con el texto del
+            // usuario: los tests de historial y de contexto dependen de ello.
+            assert!(turn.ends_with(&format!("Usuario: {text}")), "{turn}");
+        }
+        // El subagente de fondo no recibe prosodia: su salida no se habla.
+        let worker = CliBrain::new("agy -p").unwrap().with_worker_mode(true);
+        let turn = worker.build_turn(None, "revisa las PR");
+        assert!(!turn.contains("ánimo:"), "{turn}");
+        assert!(!turn.contains("asustado"), "{turn}");
     }
 
     #[test]

@@ -88,13 +88,26 @@ pub const SYSTEM_PROMPT: &str = concat!(
     "tu respuesta se lee en voz alta. Sé conciso: una o dos frases salvo que te ",
     "pidan más detalle. ",
     "Habla con calidez y naturalidad, apoyándote en la puntuación expresiva ",
-    "(¡!, ¿?, …). Si aporta expresividad, puedes guiar tu voz con directivas entre ",
-    "corchetes que nunca se leen en voz alta: [ánimo:alegre|serio|empático|entusiasta|",
-    "calmo|curioso] antes de la frase, [ritmo:lento|normal|rápido], [pausa:300] ",
-    "(milisegundos), [respira] antes de una frase emotiva o larga, ",
-    "[énfasis]palabra[/énfasis] y [susurro]texto[/susurro]. Son opcionales: usa como ",
-    "máximo una o dos por respuesta y ningún otro texto entre corchetes. ",
-    "Ejemplo: [ánimo:entusiasta]¡Listo, ya quedó! [pausa:300]Te aviso cuando termine."
+    "(¡!, ¿?, …). Tu voz NUNCA debe sonar plana: es OBLIGATORIO guiar la prosodia ",
+    "con directivas entre corchetes que nunca se leen en voz alta. ",
+    "Directivas disponibles: [ánimo:alegre|serio|empático|entusiasta|calmo|curioso|",
+    "asustado] ",
+    "antes de la frase que abre la idea, [ritmo:lento|normal|rápido] para acelerar ",
+    "o pausar la entrega, [pausa:300] (milisegundos) para separar ideas, ",
+    "[respira] antes de una frase emotiva o larga, [énfasis]palabra[/énfasis] para ",
+    "destacar una palabra y [susurro]texto[/susurro] para complicidad. ",
+    "Toda respuesta lleva al menos una directiva: usa una o dos por respuesta, ",
+    "nunca ninguna, y ningún otro texto entre corchetes. ",
+    "Elige según la intención: sorpresa → [ánimo:curioso] con [pausa:200]; ",
+    "pregunta → [ánimo:curioso] antes de la frase; entusiasmo o buena noticia → ",
+    "[ánimo:entusiasta]; calma o explicación → [ánimo:calmo] y [ritmo:lento]; ",
+    "empatía o mala noticia → [ánimo:empático] con [respira]; dato que importa → ",
+    "[énfasis]palabra[/énfasis]. ",
+    "Si el usuario te pide hablar con una emoción concreta (asustado, sorprendido, ",
+    "emocionado, enfadado), o el contenido es una alerta o un riesgo, usa el ánimo ",
+    "correspondiente: miedo, alarma o peligro → [ánimo:asustado] y [ritmo:rápido]. ",
+    "Ejemplo: [ánimo:entusiasta]¡Listo, ya quedó! [pausa:300]Te aviso cuando termine. ",
+    "Ejemplo: [ánimo:calmo][ritmo:lento]Tranquilo, lo reviso ahora mismo."
 );
 
 /// *System prompt* de un subagente de fondo (HU-60).
@@ -728,12 +741,40 @@ mod tests {
             assert!(SYSTEM_PROMPT.contains(directive), "{directive}");
         }
         assert!(SYSTEM_PROMPT.contains("una o dos por respuesta"));
+        // HU-73: el ánimo asustado existe en la tabla y el prompt lo ofrece.
+        assert!(
+            SYSTEM_PROMPT.contains("[ánimo:asustado]"),
+            "{SYSTEM_PROMPT}"
+        );
         // El ejemplo del prompt se limpia por completo antes de hablarse.
         let example = "[ánimo:entusiasta]¡Listo, ya quedó! [pausa:300]Te aviso cuando termine.";
         assert!(SYSTEM_PROMPT.contains(example));
         assert_eq!(
             crate::tts::strip_directives(example),
             "¡Listo, ya quedó! Te aviso cuando termine."
+        );
+    }
+
+    /// El modelo tendía a responder en texto plano ignorando la prosodia: el
+    /// prompt ahora la exige en cada respuesta y la asocia a la intención.
+    #[test]
+    fn system_prompt_makes_prosody_mandatory() {
+        assert!(SYSTEM_PROMPT.contains("OBLIGATORIO"));
+        assert!(SYSTEM_PROMPT.contains("Toda respuesta lleva al menos una directiva"));
+        assert!(SYSTEM_PROMPT.contains("nunca ninguna"));
+        // La guía por intención cubre sorpresa, pregunta, entusiasmo, calma y
+        // empatía, que son los casos que el usuario echaba en falta.
+        for intent in ["sorpresa", "pregunta", "entusiasmo", "calma", "empatía"] {
+            assert!(SYSTEM_PROMPT.contains(intent), "{intent}");
+        }
+        // El tope de directivas se mantiene: el prompt sigue siendo hablable.
+        assert!(SYSTEM_PROMPT.contains("una o dos por respuesta"));
+        // El segundo ejemplo también se limpia por completo.
+        let example = "[ánimo:calmo][ritmo:lento]Tranquilo, lo reviso ahora mismo.";
+        assert!(SYSTEM_PROMPT.contains(example));
+        assert_eq!(
+            crate::tts::strip_directives(example),
+            "Tranquilo, lo reviso ahora mismo."
         );
     }
 

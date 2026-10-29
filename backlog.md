@@ -240,6 +240,21 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
+## 🎭 Épica 16 (E-16): Voz Expresiva y STT Coloquial — ✅ v0.3.2
+- _Contexto de negocio:_ las emociones de Jarvis apenas se notaban al oído (offsets de prosodia demasiado sutiles), faltaba un registro de alarma y el cerebro olvidaba el protocolo de directivas en sesiones de voz largas. Además Whisper seguía deformando modismos chilenos y tecnicismos que el diccionario base no cubría.
+- [x] **HU-73** Rango emocional y prosodia perceptible en Edge-TTS: ánimo Asustado, offsets ampliados perceptibles y recordatorio en la sesión persistente de voz [Responsable: DeepSeek / Claude]
+- [x] **HU-74** Expansión masiva del diccionario STT: jerga chilena, tecnicismos y deformaciones de Whisper [Responsable: DeepSeek / Claude]
+
+### HU-73: Rango emocional y prosodia perceptible en Edge-TTS
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-audio/src/tts/directive.rs`, `tts/phrase.rs`, `brain/cli.rs`, `brain/client.rs`.
+- 📌 _Objetivo técnico:_ Que cada ánimo se distinga de oído en Edge-TTS, añadir el registro Asustado y mantener vigente el protocolo de directivas aunque la sesión de voz persista entre turnos.
+
+### HU-74: Expansión masiva del diccionario STT
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-audio/src/text/lexicon.rs`.
+- 📌 _Objetivo técnico:_ Cubrir jerga chilena, tecnicismos y deformaciones frecuentes de Whisper sin introducir falsos positivos sobre frases correctas.
+
 ## 🧾 Deuda técnica
 
 - [ ] **Cablear el pipeline de voz en el binario** (hallazgo QA v0.2.1, bloqueante para "escucha y habla"): `jarvis-app` nunca abre streams `cpal` ni lanza `spawn_dsp_thread`/VAD/`WhisperEngine`/`ClaudeClient`/salida TTS. `start_listening()` solo cambia la máquina de estados. Los componentes existen y están testeados en `jarvis-audio`; falta el orquestador captura → DSP → VAD/endpointing → STT → activación → `run_turn_streaming` → playback. Brief listo para DeepSeek V4 Pro: [`docs/specs/brief-hu9-orquestador-voz.md`](docs/specs/brief-hu9-orquestador-voz.md) (HU-ORQ-1 a HU-ORQ-5).

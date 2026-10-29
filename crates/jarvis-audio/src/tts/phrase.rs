@@ -679,7 +679,7 @@ mod tests {
             );
             let first = phrases[0].directive;
             assert_eq!(first.mood, Some(Mood::Entusiasta));
-            assert_eq!((first.rate, first.pitch, first.volume), (8, 2, 5));
+            assert_eq!((first.rate, first.pitch, first.volume), (15, 25, 5));
             assert_eq!(first.pause_before_ms, 0);
 
             let second = phrases[1].directive;
