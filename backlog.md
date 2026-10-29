@@ -240,10 +240,10 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
-## 🎭 Épica 16 (E-16): Voz Expresiva y STT Coloquial — ✅ v0.3.3
+## 🎭 Épica 16 (E-16): Voz Expresiva y STT Coloquial — ✅ v0.3.4
 - _Contexto de negocio:_ las emociones de Jarvis apenas se notaban al oído (offsets de prosodia demasiado sutiles), faltaba un registro de alarma y el cerebro olvidaba el protocolo de directivas en sesiones de voz largas. Además Whisper seguía deformando modismos chilenos y tecnicismos que el diccionario base no cubría.
 - [x] **HU-73** Rango emocional y prosodia perceptible en Edge-TTS: ánimo Asustado, offsets ampliados perceptibles y recordatorio en la sesión persistente de voz (v0.3.2); `Mood::Normal` y calibración natural sobre es-US-AlonsoNeural sin efecto ardilla/Thanos (v0.3.3) [Responsable: DeepSeek / Claude]
-- [x] **HU-74** Expansión masiva del diccionario STT: jerga chilena, tecnicismos y deformaciones de Whisper (v0.3.2); lote adicional de transcripciones fonéticas reales (v0.3.3) [Responsable: DeepSeek / Claude]
+- [x] **HU-74** Expansión masiva del diccionario STT: jerga chilena, tecnicismos y deformaciones de Whisper (v0.3.2); lote adicional de transcripciones fonéticas reales (v0.3.3); hotfix v0.3.4 de "habla normal" y formas sin hache de hablar [Responsable: DeepSeek / Claude / VibeCoder]
 
 ### HU-73: Rango emocional y prosodia perceptible en Edge-TTS
 - 📁 _Repositorio:_ `Fokkus-Jarvis`
@@ -256,6 +256,7 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 - 🎯 _Capa:_ `crates/jarvis-audio/src/text/lexicon.rs`.
 - 📌 _Objetivo técnico:_ Cubrir jerga chilena, tecnicismos y deformaciones frecuentes de Whisper sin introducir falsos positivos sobre frases correctas.
 - 🔧 _Ampliación v0.3.3:_ segundo lote con deformaciones de transcripciones reales (frases propias, Plane, archivos .md, Game Boy Advance).
+- 🔧 _Hotfix v0.3.4 (lote 4):_ "habla normal" seguía saliendo deformado en vivo (`avladon a mal`, `havilla no de mal`, `ablanormal`, y con coma: `abla, normal`, `habla, normal`), y Whisper se come la hache inicial de hablar (`abla`, `ablar`, `ablando`). Se añaden esas variantes y una regla acotada en el motor: una coma **seguida de espacio** ya no corta un tramo, para que "Abla, normal" llegue a "habla normal" sin que "a,b" una palabras. Cuatro negativos nuevos garantizan que `ablandar`, `ablandador`, `ablandando` y el `habla` bien transcrito no se toquen.
 
 ## 🧾 Deuda técnica
 

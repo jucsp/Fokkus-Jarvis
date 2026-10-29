@@ -18,6 +18,8 @@
 //!   "GitHub actions".
 //! - Un tramo escrito todo en mayúsculas se conserva gritado: "DOQUER" →
 //!   "DOCKER".
+//! - Una coma seguida de espacio **no** corta un tramo: "abla, normal" →
+//!   "habla normal" (HU-74). "a,b", sin espacio, nunca casa.
 //!
 //! Este módulo **no** sustituye a [`crate::text::normalize`] (HU-59): aquel
 //! normaliza **con pérdida** para comparar (minúsculas, sin tildes, en el
@@ -42,6 +44,10 @@
 //!   "como si tuvieras hambre" también cambia.
 //! - "po" se sustituye por "po" (identidad): está en la tabla para dar destino
 //!   a "poh" y para fijar la forma canónica, no para cambiarla.
+//! - "abla", "avla", "ablar", "ablando"… se corrigen a "habla", "hablar",
+//!   "hablando": whisper se come la hache y ninguna de esas formas es español
+//!   corriente. La coincidencia es por palabra completa, así que "ablandar",
+//!   "ablandando" y "ablandador" no se tocan.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -326,7 +332,20 @@ pub const BASE_ENTRIES: &[(&str, &[&str])] = &[
     ("se te cambió la voz", &["se te cambio la hoja"]),
     (
         "habla normal",
-        &["ahora lo es normal", "habla lo es normal"],
+        &[
+            "ahora lo es normal",
+            "habla lo es normal",
+            // HU-74 (lote 4): formas oídas en vivo. Whisper puntúa con comas,
+            // así que la variante con coma se conserva; al plegarse, "abla
+            // normal" y "abla, normal" comparten entrada en el índice.
+            "avladon a mal",
+            "havilla no de mal",
+            "abla normal",
+            "abla, normal",
+            "avla normal",
+            "habla, normal",
+            "ablanormal",
+        ],
     ),
     (
         "estás ahí",
@@ -336,6 +355,12 @@ pub const BASE_ENTRIES: &[(&str, &[&str])] = &[
     ("con voz", &["con vod", "con vot", "con bos"]),
     ("Super Nintendo", &["suban nintendo", "subanintendo"]),
     ("discos", &["viscos"]),
+    // HU-74 (lote 4): whisper se come la hache inicial de "hablar" y de sus
+    // conjugaciones. La coincidencia es por palabra completa, así que "ablar"
+    // no toca "ablandar" ni "ablando" toca "ablandando".
+    ("habla", &["abla", "avla"]),
+    ("hablar", &["ablar", "avlar"]),
+    ("hablando", &["ablando", "avlando"]),
     // -------------------------------------------------- nombres propios
     ("Iron Man", &["iron man", "iroquman", "airom man"]),
     ("Temuco", &["temuco", "temunco"]),
@@ -413,6 +438,13 @@ pub const NEGATIVES: &[&str] = &[
     "todo está normal por ahora",
     // "agrada" bien transcrito no cambia.
     "no me agrada el frío",
+    // HU-74 (lote 4): la regla sin hache es por palabra completa; "ablandar" y
+    // sus derivados empiezan igual que "ablando" pero no son "hablando".
+    "ablanda la mantequilla antes de batir",
+    "el ablandador de carne está en el cajón",
+    "estuvimos ablandando la masa un rato",
+    // "habla" bien transcrito es la forma canónica, no una variante.
+    "el habla del pueblo cambia con los años",
 ];
 
 /// Una entrada ya compilada del índice.
@@ -675,13 +707,24 @@ fn scan_words(text: &str) -> Vec<Word> {
 }
 
 /// `true` si entre palabra y palabra solo hay separadores débiles (espacios,
-/// guion, guion bajo o punto): así "cargo.toml" y "lorem-ipsum" también casan,
-/// pero nunca dos palabras pegadas sin separador.
+/// guion, guion bajo, punto, apóstrofo o coma seguida de espacio): así
+/// "cargo.toml" y "lorem-ipsum" también casan, pero nunca dos palabras pegadas
+/// sin separador.
+///
+/// La coma solo cuenta si va **seguida de un espacio** (", "), que es como
+/// puntúa whisper (HU-74, lote 4): "abla, normal" → "habla normal". Sin esa
+/// condición, "a,b" uniría dos palabras que el hablante separó.
 fn separators_ok(text: &str, words: &[Word]) -> bool {
     words.windows(2).all(|pair| {
-        text[pair[0].end..pair[1].start]
-            .chars()
-            .all(|c| c.is_whitespace() || matches!(c, '-' | '_' | '.' | '\''))
+        let mut gap = text[pair[0].end..pair[1].start].chars().peekable();
+        while let Some(c) = gap.next() {
+            let weak = c.is_whitespace() || matches!(c, '-' | '_' | '.' | '\'');
+            let comma = c == ',' && gap.peek().is_some_and(|next| next.is_whitespace());
+            if !weak && !comma {
+                return false;
+            }
+        }
+        true
     })
 }
 
@@ -957,6 +1000,18 @@ mod tests {
             ("los viscos duros", "los discos duros"),
             ("crea un tiquetan plane", "crea un ticket en Plane"),
             ("crea un ticatain plane", "crea un ticket en Plane"),
+            // Lote 4: "habla normal" y las formas sin hache de hablar.
+            ("Avladón a mal", "habla normal"),
+            ("Havilla no de mal", "habla normal"),
+            ("Abla, normal", "habla normal"),
+            ("avladon a mal", "habla normal"),
+            ("ablanormal", "habla normal"),
+            ("habla, normal", "habla normal"),
+            ("avla normal", "habla normal"),
+            ("abla con el equipo", "habla con el equipo"),
+            ("estoy ablando", "estoy hablando"),
+            ("quiero ablar", "quiero hablar"),
+            ("estamos avlando de eso", "estamos hablando de eso"),
         ] {
             assert_eq!(lex.correct(input), expected, "{input}");
         }
@@ -975,6 +1030,24 @@ mod tests {
                 "el negativo se tocó: {sentence}"
             );
         }
+    }
+
+    /// HU-74 (lote 4): una coma seguida de espacio no corta un tramo, pero sin
+    /// espacio no une dos palabras.
+    #[test]
+    fn a_comma_followed_by_space_does_not_block_a_span() {
+        let lex = base();
+        assert_eq!(lex.correct("abla, normal"), "habla normal");
+        assert_eq!(lex.correct("Abla, normal"), "habla normal");
+        // Espacio antes de la coma: también es puntuación normal.
+        assert_eq!(lex.correct("habla ,  normal"), "habla normal");
+        // Sin espacio la coma no une: solo se corrige la palabra suelta.
+        assert_eq!(lex.correct("abla,normal"), "habla,normal");
+        // Y la coma fuera de un tramo se conserva tal cual.
+        assert_eq!(
+            lex.correct("buenas, abla con el equipo"),
+            "buenas, habla con el equipo"
+        );
     }
 
     // ------------------------------------------------------------- CA-70.5

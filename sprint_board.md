@@ -1,15 +1,16 @@
 # Sprint Board — Fokkus-Jarvis
 
-**Épica Actual:** Épica 16 (E-16) Voz Expresiva y STT Coloquial · v0.3.3
+**Épica Actual:** Épica 16 (E-16) Voz Expresiva y STT Coloquial · v0.3.4
 **Sprint:** E-16 (HU-73 y HU-74) — IMPLEMENTADO. Arrastre de E-15: release `models-v1` (69.2), IPC `jarvis.modelStatus` (69.5) y pruebas manuales 🧪
-**Actualizado:** 2026-10-29 · **PM/QA:** Claude · **PO:** Antigravity · **Dev:** DeepSeek
+**Actualizado:** 2026-10-29 · **PM/QA:** Claude (suplencia: VibeCoder) · **PO:** Antigravity · **Dev:** DeepSeek
 
 Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere prueba manual
 
 ---
 
-## 🏁 COMPLETADO: ÉPICA 16 (E-16) — Voz Expresiva y STT Coloquial · v0.3.3
+## 🏁 COMPLETADO: ÉPICA 16 (E-16) — Voz Expresiva y STT Coloquial · v0.3.4
 > Verificado 2026-10-29 (v0.3.3): `cargo test -p jarvis-audio` 515 pasados (509 + 6), 0 fallidos, 4 ignorados; `cargo test --workspace` 957 pasados, 0 fallidos, 7 ignorados; `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --check` limpios; `cargo build --release -p jarvis-app` OK; binario instalado reporta `Fokkus-Jarvis 0.3.3`.
+> ⚠️ v0.3.4 (hotfix de léxico, lote 4): código y documentos aplicados; **verificación pendiente** de `cargo test -p jarvis-audio`, `cargo test --workspace`, `fmt --check`, `clippy -D warnings`, build release e instalación (la sesión de suplencia no tenía shell).
 > v0.3.2: 512 pasados en `jarvis-audio`; primera entrega de HU-73 y HU-74.
 
 ### HU-73 — Rango emocional y prosodia perceptible en Edge-TTS ✅
@@ -27,6 +28,8 @@ Leyenda: `[x]` hecho y verificado con tests · `[ ]` pendiente · 🧪 requiere 
 - [x] 74.2 QA: depuradas variantes que corregían frases correctas (falsos positivos) y `fmt --check` limpio [Responsable: Claude]
 - [x] 74.3 (v0.3.3) `text/lexicon.rs`: lote adicional de transcripciones fonéticas reales (`socuen` → Soy Juan, `alvarlo` → Háblalo, `avelosidad` → a velocidad, `comardilla` → como ardilla, `su minito` → un grito, `asperate` → espérate, `tiketin plane` → ticket en Plane, `punto de mede` → archivo .md, `mieselo` → envíaselo, `gamboy advance` → Game Boy Advance) [Responsable: DeepSeek / Claude]
 - [x] 74.4 (v0.3.3) QA: casos nuevos en `transcript_history_terms_are_present`; variantes `archivo punto de mede` para no escribir "archivo archivo .md" [Responsable: Claude]
+- [x] 74.5 (v0.3.4) `text/lexicon.rs`: hotfix de "habla normal" con las formas oídas en vivo (`avladon a mal`, `havilla no de mal`, `abla normal`, `abla, normal`, `avla normal`, `habla, normal`, `ablanormal`) y entradas nuevas para las formas sin hache de hablar: `abla`/`avla` → habla, `ablar`/`avlar` → hablar, `ablando`/`avlando` → hablando [Responsable: VibeCoder (backup PM/QA)]
+- [x] 74.6 (v0.3.4) `separators_ok`: una coma seguida de espacio ya no corta un tramo ("Abla, normal" → "habla normal"), sin que "a,b" llegue a unir palabras. Cuatro negativos nuevos (`ablanda`, `ablandador`, `ablandando`, `habla` bien transcrito) y test `a_comma_followed_by_space_does_not_block_a_span` [Responsable: VibeCoder (backup PM/QA)]
 
 ---
 
