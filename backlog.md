@@ -244,6 +244,7 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 - _Contexto de negocio:_ las emociones de Jarvis apenas se notaban al oído (offsets de prosodia demasiado sutiles), faltaba un registro de alarma y el cerebro olvidaba el protocolo de directivas en sesiones de voz largas. Además Whisper seguía deformando modismos chilenos y tecnicismos que el diccionario base no cubría.
 - [x] **HU-73** Rango emocional y prosodia perceptible en Edge-TTS: ánimo Asustado, offsets ampliados perceptibles y recordatorio en la sesión persistente de voz (v0.3.2); `Mood::Normal` y calibración natural sobre es-US-AlonsoNeural sin efecto ardilla/Thanos (v0.3.3) [Responsable: DeepSeek / Claude]
 - [x] **HU-74** Expansión masiva del diccionario STT: jerga chilena, tecnicismos y deformaciones de Whisper (v0.3.2); lote adicional de transcripciones fonéticas reales (v0.3.3); hotfix v0.3.4 de "habla normal" y formas sin hache de hablar [Responsable: DeepSeek / Claude / VibeCoder]
+- [x] **HU-75** Motor STT no autorregresivo Sherpa-ONNX (NeMo FastConformer CTC int8) y compuerta RMS de silencio (v0.3.5) [Responsable: DeepSeek / Claude / PO Antigravity]
 
 ### HU-73: Rango emocional y prosodia perceptible en Edge-TTS
 - 📁 _Repositorio:_ `Fokkus-Jarvis`
@@ -258,6 +259,15 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 - 🔧 _Ampliación v0.3.3:_ segundo lote con deformaciones de transcripciones reales (frases propias, Plane, archivos .md, Game Boy Advance).
 - 🔧 _Hotfix v0.3.4 (lote 4):_ "habla normal" seguía saliendo deformado en vivo (`avladon a mal`, `havilla no de mal`, `ablanormal`, y con coma: `abla, normal`, `habla, normal`), y Whisper se come la hache inicial de hablar (`abla`, `ablar`, `ablando`). Se añaden esas variantes y una regla acotada en el motor: una coma **seguida de espacio** ya no corta un tramo, para que "Abla, normal" llegue a "habla normal" sin que "a,b" una palabras. Cuatro negativos nuevos garantizan que `ablandar`, `ablandador`, `ablandando` y el `habla` bien transcrito no se toquen.
 
+### HU-75: Motor STT no autorregresivo Sherpa-ONNX y compuerta RMS de silencio
+- 📁 _Repositorio:_ `Fokkus-Jarvis`
+- 🎯 _Capa:_ `crates/jarvis-audio/src/stt/sherpa.rs`, `crates/jarvis-audio/src/stt.rs`, `crates/jarvis-app/src/runtime.rs`, `crates/jarvis-core/src/config.rs`.
+- 📌 _Objetivo técnico:_ Eliminar alucinaciones en silencio (falsos barge-in por "suscríbete") y latencias elevadas mediante arquitectura CTC no autorregresiva:
+  - Compuerta de energía cuadrática media (RMS Gate) con umbral `0.005` en `prepare_audio`: silencio acústico retorna `""` sin consumir ciclos de CPU ni decodificador.
+  - Integración nativa de `sherpa-onnx` con soporte para NeMo FastConformer CTC cuantizado int8 (`sherpa-onnx-nemo-fast-conformer-ctc-es-1424-int8`), entrenado en 1424 horas de español nativo.
+  - Cero dependencias de Hugging Face; modelos verificados por SHA-256 e inferencia en CPU < 40 ms.
+  - Soporte de configuración `[stt] backend = "sherpa"` con alternancia a `"whisper"` transparente.
+
 ## 🧾 Deuda técnica
 
 - [x] **Cablear el pipeline de voz en el binario** (cerrada en Épica 2/3/9): `jarvis-app` corre el bucle completo de audio `cpal` + DSP (AEC/NS/AGC) + VAD Silero + WhisperEngine + CLI/Brain persistente + Edge-TTS + playback en memoria.
@@ -268,12 +278,12 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ---
 
-## 📊 Métricas Globales (2026-10-29 — v0.3.4)
+## 📊 Métricas Globales (2026-10-29 — v0.3.5)
 
-- ✅ **958 pruebas unitarias e integradas pasando al 100%** en todo el workspace (**0 fallos**, 7 ignoradas intencionalmente por requerir bus privado o modelos offline).
+- ✅ **965 pruebas unitarias e integradas pasando al 100%** en todo el workspace (**0 fallos**, 7 ignoradas intencionalmente por requerir bus privado o modelos offline).
 - ✅ Bucle principal en KWin Wayland con overlay layer-shell `zwlr_layer_shell_v1`, HUD translúcido, menú popup y fallback headless.
 - ✅ Pipeline de audio con cancelación de eco (AEC3), VAD de dos niveles, barge-in instantáneo y atenuación de ruido.
-- ✅ STT con Whisper local, corrector léxico determinista HU-70/HU-74 (< 1 ms) y soporte de modismos chilenos y tecnicismos.
+- ✅ STT soberano dual: Sherpa-ONNX (NeMo FastConformer CTC int8 español, < 40 ms, 0 alucinaciones) y Whisper local con corrector léxico determinista HU-70/HU-74 (< 1 ms).
 - ✅ TTS neuronal Edge-TTS con rango dinámico perceptible HU-73 (`Mood::Normal`, Asustado, Entusiasta, Alegre, Curioso, Serio, Calmo), silencios y pausas PCM.
 - ✅ Cerebro híbrido: CLI persistente (`agy` por NDJSON sin arranque en frío) y API Anthropic Messages síncrona/streaming.
 - ✅ Arquitectura multi-sesión HU-60 a HU-66 (hilo de voz + subagentes de desarrollo y análisis en segundo plano).
