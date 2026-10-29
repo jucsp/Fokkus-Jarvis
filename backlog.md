@@ -260,18 +260,22 @@ Especificación SDD: [docs/specs/sdd-fokkus-jarvis.md](docs/specs/sdd-fokkus-jar
 
 ## 🧾 Deuda técnica
 
-- [ ] **Cablear el pipeline de voz en el binario** (hallazgo QA v0.2.1, bloqueante para "escucha y habla"): `jarvis-app` nunca abre streams `cpal` ni lanza `spawn_dsp_thread`/VAD/`WhisperEngine`/`ClaudeClient`/salida TTS. `start_listening()` solo cambia la máquina de estados. Los componentes existen y están testeados en `jarvis-audio`; falta el orquestador captura → DSP → VAD/endpointing → STT → activación → `run_turn_streaming` → playback. Brief listo para DeepSeek V4 Pro: [`docs/specs/brief-hu9-orquestador-voz.md`](docs/specs/brief-hu9-orquestador-voz.md) (HU-ORQ-1 a HU-ORQ-5).
-- [x] **Clic derecho cerraba la app sin aviso** (feedback v0.2.1): ahora abre un menú contextual `xdg_popup` con *grab* (Silenciar/Activar micrófono, Posición inicial, Salir); clic fuera lo cierra. "Silenciar" hoy solo cambia el estado: liberar el micrófono queda en HU-ORQ-4.
-- [ ] **Unificar `JarvisCore`** (cubierto por HU-ORQ-4; hallazgo QA, HU-4 de `docs/specs/brief-hu-overlay-event-loop.md`): `ConversationCoordinator` y `ServerState` mantienen núcleos independientes. La esfera ya lee el estado de `ServerState::state()` (fuente de verdad del IPC) y el nivel de audio del coordinador, pero un `start_listening()` del coordinador no se refleja en el color de la esfera. Requiere compartir un único núcleo (`Arc<Mutex<JarvisCore>>` o eventos) cambiando APIs de `jarvis-ipc`/`jarvis-audio`.
+- [x] **Cablear el pipeline de voz en el binario** (cerrada en Épica 2/3/9): `jarvis-app` corre el bucle completo de audio `cpal` + DSP (AEC/NS/AGC) + VAD Silero + WhisperEngine + CLI/Brain persistente + Edge-TTS + playback en memoria.
+- [x] **Clic derecho cerraba la app sin aviso** (feedback v0.2.1): menú contextual `xdg_popup` con *grab* (Silenciar/Activar micrófono, Posición inicial, Salir).
+- [x] **Unificar `JarvisCore`** (cerrada en HU-ORQ-4): núcleo sincronizado entre el orquestador de voz, el servidor IPC y la esfera líquida.
 - [ ] **CPU en reposo de la esfera** (~6 % de un núcleo en release a 30 FPS): `SphereRenderer::render_into` cuesta ~1,6 ms por frame a 220×220. Objetivo M5 < 5 %: cachear el halo estático o bajar a 20 FPS en `Idle`.
 - [ ] **Clippy en Windows** (`--target x86_64-pc-windows-gnu`): `result_large_err` en `jarvis-core/src/config.rs` (`ConfigError::Parse`). `cargo check` compila; solo falla el lint.
 
 ---
 
-## 📊 Métricas Globales (2026-10-15)
+## 📊 Métricas Globales (2026-10-29 — v0.3.4)
 
-- ✅ **163 pruebas unitarias pasando al 100%** en todo el workspace (**0 fallos**).
-- ✅ Bucle principal con apagado limpio (SIGINT/SIGTERM < 50 ms) y overlay `zwlr_layer_shell_v1` en KWin Wayland, con fallback headless.
-- ✅ `make check` / `make lint` / `make fmt-check` limpios (sin warnings).
-- ✅ Binario `jarvis-app` con CLI operativo: `--version` (`-v`), `--check` (`-c`), `--help` (`-h`).
-- ✅ Socket IPC activo y listo para conexiones de Fokkus IDE.
+- ✅ **958 pruebas unitarias e integradas pasando al 100%** en todo el workspace (**0 fallos**, 7 ignoradas intencionalmente por requerir bus privado o modelos offline).
+- ✅ Bucle principal en KWin Wayland con overlay layer-shell `zwlr_layer_shell_v1`, HUD translúcido, menú popup y fallback headless.
+- ✅ Pipeline de audio con cancelación de eco (AEC3), VAD de dos niveles, barge-in instantáneo y atenuación de ruido.
+- ✅ STT con Whisper local, corrector léxico determinista HU-70/HU-74 (< 1 ms) y soporte de modismos chilenos y tecnicismos.
+- ✅ TTS neuronal Edge-TTS con rango dinámico perceptible HU-73 (`Mood::Normal`, Asustado, Entusiasta, Alegre, Curioso, Serio, Calmo), silencios y pausas PCM.
+- ✅ Cerebro híbrido: CLI persistente (`agy` por NDJSON sin arranque en frío) y API Anthropic Messages síncrona/streaming.
+- ✅ Arquitectura multi-sesión HU-60 a HU-66 (hilo de voz + subagentes de desarrollo y análisis en segundo plano).
+- ✅ Servidor IPC JSON-RPC 2.0 sobre `~/.fokkus/jarvis.sock` listo para Fokkus IDE.
+- ✅ `cargo clippy --workspace --all-targets -D warnings` y `cargo fmt --check` limpios.
