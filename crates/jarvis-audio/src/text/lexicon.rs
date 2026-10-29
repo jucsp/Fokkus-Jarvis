@@ -37,6 +37,9 @@
 //! - "germando" se corrige a "armando" y "volutiva" a "evolutiva" aunque las
 //!   acepciones corrientes existan ("germinar"): en el historial de
 //!   transcripciones nunca aparecieron y sí el nombre y el adjetivo.
+//! - "como si tuvieras" se corrige a "como si estuvieras": en el historial
+//!   whisper se comió el "es" pidiendo un estado de ánimo, y el costo es que
+//!   "como si tuvieras hambre" también cambia.
 //! - "po" se sustituye por "po" (identidad): está en la tabla para dar destino
 //!   a "poh" y para fijar la forma canónica, no para cambiarla.
 
@@ -290,7 +293,10 @@ pub const BASE_ENTRIES: &[(&str, &[&str])] = &[
     ("como ardilla", &["comardilla"]),
     ("un grito", &["su minito", "suminito"]),
     ("espérate", &["asperate"]),
-    ("ticket en Plane", &["ticatain plane", "tiketin plane"]),
+    (
+        "ticket en Plane",
+        &["tiquetan plane", "ticatain plane", "tiketin plane"],
+    ),
     // Con "archivo" dentro para no escribir "archivo archivo .md".
     (
         "archivo .md",
@@ -306,6 +312,30 @@ pub const BASE_ENTRIES: &[(&str, &[&str])] = &[
     // "míeselo" no hace falta: la comparación pliega la tilde.
     ("envíaselo", &["mieselo"]),
     ("Game Boy Advance", &["gamboy advance", "gameboy advance"]),
+    // HU-74 (lote 3): frases largas primero; la búsqueda ya prioriza el
+    // tramo más largo, el orden aquí es solo para leerlas.
+    ("se genere esa diferencia", &["ese genero es a diferencia"]),
+    (
+        "como si estuvieras",
+        &[
+            "que hemos y estuvieras",
+            "que hemos si estuvieras",
+            "como si tuvieras",
+        ],
+    ),
+    ("se te cambió la voz", &["se te cambio la hoja"]),
+    (
+        "habla normal",
+        &["ahora lo es normal", "habla lo es normal"],
+    ),
+    (
+        "estás ahí",
+        &["este este ahi", "este este ai", "estas ai", "tatai"],
+    ),
+    ("no me agrada", &["no me grada"]),
+    ("con voz", &["con vod", "con vot", "con bos"]),
+    ("Super Nintendo", &["suban nintendo", "subanintendo"]),
+    ("discos", &["viscos"]),
     // -------------------------------------------------- nombres propios
     ("Iron Man", &["iron man", "iroquman", "airom man"]),
     ("Temuco", &["temuco", "temunco"]),
@@ -375,6 +405,14 @@ pub const NEGATIVES: &[&str] = &[
     "tengo una duda sobre el tema",
     // "espectáculo" no es "Spectacle".
     "el espectáculo de anoche fue increíble",
+    // "hoja" solo se corrige dentro de "se te cambio la hoja".
+    "compré una hoja de papel",
+    "se te cayó la hoja del cuaderno",
+    // "voz" y "normal" sueltos no se tocan: las reglas son frases completas.
+    "la voz del locutor es grave",
+    "todo está normal por ahora",
+    // "agrada" bien transcrito no cambia.
+    "no me agrada el frío",
 ];
 
 /// Una entrada ya compilada del índice.
@@ -892,6 +930,33 @@ mod tests {
             ("míeselo", "envíaselo"),
             ("míeselo a Felipe", "envíaselo a Felipe"),
             ("gamboy advance", "Game Boy Advance"),
+            // Lote 3.
+            ("hola este este ahi", "hola estás ahí"),
+            ("jarvis estas ai", "jarvis estás ahí"),
+            ("tatai", "estás ahí"),
+            (
+                "habla que hemos y estuvieras cansado",
+                "habla como si estuvieras cansado",
+            ),
+            (
+                "habla como si tuvieras asustado",
+                "habla como si estuvieras asustado",
+            ),
+            ("responde con vod grave", "responde con voz grave"),
+            ("háblame con bos", "háblame con voz"),
+            ("oye se te cambio la hoja", "oye se te cambió la voz"),
+            ("ahora lo es normal", "habla normal"),
+            ("habla lo es normal por favor", "habla normal por favor"),
+            ("eso no me grada", "eso no me agrada"),
+            (
+                "no quiero que ese genero es a diferencia",
+                "no quiero que se genere esa diferencia",
+            ),
+            ("juegos de suban nintendo", "juegos de Super Nintendo"),
+            ("subanintendo", "Super Nintendo"),
+            ("los viscos duros", "los discos duros"),
+            ("crea un tiquetan plane", "crea un ticket en Plane"),
+            ("crea un ticatain plane", "crea un ticket en Plane"),
         ] {
             assert_eq!(lex.correct(input), expected, "{input}");
         }
